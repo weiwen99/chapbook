@@ -50,6 +50,7 @@ src/
   assets.rs    # include_str! 内嵌前端资源
 assets/        # materialize.min.css / materialize.min.js（v2.3.3 社区分支）+ chapbook-theme.css（目录页主题）
                # + chapbook-doc.css（文档/代码页样式）
+               # + syntaxes/（14 个补充语法定义，syntect 默认集缺失的常见语言；见 THIRD_PARTY_NOTICES）
 tests/
   router.rs    # 路由集成测试（渲染/协商/安全）
   sort.rs      # SortBy 解析测试
@@ -100,7 +101,7 @@ tests/
 | maud | HTML 模板 | 自动转义，文件名含 `<>&"` 安全；TOC/页面骨架渲染 |
 | orgize 0.9 | .org 渲染 | 纯 Rust AST 渲染，无子进程；`default-features = false`（跳过 serde） |
 | comrak 0.54 | .md 渲染 | `default-features = false`；HeadingAdapter/SyntaxHighlighterAdapter 插件化锚点与高亮 |
-| syntect 5 | 代码高亮 | 内嵌语法集（~50 语言，二进制 +~5MB）；`ClassStyle::Spaced` 输出 scope atom 类名 |
+| syntect 5 | 代码高亮 | 内嵌语法集（默认 ~50 语言 + `assets/syntaxes/` 补充 14 个常见语言，二进制 +~0.5MB）；`ClassStyle::Spaced` 输出 scope atom 类名 |
 | clap (derive) | CLI | `disable_help_flag`，`-h` 让给 `--host` |
 | chrono | 时间格式化 | `yyyy-MM-dd HH:mm:ss` 本地时区 |
 | percent-encoding | href 编码 | 见安全不变量 |

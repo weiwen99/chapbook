@@ -32,6 +32,18 @@ chapbook 本身采用 Apache License 2.0（见 [LICENSE](./LICENSE)）。
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 > SOFTWARE.
 
+## 内嵌语法定义（随二进制分发）
+
+`assets/syntaxes/` 下的 14 个 TextMate 语法文件用于补充 syntect 默认集缺失的常见语言
+（TypeScript、TOML、Kotlin、Swift、Dockerfile、GraphQL、Dart、Elixir、CMake、Protobuf、
+Zig、INI、Nix、Svelte）：
+
+- `TOML.sublime-syntax` 来自 [sublimehq/Packages](https://github.com/sublimehq/Packages)（MIT）。
+- 其余 13 个来自 [sharkdp/bat](https://github.com/sharkdp/bat) 的 `assets/syntaxes/02_Extra/`
+  （bat 项目为 MIT；各语法文件源自其各自上游仓库，许可证以各上游为准，多为 MIT 或
+  BSD-3-Clause —— 主要上游包括 Microsoft/TypeScript-Sublime-Plugin（TypeScript，MIT）、
+  dart-lang（Dart）等）。
+
 ## 静态链接的渲染相关依赖
 
 以下 crate 以静态链接方式编译进二进制（许可证以 crates.io 发布元数据为准）：
