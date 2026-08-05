@@ -1,0 +1,90 @@
+#+TITLE: Proposal: 语法高亮渲染代码文件
+#+DATE: 2026-08-05
+
+*状态：已实现（2026-08-05，按方案 A）。* 实现要点与提案一致；两处实现期修正：
+
+- 测试断言不能匹配含 =-= 的字面量（高亮会把符号包进 token span），用标识符代替。
+- pandoc 无 TOC 页面的宽屏左移改为 CSS =:has(#TOC)= 守卫，代码页不留空侧栏位。
+- html/htm 从语言映射表移除（实现时误加）：网页文件应直接透传给浏览器渲染，不做代码高亮。
+
+* 背景与需求
+
+- 日常高频场景：用 chapbook 浏览 .rs / .scala / .py / .js / .ts / .go 等源代码文件。
+- 现状：代码文件走 =ServeFile= 裸文本通道（text/* + charset=utf-8），浏览器按纯文本显示，
+  无高亮、无排版，与 org/md 文档页的精致渲染形成落差。
+- 需求：浏览代码文件时，返回与文档页同一视觉系统（chapbook-doc-style）的语法高亮 HTML 页面。
+- 编码策略：暂按 UTF-8 处理所有代码文件。
+  - 待讨论：非 UTF-8 文件（GBK 等）如何识别与处理？见"编码处理"一节。
+
+* 范围
+
+** 目标
+- 常见源码扩展名（rs scala java py js ts go c h cpp sh sql yaml toml xml css json 等）
+  以高亮 HTML 渲染，样式与 org/md 页一致（亮/暗自适应、GitHub 双色调色板、方角代码块）。
+- 保留获取原始文本的能力（脚本/curl/下载场景不能被破坏）。
+
+** 非目标
+- 在线编辑、blame、跳转等 IDE 能力。
+- 二进制文件的预览（图片/音视频维持 ServeFile 现状）。
+- .org/.md 已在文档渲染管线内，不在本提案范围。
+
+* 方案（三选一）
+
+| 方案 | 原理 | 优点 | 缺点 |
+|------|------|------|------|
+| A. pandoc 包装渲染 | 内容包进 =```lang= fenced block，走现有 pandoc 管线 + DOC_STYLE | 复用现有渲染/样式/调色板，代码增量最小；={.lang .numberSource}= 自带行号 | 每次查看一次 pandoc 子进程（~100–300ms）；需要 ext→语言映射表 |
+| B. syntect 内嵌 | Rust 原生高亮库（Sublime 语法包），编译进二进制 | 无子进程、无 pandoc 依赖、微秒级 | 二进制 +2–5MB（语法 dump）；调色板需另做一套以匹配现有色系 |
+| C. 客户端 highlight.js | HTML 壳 + 内嵌 JS 在浏览器端高亮 | 服务端零成本；大文件不耗服务端 | 重新引入 JS 依赖（刚拆掉 Markdeep）；转义/FOUC 处理；与现有视觉不同源 |
+
+*推荐 A*：与文档渲染共用一条管线，视觉天然一致，实现量最小。
+若未来 pandoc 依赖被嫌弃（如追求零依赖分发），再评估 B。
+
+* 关键设计点（方案 A）
+
+** 响应协商：HTML 还是原文？
+
+代码文件的消费者有两类：浏览器（要 HTML）和脚本（curl/API，要原文）。
+破坏任一方都不可接受。设计：
+
+- 默认按 =Accept= 头协商：含 =text/html=（浏览器）→ 高亮 HTML；否则（curl 的 =*/*=）→ 原文。
+- 显式覆盖：=?raw=1= 强制原文，=?view=1= 强制渲染（用于分享链接）。
+- 已知类型的判定顺序：目录 → .md → .org → 代码文件（新）→ ServeFile 裸文件。
+
+** 语言识别
+
+- 静态映射表 扩展名 → skylighting 语言名（rs→rust, js→javascript, sh→bash, ...）。
+- 未识别的扩展名：维持裸文本现状，不包 pandoc。
+
+** fenced block 包装细节
+
+- 围栏长度动态取 "内容中最长连续反引号串 + 1"（至少 3 个），避免内容里的 =```= 截断代码块。
+- 属性写 ={.lang .numberSource}= 启用行号（便于代码评审时引用行号）。
+- 不带 =--toc=（代码文件无章节结构）。
+
+** 编码处理
+
+- 读取后先做 UTF-8 校验：有效 → 渲染；无效 → 按裸字节走 ServeFile 现状（不做转码猜测）。
+- chardet 类编码探测不在本期范围（误判风险大于收益）。
+
+** 大文件保护
+
+- 超过阈值（如 1MB）的文件不渲染，直接走 ServeFile（避免 pandoc 慢/内存放大）。
+- pandoc 子进程沿用现有 10s 超时 + kill_on_drop。
+
+** 降级链
+
+pandoc 缺失/失败 → =text/plain; charset=utf-8= 原文（与 org/md 的降级语义一致）。
+
+* 测试计划
+
+- rs 文件（含中文注释）Accept: text/html → 200 HTML，含 =sourceCode rust=、行号、chapbook-doc-style 标记。
+- 同文件 curl（Accept: */*）→ 原文 text/plain?（按 mime）且字节一致；=?raw=1= 同样返回原文。
+- 未知扩展名（如 .xyz123）→ 维持裸文本。
+- 内容含 =```= 的代码文件 → 渲染完整不截断。
+- 非 UTF-8 字节文件 → 裸字节透传。
+- 大文件（>1MB）→ 走 ServeFile（断言 content-type 非 html）。
+
+* 工作量估计
+
+约 0.5–1 天：ext 映射表 + 包装渲染函数 + 响应协商 + 测试 6 个用例。
+改动集中在 routes.rs（新增分支）与一个新模块（highlight.rs），无破坏性变更。
