@@ -1,0 +1,143 @@
+#+TITLE: Proposal: 移除对本机安装 pandoc 的强依赖
+#+DATE: 2026-08-05
+
+* 状态：草稿（待评审）
+
+参考: [[./2026-08-05-spike-orgize-report.org][spike: orgize 渲染质量对比报告]]（同日期）。
+本提案实施 Phase 1（org 切 orgize）; Phase 2（syntect + .md 迁移）为后续方案, 见"方案"。
+
+* 背景与需求
+
+现状: 三条文档/代码渲染路径全部依赖本机安装 pandoc（需 ≥ 3.5 才有 =--syntax-highlighting=default=）:
+
+| 路径   | 当前管线                              | 无 pandoc 时     |
+|--------+---------------------------------------+------------------|
+| .org   | pandoc → emacs batch (~3s) → 原文      | 退化为纯文本     |
+| .md    | pandoc → 原文                          | 退化为纯文本     |
+| 代码文件 | pandoc 包装渲染 → 原文                | 退化为纯文本     |
+
+问题:
+
+1. **可靠性**: spike 实测 213 个 .org 语料, pandoc 失败/超时 78 个（37%）, 且存在病态 hang
+   （40KB 文件跑 3 分钟+, 每次请求都可能白等 10s 超时）。
+2. **结构保真**: pandoc 与 emacs 都会丢 4 级标题（plan-56: pandoc 丢全部 17 个 =****=,
+   emacs 丢 13 个; orgize 与源码一致）——=****= 架构小节在现有渲染里直接消失。
+3. **强依赖**: 未装 pandoc 时文档体验落差大; 无法做单二进制分发; 每次渲染起子进程
+   （100ms–3s）+ 超时/kill 兜底的复杂度。
+4. emacs 兜底链: 37% 的 org 文档要走 ~3s 的 emacs batch, 且同样丢标题。
+
+目标: org 路径完全自包含（纯 Rust、无子进程、无外部工具）, pandoc 降级为可选增强;
+Phase 2 彻底移除 pandoc, 达成零外部运行时依赖。
+
+* 范围
+
+** Phase 1（本提案实施范围）
+
+- .org 渲染切 orgize 0.9.0（crates.io 稳定线; spike 213/213 全部成功、毫秒级）。
+- 删除 emacs batch 兜底与 org 的 pandoc 路径。
+- 自建轻量 TOC（服务端, 从 orgize AST 生成）, 恢复宽屏侧栏（复用 =body:has(#TOC)= 守卫）。
+- 接受代码块无语法高亮 token（内容完整; org 文档里代码块不是主视觉元素）。
+- 页面骨架（=<!DOCTYPE>= / head / title）从 pandoc =-s= 移交到 render 模块自组。
+
+** 非目标（Phase 1）
+
+- .md 渲染迁移、代码文件高亮迁移（Phase 2）。
+- 数学公式渲染（orgize 不渲染 LaTeX; 注: pandoc =--katex= 输出的本就是 KaTeX CDN 链接,
+  离线环境同样不渲染）。
+- orgize 升级到 0.10 alpha（API 变动未发正式版）。
+
+** Phase 2（后续, 另立提案或追加）
+
+syntect 高亮叠加 + .md 纯 Rust 渲染 → pandoc 整体退出运行时依赖（详见"方案"）。
+
+* 方案
+
+** 决策依据（spike 结论）
+
+| 选项 | 收益 | 代价 |
+|------+------+------|
+| A. org 切 orgize（Phase 1）| 100% 可靠、毫秒级、结构最忠实（含 h4）、零子进程; emacs 兜底链可删 | 代码块失去高亮 token; TOC 需自建（~0.5 天）|
+| B. 维持现状 | 保留高亮 + TOC | 37% 文档走 ~3s emacs; h4 结构性丢失; 仍是外部强依赖 |
+| C. orgize + syntect 高亮叠加（Phase 2）| 兼得可靠性与高亮 | 二进制 +2–5MB; 工作量 +1–2 天 |
+
+按 spike 建议: 先做 A; 若后续要代码块高亮, 再评估 C。
+
+** Phase 1 渲染管线
+
+.Org 文件 → =Org::parse=（纯内存解析, 不会失败）→ 自定义 =HtmlHandler= 渲染 HTML fragment
+（标题补锚点）→ 自组完整页面（head + title + TOC + 正文）→ =render::inject_doc_style=
+注入 DOC_STYLE。
+
+- 扩展点: =Org::write_html_custom= 的 =HtmlHandler= trait（orgize 0.9.0, docs.rs 核实）。
+  默认输出 =<main><h1>…</h1><section>…</section></main>=, 标题默认无锚点, 须自定义 handler
+  按 =Element::Title{level, raw}= 包 =<a id= href=>=。
+- =run_renderer= 的 org 用法与 =PANDOC_TIMEOUT=/=EMACS_TIMEOUT=（org 路径）删除;
+  md/代码路径继续走 pandoc + 现有 10s 超时机制, 行为不变。
+- 保留 =serve_raw_text= 回退作为防御分支（orgize 解析不会失败, 实际不会触发）。
+
+** orgize 输出结构与现有 CSS 适配（spike 实测）
+
+| orgize 输出结构 | 与 chapbook-doc.css 兼容性 |
+|-----------------+---------------------------|
+| =<main><section>= 包裹、h1–h6 | ✓ 无冲突 |
+| =<table><thead><tbody>= | ✓ 现有表格样式直接生效 |
+| =<pre class="src src-scala">= | ✓ 已有 =pre.src= 选择器 |
+| =<i>=（=*斜体*=）/ =<b>=（=*粗体*=）代替 =<em>/<strong>= | 浏览器默认样式即可; 可选补 1 行统一定义（spike 建议）|
+| 无 =<nav id="TOC">= | 自建 TOC 后 =:has(#TOC)= 守卫继续生效 |
+| 无语法高亮 token | 已接受的取舍（Phase 1）|
+
+** 自建 TOC
+
+- 遍历 =Org::iter()= 的 =Element::Title= 事件（含 =level= 与 =raw= 纯文本）: 生成嵌套
+  =<nav id="TOC"><ul>= 结构; 渲染时给每个标题包 =<a id="slug" href="#slug">=。
+- 关键不变量: TOC 链接与标题锚点必须由**同一 slug 函数**生成（小写、非字母数字 → =-=、
+  去重）; 标题 level > 6 时按 h6 处理。
+- =#+TITLE= keyword → =<title>= 与 =<header id="title-block-header">= 下的 h1.title
+  （复用现有 CSS; pandoc 行为对齐）。
+- =#+OPTIONS: toc:= 按 Keyword 事件解析（=toc:nil= 关闭 / =toc:N= 限深度, 成本低）;
+  默认总是生成, 与现状 pandoc =--toc= 一致。
+
+* 测试计划（tests/router.rs 更新）
+
+| 用例 | 变更 |
+|------+------|
+| =org_rendered_via_pandoc= → 改名 =org_rendered_via_orgize= | 去掉 has_pandoc 跳过（无外部依赖, 恒跑）; =<em>= 断言改 =<i>=; =sourceCode scala= 改 =src src-scala=; =<nav id="TOC"= 保留（自建）; verbatim 断言按 orgize 实际输出核对 |
+| =org_always_readable_when_pandoc_fails= | 删除（pandoc/emacs 链不存在; "无 pandoc 也渲染"已被上一用例覆盖）|
+| 新增: 4 级标题保真回归 | 夹具含 =****= 小节 → 断言 =<h4>= 存在（spike plan-56 场景）|
+| 新增: TOC 锚点一致性 | =<nav id="TOC">= 内 href 与正文标题 =id= 一一对应（同一 slug）|
+| 新增: =#+TITLE= → =<title>= | 断言 head 内 title 文本 |
+| md / 代码文件用例 | 不变（pandoc 路径未动）|
+
+* 验收标准
+
+- 无 pandoc/emacs 的机器上: .org 请求返回 text/html 完整页面, 含 TOC、h4、src 块。
+- spike 语料（213 文件）抽样回归: 无失败、无 hang。
+- pandoc 存在时 .md 与代码文件行为与现状完全一致。
+- =cargo test= / =cargo fmt --check= / =cargo clippy --all-targets= 全绿。
+- AGENTS.md 随实现更新: 行为契约 5 改写（org 走 orgize、无子进程、无 TOC 丢失;
+  删 emacs 兜底）; 依赖表加入 orgize; 设计决策 3 更新。
+
+* 风险与开放问题
+
+- orgize 0.9.0 为 2019 年起的稳定线, 维护放缓; 0.10 仅 alpha。锁定 0.9.0, 渲染收敛在
+  单个模块, 日后升级成本可控。
+- crates.io 上 orgize 的 license 元数据缺失（docs.rs 显示 MIT）: 落地前核实。
+- 标题锚点 slug 规则与 pandoc 不同: 站外链接到 =#anchor= 可能失效（低影响; TOC 自产自销）。
+- 数学公式按原文显示（Phase 1 取舍; pandoc 的 KaTeX 也是 CDN 链接, 离线同样不渲染）。
+- 代码块无高亮 token（Phase 1 取舍; Phase 2 orgize 自带 =SyntectHtmlHandler=, 叠加成本
+  低于 spike 初估——无需自接 syntect 管线）。
+- CJK 边界 verbatim 错配与渲染器无关（spike 附注）: 文档内容问题, 不处理。
+
+* 工作量估计
+
+- Phase 1: 0.5–1 天（orgize 接入 + 页面骨架 + 自建 TOC + CSS 微调 + 测试更新）。
+- Phase 2（后续）: +1–2 天。syntect: org 用内置 =SyntectHtmlHandler=, .md 候选 comrak
+  （自带 syntect 集成）或 pulldown-cmark, 代码文件直接 syntect 渲染; KaTeX 候选
+  katex-rs（纯 Rust 服务端渲染）或维持原文。
+
+* 附注
+
+- spike 数据与方法: docs/2026-08-05-spike-orgize-report.org（探针工程 /tmp/orgize-spike
+  已清理）。
+- orgize 0.9.0 API 依据 docs.rs 核实: =Org::parse= / =write_html_custom= / =HtmlHandler=
+  （=Element::Title{level, raw}= 的锚点示例即本提案 TOC 方案的原型）; =syntect= feature 内置。

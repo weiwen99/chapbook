@@ -1,0 +1,595 @@
+//! 路由集成测试: 元信息 / 文件服务 / 目录列表 / 文档与代码渲染 / 响应协商 / 安全.
+
+use std::path::Path;
+
+use axum::body::{to_bytes, Body};
+use axum::http::{header, Request, Response, StatusCode};
+use axum::Router;
+use tempfile::TempDir;
+use tower::ServiceExt;
+
+use chapbook::routes;
+
+const TEXT1: &str = "text 1";
+const TEXT2: &str = r#"{"key":"value"}"#;
+
+fn app(root: &Path) -> Router {
+    routes::app(root.to_path_buf())
+}
+
+async fn get(app: Router, uri: &str) -> Response<Body> {
+    app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn body_string(res: Response<Body>) -> String {
+    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+fn content_type(res: &Response<Body>) -> String {
+    res.headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// 建一个含 1.txt 和 subdir/2.json 的测试目录.
+fn fixture() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("1.txt"), TEXT1).unwrap();
+    std::fs::create_dir(dir.path().join("subdir")).unwrap();
+    std::fs::write(dir.path().join("subdir/2.json"), TEXT2).unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn meta_api_works() {
+    let dir = fixture();
+    let res = get(app(dir.path()), "/__/status").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_string(res).await, "simple static server is running.\n");
+}
+
+#[tokio::test]
+async fn serves_top_level_files() {
+    let dir = fixture();
+    let res = get(app(dir.path()), "/1.txt").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_string(res).await, TEXT1);
+}
+
+#[tokio::test]
+async fn serves_nested_dir_files() {
+    let dir = fixture();
+    let res = get(app(dir.path()), "/subdir/2.json").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "application/json");
+    assert_eq!(body_string(res).await, TEXT2);
+}
+
+#[tokio::test]
+async fn missing_file_returns_404() {
+    let dir = fixture();
+    let res = get(app(dir.path()), "/nope.txt").await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+/// text/* 响应必须带 charset=utf-8, 否则浏览器按 Latin-1 猜码, UTF-8 中文乱码
+#[tokio::test]
+async fn text_files_served_with_utf8_charset() {
+    let dir = fixture();
+    let chinese = "// 中文注释\nfn main() {}\n";
+    std::fs::write(dir.path().join("main.rs"), chinese).unwrap();
+
+    for (uri, expected_ct) in [
+        ("/1.txt", "text/plain; charset=utf-8"),
+        ("/main.rs", "text/x-rust; charset=utf-8"),
+    ] {
+        let res = get(app(dir.path()), uri).await;
+        assert_eq!(res.status(), StatusCode::OK, "uri: {uri}");
+        assert_eq!(content_type(&res), expected_ct, "uri: {uri}");
+    }
+    let res = get(app(dir.path()), "/main.rs").await;
+    assert_eq!(body_string(res).await, chinese);
+}
+
+async fn get_with_accept(app: Router, uri: &str, accept: &str) -> Response<Body> {
+    app.oneshot(
+        Request::builder()
+            .uri(uri)
+            .header(header::ACCEPT, accept)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+/// 代码文件: 浏览器 (Accept: text/html) -> syntect 高亮 HTML (带行号); curl (Accept: */*) -> 原文.
+/// ?raw=1 / ?view=1 显式覆盖.
+#[tokio::test]
+async fn code_file_content_negotiation() {
+    let dir = fixture();
+    let rust_src = "// 你好\nfn main() { let x = 1; }\n";
+    std::fs::write(dir.path().join("main.rs"), rust_src).unwrap();
+
+    // 浏览器 -> 高亮 HTML
+    let res = get_with_accept(
+        app(dir.path()),
+        "/main.rs",
+        "text/html,application/xhtml+xml",
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/html; charset=utf-8");
+    let body = body_string(res).await;
+    assert!(
+        body.contains(r#"<pre class="sourceCode"><code>"#),
+        "body: {body}"
+    );
+    assert!(
+        body.contains(r#"<span class="ln">1</span>"#),
+        "should have line numbers: {body}"
+    );
+    assert!(body.contains("/* chapbook-doc-style */"), "body: {body}");
+    assert!(body.contains("<title>main.rs</title>"), "body: {body}");
+
+    // curl (Accept: */*) -> 原文
+    let res = get_with_accept(app(dir.path()), "/main.rs", "*/*").await;
+    assert_eq!(content_type(&res), "text/x-rust; charset=utf-8");
+    assert_eq!(body_string(res).await, rust_src);
+
+    // ?raw=1 即使浏览器 Accept 也返回原文
+    let res = get_with_accept(app(dir.path()), "/main.rs?raw=1", "text/html").await;
+    assert_eq!(content_type(&res), "text/x-rust; charset=utf-8");
+
+    // ?view=1 即使 curl Accept 也返回 HTML
+    let res = get_with_accept(app(dir.path()), "/main.rs?view=1", "*/*").await;
+    assert_eq!(content_type(&res), "text/html; charset=utf-8");
+}
+
+/// 内容含 ``` 的代码文件: 按代码渲染 (syntect 对非法语法宽容), 内容不截断.
+#[tokio::test]
+async fn code_file_with_embedded_fences() {
+    let dir = fixture();
+    let src = "# doc\n\n```python\nprint(1)\n```\n\ntail_marker_line = 1\n";
+    std::fs::write(dir.path().join("readme.py"), src).unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/readme.py", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    // 高亮会把 token 包进 span, 断言内容须用标识符
+    assert!(
+        body.contains("tail_marker_line"),
+        "content after embedded fence must survive: {body}"
+    );
+}
+
+/// 非 UTF-8 代码文件: 不做编码猜测, 裸字节透传.
+#[tokio::test]
+async fn non_utf8_code_file_passthrough() {
+    let dir = fixture();
+    // GBK 编码的 "中文" 等非法 UTF-8 序列
+    let gbk_bytes: &[u8] = b"// \xd6\xd0\xce\xc4\xc7\xf8\n";
+    std::fs::write(dir.path().join("legacy.rs"), gbk_bytes).unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/legacy.rs", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/x-rust; charset=utf-8");
+    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(bytes.as_ref(), gbk_bytes);
+}
+
+/// 超过 1MB 的代码文件不做渲染, 直接走 ServeFile.
+#[tokio::test]
+async fn oversized_code_file_not_rendered() {
+    let dir = fixture();
+    let big = "x".repeat(1024 * 1024 + 1);
+    std::fs::write(dir.path().join("big.rs"), &big).unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/big.rs", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/x-rust; charset=utf-8");
+    assert_eq!(body_string(res).await, big);
+}
+
+/// 未知扩展名维持裸文本现状.
+#[tokio::test]
+async fn unknown_extension_stays_raw() {
+    let dir = fixture();
+    std::fs::write(dir.path().join("data.xyz123"), "hello").unwrap();
+    let res = get_with_accept(app(dir.path()), "/data.xyz123", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_ne!(content_type(&res), "text/html; charset=utf-8");
+    assert_eq!(body_string(res).await, "hello");
+}
+
+/// .html 是网页不是代码: 即使浏览器 Accept 也直接透传原文 (text/html), 让浏览器渲染网页.
+#[tokio::test]
+async fn html_files_render_natively() {
+    let dir = fixture();
+    let page = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><h1>网页</h1></body></html>";
+    std::fs::write(dir.path().join("page.html"), page).unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/page.html", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/html; charset=utf-8");
+    let body = body_string(res).await;
+    assert_eq!(
+        body, page,
+        "html file must be served verbatim, not highlighted"
+    );
+    assert!(!body.contains("sourceCode"), "body: {body}");
+}
+
+#[tokio::test]
+async fn directory_listing_survives_broken_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("real.txt"), "real").unwrap();
+    // Emacs 风格的锁文件: 目标不存在的悬空符号链接
+    std::os::unix::fs::symlink("user@host.12345:67890", dir.path().join(".#real.txt")).unwrap();
+
+    let res = get(app(dir.path()), "/").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(
+        body.contains("real.txt"),
+        "body should list real.txt: {body}"
+    );
+    // 主题样式与 thead 结构 (表头不应被条纹染色)
+    assert!(
+        body.contains(r#"href="/__/static/css/chapbook-theme.css""#),
+        "body: {body}"
+    );
+    assert!(body.contains("<thead>"), "body: {body}");
+}
+
+/// .md 经 comrak 纯 Rust 渲染 (无 pandoc 依赖, 恒跑):
+/// 完整页面 + 自建 TOC + syntect 高亮 + 同一 DOC_STYLE.
+#[tokio::test]
+async fn markdown_rendered_via_comrak() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("test.md"),
+        "# Hello\n\nThis is **markdown**.\n\n## Section 2\n\n```scala\nval x = 1\n```\n",
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/test.md").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/html; charset=utf-8");
+    let body = body_string(res).await;
+    assert!(body.contains("<strong>markdown</strong>"), "body: {body}");
+    // 与 org 同一视觉系统: DOC_STYLE + 自建 TOC + syntect 高亮
+    assert!(body.contains("/* chapbook-doc-style */"), "body: {body}");
+    assert!(body.contains(r#"<nav id="TOC""#), "body: {body}");
+    assert!(
+        body.contains(r#"<pre class="sourceCode"><code class="language-scala">"#),
+        "body: {body}"
+    );
+    // 高亮 token 类名 (syntect scope atom) 或纯文本都要保住代码内容;
+    // token 被包进 span, 断言须按 token 边界
+    assert!(body.contains(">val<"), "body: {body}");
+    assert!(body.contains(">x<"), "body: {body}");
+    assert!(body.contains(">1<"), "body: {body}");
+}
+
+/// md 与 org 共用同一 slug 函数: TOC href 与正文标题 id 一一对应 (含去重后缀).
+#[tokio::test]
+async fn markdown_toc_anchors_match_heading_ids() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("toc.md"),
+        "# Intro\n\ntext\n\n## Deep **Dive**\n\n# Intro\n\n## 中文 标题\n",
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/toc.md").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+
+    let nav = body
+        .split(r#"<nav id="TOC">"#)
+        .nth(1)
+        .and_then(|rest| rest.split("</nav>").next())
+        .expect("TOC nav must exist");
+    let mut toc_hrefs: Vec<&str> = nav
+        .split("href=\"#")
+        .skip(1)
+        .map(|s| s.split('"').next().unwrap())
+        .collect();
+    toc_hrefs.sort_unstable();
+
+    let mut heading_ids: Vec<&str> = Vec::new();
+    for tag in [
+        "<h1><a id=\"",
+        "<h2><a id=\"",
+        "<h3><a id=\"",
+        "<h4><a id=\"",
+        "<h5><a id=\"",
+        "<h6><a id=\"",
+    ] {
+        for part in body.split(tag).skip(1) {
+            heading_ids.push(part.split('"').next().unwrap());
+        }
+    }
+    heading_ids.sort_unstable();
+
+    assert_eq!(
+        toc_hrefs, heading_ids,
+        "TOC hrefs and heading ids must match 1:1: {body}"
+    );
+    // 粗体被扁平化: "Deep **Dive**" -> "Deep Dive" -> slug deep-dive
+    assert!(heading_ids.contains(&"deep-dive"), "body: {body}");
+    // 重复标题去重
+    assert!(heading_ids.contains(&"intro"), "body: {body}");
+    assert!(heading_ids.contains(&"intro-1"), "body: {body}");
+}
+
+/// YAML front matter: title 进 <title> 与 title-block-header, front matter 本身不显示.
+#[tokio::test]
+async fn markdown_front_matter_title() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("fm.md"),
+        "---\ntitle: \"我的文档\"\n---\n\n# Section\n\nbody\n",
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/fm.md").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(body.contains("<title>我的文档</title>"), "body: {body}");
+    assert!(
+        body.contains(
+            r#"<header id="title-block-header"><h1 class="title">我的文档</h1></header>"#
+        ),
+        "body: {body}"
+    );
+    // front matter 不渲染为内容 (无孤立 hr/文本)
+    assert!(!body.contains("title: \"我的文档\""), "body: {body}");
+}
+
+/// .org 经 orgize 纯 Rust 渲染 (无 pandoc/emacs 依赖, 恒跑):
+/// 完整页面 + 自建 TOC + 标题锚点 + src 块 + 同一 DOC_STYLE.
+#[tokio::test]
+async fn org_rendered_via_orgize() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("test.org"),
+        "* Hello Org\nThis is /org-mode/ text with =verbatim= code.\n\n#+begin_src scala\nval x = 1\n#+end_src\n",
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/test.org").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/html; charset=utf-8");
+    let body = body_string(res).await;
+    // orgize 用 <i> 表示斜体 (pandoc 是 <em>)
+    assert!(body.contains("<i>org-mode</i>"), "body: {body}");
+    // verbatim -> <code> (orgize 输出无 class)
+    assert!(body.contains("<code>verbatim</code>"), "body: {body}");
+    // 自建 TOC 保留
+    assert!(body.contains(r#"<nav id="TOC""#), "body: {body}");
+    // 同一视觉系统: DOC_STYLE 注入 + 宽屏侧栏守卫
+    assert!(body.contains("/* chapbook-doc-style */"), "body: {body}");
+    assert!(
+        body.contains("@media screen and (min-width: 75rem)"),
+        "body: {body}"
+    );
+    // src 块: orgize 输出 <pre class="src src-scala">, 无高亮 token
+    assert!(
+        body.contains(r#"<pre class="src src-scala">"#),
+        "body: {body}"
+    );
+    // CSS 中 pre.src 选择器保住代码块底色
+    assert!(body.contains("pre.src"), "body: {body}");
+}
+
+/// 4 级标题保真: pandoc/emacs 都会丢 h4, orgize 保留 (spike plan-56 场景).
+#[tokio::test]
+async fn org_keeps_level4_headings() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("h4.org"),
+        "* Top\n** Sub\n*** Subsub\n**** Level 4\ncontent\n",
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/h4.org").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(body.contains("<h4>"), "h4 must survive: {body}");
+    assert!(body.contains(">Level 4<"), "body: {body}");
+}
+
+/// TOC 链接与正文标题锚点必须由同一 slug 函数生成: nav 内 href 与标题 id 一一对应.
+/// 重复标题走 -1/-2 去重后缀.
+#[tokio::test]
+async fn org_toc_anchors_match_heading_ids() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("toc.org"),
+        "* Intro\ncontent\n** Deep Dive\nmore\n* Intro\nagain\n* Level 4 标题\nx\n",
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/toc.org").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+
+    let nav = body
+        .split(r#"<nav id="TOC">"#)
+        .nth(1)
+        .and_then(|rest| rest.split("</nav>").next())
+        .expect("TOC nav must exist");
+    let mut toc_hrefs: Vec<&str> = nav
+        .split("href=\"#")
+        .skip(1)
+        .map(|s| s.split('"').next().unwrap())
+        .collect();
+    toc_hrefs.sort_unstable();
+
+    let mut heading_ids: Vec<&str> = Vec::new();
+    for tag in [
+        "<h1><a id=\"",
+        "<h2><a id=\"",
+        "<h3><a id=\"",
+        "<h4><a id=\"",
+        "<h5><a id=\"",
+        "<h6><a id=\"",
+    ] {
+        for part in body.split(tag).skip(1) {
+            heading_ids.push(part.split('"').next().unwrap());
+        }
+    }
+    heading_ids.sort_unstable();
+
+    assert_eq!(
+        toc_hrefs, heading_ids,
+        "TOC hrefs and heading ids must match 1:1: {body}"
+    );
+    // 重复标题去重: 两个 "Intro" -> intro 与 intro-1
+    assert!(heading_ids.contains(&"intro"), "body: {body}");
+    assert!(heading_ids.contains(&"intro-1"), "body: {body}");
+}
+
+/// #+TITLE -> <title> 与 header 下 h1.title (pandoc 行为对齐); #+AUTHOR/#+DATE 同渲染.
+#[tokio::test]
+async fn org_title_keyword_sets_page_title() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("titled.org"),
+        "#+TITLE: 我的文档\n#+AUTHOR: Alice\n#+DATE: 2026-08-05\n\n* Section\nbody\n",
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/titled.org").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(body.contains("<title>我的文档</title>"), "body: {body}");
+    assert!(
+        body.contains(
+            r#"<header id="title-block-header"><h1 class="title">我的文档</h1><p class="author">Alice</p><p class="date">2026-08-05</p></header>"#
+        ),
+        "body: {body}"
+    );
+}
+
+/// #+OPTIONS: toc:nil 关闭自建 TOC (标题与锚点仍正常渲染).
+#[tokio::test]
+async fn org_options_toc_nil_disables_toc() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("notoc.org"),
+        "#+OPTIONS: toc:nil num:nil\n\n* Section\nbody\n",
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/notoc.org").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(!body.contains(r#"<nav id="TOC""#), "body: {body}");
+    assert!(body.contains("<h1>"), "headings still render: {body}");
+}
+
+/// 词法前缀比较不会消除 `..` 分量, `/%2e%2e/%2e%2e/...` 可以读到根目录外的文件.
+/// 必须逐分量解析, 溢出即 403.
+#[tokio::test]
+async fn path_traversal_is_forbidden() {
+    let dir = fixture();
+    for uri in [
+        "/%2e%2e/%2e%2e/%2e%2e/etc/passwd",
+        "/subdir/../../../../../etc/passwd",
+    ] {
+        let res = get(app(dir.path()), uri).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "uri: {uri}");
+    }
+}
+
+#[tokio::test]
+async fn range_request_returns_partial_content() {
+    let dir = fixture();
+    let res = app(dir.path())
+        .oneshot(
+            Request::builder()
+                .uri("/1.txt")
+                .header(header::RANGE, "bytes=0-3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        res.headers().get(header::CONTENT_RANGE).unwrap(),
+        &format!("bytes 0-3/{}", TEXT1.len()).as_str()
+    );
+    assert_eq!(body_string(res).await, &TEXT1[..4]);
+}
+
+#[tokio::test]
+async fn invalid_sort_param_returns_404() {
+    let dir = fixture();
+    // 非法 sort 参数 -> 404 (不是 400), 保持既有行为
+    let res = get(app(dir.path()), "/?sort=Name:Invalid").await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn sort_by_size_desc() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("small.txt"), "x").unwrap();
+    std::fs::write(dir.path().join("large.txt"), "x".repeat(100)).unwrap();
+
+    let res = get(app(dir.path()), "/?sort=Size:Desc").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    let large_pos = body.find("large.txt").unwrap();
+    let small_pos = body.find("small.txt").unwrap();
+    assert!(
+        large_pos < small_pos,
+        "Size:Desc should list large.txt first: {body}"
+    );
+}
+
+/// 文件名含空格: 链接必须 percent-encode 为 %20 (表单语义的 `+` 在 path segment 是 bug),
+/// 且 %20 URL 能正确解码回文件.
+#[tokio::test]
+async fn space_in_filename_is_percent_encoded() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a b.txt"), "space").unwrap();
+
+    let res = get(app(dir.path()), "/").await;
+    let body = body_string(res).await;
+    assert!(body.contains(r#"href="/a%20b.txt""#), "body: {body}");
+
+    let res = get(app(dir.path()), "/a%20b.txt").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_string(res).await, "space");
+}
+
+#[tokio::test]
+async fn static_assets_served() {
+    let dir = fixture();
+    let res = get(app(dir.path()), "/__/static/css/materialize.min.css").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/css");
+    assert!(body_string(res).await.contains("Materialize"));
+
+    let res = get(app(dir.path()), "/__/static/css/chapbook-theme.css").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/css");
+    assert!(body_string(res).await.contains("chapbook-theme"));
+
+    let res = get(app(dir.path()), "/__/static/js/materialize.min.js").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "application/javascript");
+
+    let res = get(app(dir.path()), "/__/static/css/nope.css").await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}

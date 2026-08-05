@@ -1,0 +1,90 @@
+/* chapbook-theme: 目录列表页主题, 覆盖 Materialize v2 默认值.
+ * 色系与 org 渲染页 (render.rs ORG_STYLE) 一致: GitHub 风格, 亮/暗自适应.
+ *
+ * 覆盖动机:
+ * - v2.3.3 dist 的链接色是无效的 `colorFunc("light-blue","darken-1")`, 浏览器丢弃后回退到 UA 默认蓝紫色
+ * - v2 条纹 rgba(0,0,0,.08) 过重, 且会把隐式 tbody 里的表头行染成灰色带
+ * - v2 无暗色模式
+ */
+
+:root {
+  color-scheme: light;
+  --cb-text: #1f2328;
+  --cb-bg: #ffffff;
+  --cb-accent: #0969da;
+  --cb-muted: #57606a;
+  --cb-border: #d1d9e0;
+  --cb-soft: #f6f8fa;
+  --cb-hover: rgba(9, 105, 218, 0.08);
+}
+
+/* 全局字体缩放 ~80% (用户要求): 覆盖 Materialize 的 14/14.5/15px 响应式基准,
+ * rem 布局 (间距/标题) 随之等比缩放 */
+html {
+  font-size: 80%;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --cb-text: #e6edf3;
+    --cb-bg: #0d1117;
+    --cb-accent: #4493f8;
+    --cb-muted: #8b949e;
+    --cb-border: #30363d;
+    --cb-soft: #161b22;
+    --cb-hover: rgba(68, 147, 248, 0.15);
+  }
+}
+
+body {
+  background-color: var(--cb-bg);
+  color: var(--cb-text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+}
+
+a {
+  color: var(--cb-accent);
+}
+a:hover {
+  text-decoration: underline;
+}
+
+/* 表头: 不被条纹染色 (thead 独立于 tbody), 细分隔线, 长列表吸顶 */
+thead th {
+  background-color: var(--cb-bg);
+  border-bottom: 2px solid var(--cb-border);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+/* 吸顶表头的链接不需要下划线hover */
+thead a:hover {
+  text-decoration: none;
+}
+
+/* 条纹: 覆盖 v2 的 rgba(0,0,0,.08), 用更轻的 soft 色 */
+table.striped tbody > tr:nth-child(odd) {
+  background-color: var(--cb-soft);
+}
+/* hover 高亮 (优先级靠后, 覆盖条纹) */
+table.striped tbody > tr:hover {
+  background-color: var(--cb-hover);
+}
+
+/* 大小/时间列: 等宽数字便于扫读; Size 列右对齐 */
+td:nth-child(n+3),
+th:nth-child(n+3) {
+  font-variant-numeric: tabular-nums;
+}
+td:nth-child(3),
+th:nth-child(3) {
+  text-align: right;
+}
+
+/* 次级信息 (类型/时间) 用柔和色, 突出文件名 */
+td:nth-child(2),
+td:nth-child(n+4) {
+  color: var(--cb-muted);
+}

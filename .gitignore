@@ -1,0 +1,26 @@
+# 构建产物
+/target
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Emacs
+.#*        # 锁文件 (如 .#foo.txt, 悬空符号链接)
+#*#        # 自动保存文件 (如 #foo.txt#)
+*.elc      # 字节编译产物
+
+# AI 编码代理本地工作目录
+.claude/
+.cursor/
+.codex/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志与临时文件
+*.log
+*.tmp
