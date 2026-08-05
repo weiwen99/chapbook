@@ -4,13 +4,16 @@
 //! (`keyword` / `string` / `comment` …), 颜色由 chapbook-doc.css 调色板控制
 //! (GitHub 亮/暗双模式). 代码文件额外带行号 (`<span class="ln">`).
 //!
+//! 语法集 = syntect 默认集 (~50 语言) + `assets/syntaxes/` 内嵌补充
+//! (TypeScript/TOML/Kotlin/Swift 等默认集缺失的常见语言, 详见 THIRD_PARTY_NOTICES).
+//!
 //! 提案: docs/2026-08-05-proposal-syntax-highlight-code-files.org (方案 A).
 
 use std::path::Path;
 use std::sync::OnceLock;
 
 use syntect::html::{ClassStyle, ClassedHTMLGenerator};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxDefinition, SyntaxSet, SyntaxSetBuilder};
 use syntect::util::LinesWithEndings;
 
 /// 超过该大小的代码文件不做渲染, 直接走 ServeFile (避免内存放大).
@@ -19,21 +22,29 @@ pub const MAX_RENDER_BYTES: u64 = 1024 * 1024;
 /// 扩展名 -> 高亮 token. 未识别的扩展名维持裸文本现状.
 /// 注意: html/htm 不在此映射 — 网页文件应直接交给浏览器渲染, 而不是显示源码.
 pub fn language_for_path(path: &Path) -> Option<&'static str> {
+    // 无扩展名文件按文件名匹配 (常见构建/容器文件)
+    let file_name = path.file_name()?.to_str()?;
+    match file_name {
+        "Dockerfile" | "Containerfile" => return Some("dockerfile"),
+        "Makefile" | "GNUmakefile" | "makefile" => return Some("makefile"),
+        _ => {}
+    }
     let ext = path.extension()?.to_str()?;
     Some(match ext.to_ascii_lowercase().as_str() {
         "rs" => "rust",
-        "scala" => "scala",
+        "scala" | "sbt" => "scala",
         "java" => "java",
         "py" => "python",
-        "js" | "mjs" | "jsx" => "javascript",
-        "ts" | "tsx" => "typescript",
+        "js" | "mjs" => "javascript",
+        // JSX/TSX 共用 TypeScript 语法 (JSX 是其子集; 内嵌 TS 语法已加 tsx/jsx 扩展)
+        "ts" | "tsx" | "mts" | "cts" | "jsx" => "typescript",
         "go" => "go",
         "c" | "h" => "c",
         "cpp" | "cc" | "cxx" | "hpp" => "cpp",
         "sh" | "bash" | "zsh" => "bash",
         "sql" => "sql",
         "yaml" | "yml" => "yaml",
-        "toml" => "toml",
+        "toml" | "tml" => "toml",
         "xml" => "xml",
         "css" => "css",
         "json" => "json",
@@ -42,15 +53,118 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
         "lua" => "lua",
         "php" => "php",
         "swift" => "swift",
+        "graphql" | "gql" | "graphqls" => "graphql",
+        "dart" => "dart",
+        "ex" | "exs" => "elixir",
+        "cmake" => "cmake",
+        "proto" | "protobuf" => "protobuf",
+        "zig" | "zon" => "zig",
+        // conf/cfg 由内嵌 INI 语法处理 (构建时已加扩展)
+        "ini" | "conf" | "cfg" | "reg" | "inf" => "ini",
+        "nix" => "nix",
+        "svelte" => "svelte",
+        "properties" => "properties",
+        "bat" | "cmd" => "bat",
+        "hs" | "lhs" => "haskell",
+        "pl" | "pm" => "perl",
+        "r" => "r",
+        "tex" | "ltx" => "latex",
+        "diff" | "patch" => "diff",
         _ => return None,
     })
 }
 
-/// 内嵌语法集 (syntect defaults, 含 ~50 种语言), 进程内只构建一次.
+/// 内嵌语法集 (syntect 默认集 + 补充语法), 进程内只构建一次.
 /// 用 `load_defaults_newlines` 变体: 跨行字符串等上下文依赖行尾换行符参与匹配.
 fn syntax_set() -> &'static SyntaxSet {
     static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+    SYNTAX_SET.get_or_init(build_syntax_set)
+}
+
+/// 内嵌补充语法 (syntect 默认集缺失的常见语言).
+/// 来源: sublimehq/Packages (TOML) 与 sharkdp/bat assets/syntaxes/02_Extra (其余),
+/// 许可证见 THIRD_PARTY_NOTICES. 部分语法补充扩展名 (如 TS 语法认 tsx/jsx).
+fn build_syntax_set() -> SyntaxSet {
+    let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/TypeScript.sublime-syntax"),
+        &["tsx", "jsx"],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/TOML.sublime-syntax"),
+        &[],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/Kotlin.sublime-syntax"),
+        &[],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/Swift.sublime-syntax"),
+        &[],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/Dockerfile.sublime-syntax"),
+        &["Containerfile"],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/GraphQL.sublime-syntax"),
+        &[],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/Dart.sublime-syntax"),
+        &[],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/Elixir.sublime-syntax"),
+        &[],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/CMake.sublime-syntax"),
+        &[],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/Protobuf.sublime-syntax"),
+        &[],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/Zig.sublime-syntax"),
+        &[],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/INI.sublime-syntax"),
+        &["conf", "cfg"],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/Nix.sublime-syntax"),
+        &[],
+    );
+    add_extra(
+        &mut builder,
+        include_str!("../assets/syntaxes/Svelte.sublime-syntax"),
+        &[],
+    );
+    builder.build()
+}
+
+fn add_extra(builder: &mut SyntaxSetBuilder, src: &str, extra_extensions: &[&str]) {
+    let mut def = SyntaxDefinition::load_from_str(src, true, None)
+        .expect("embedded .sublime-syntax must parse");
+    def.file_extensions
+        .extend(extra_extensions.iter().map(|s| s.to_string()));
+    builder.add(def);
 }
 
 /// 高亮代码为 classed HTML fragment (不含 `<pre>`/`<code>` 包裹, 内容已转义).

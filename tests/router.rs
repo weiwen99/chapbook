@@ -169,6 +169,51 @@ async fn code_file_with_embedded_fences() {
     );
 }
 
+/// 常见语言覆盖: 内嵌补充语法 (TypeScript/TOML/Kotlin 等) 渲染出高亮 span 而非纯文本.
+/// Dockerfile 无扩展名, 走文件名匹配路径.
+#[tokio::test]
+async fn code_file_highlighting_covers_common_languages() {
+    let dir = fixture();
+    let cases: &[(&str, &str)] = &[
+        ("main.ts", "interface Foo {\n  bar: string;\n}\n"),
+        ("Cargo.toml", "[package]\nname = \"x\"\n"),
+        ("Dockerfile", "FROM rust:1.97\nRUN cargo build\n"),
+        ("app.conf", "key = value\n"),
+        ("main.kt", "fun main() { val x = 1 }\n"),
+        ("main.swift", "let x = 1\n"),
+        ("main.dart", "void main() { var x = 1; }\n"),
+        ("main.ex", "defmodule Foo do\n  def bar, do: :ok\nend\n"),
+        ("schema.graphql", "type Query { hello: String }\n"),
+        (
+            "main.proto",
+            "syntax = \"proto3\";\nmessage Foo { string name = 1; }\n",
+        ),
+        ("main.zig", "const x: i32 = 1;\n"),
+        ("default.nix", "{ pkgs }: pkgs.hello\n"),
+    ];
+    for (file, content) in cases {
+        std::fs::write(dir.path().join(file), content).unwrap();
+    }
+    for (file, _) in cases {
+        let res = get_with_accept(app(dir.path()), &format!("/{file}"), "text/html").await;
+        assert_eq!(res.status(), StatusCode::OK, "{file}");
+        let body = body_string(res).await;
+        assert!(
+            body.contains("<pre class=\"sourceCode\"><code>"),
+            "{file}: {body}"
+        );
+        assert!(
+            body.contains(r#"<span class="ln">1</span>"#),
+            "{file}: {body}"
+        );
+        // 有高亮 span 而非 plain text 兜底
+        assert!(
+            body.contains("<span class="),
+            "{file} rendered as plain text: {body}"
+        );
+    }
+}
+
 /// 非 UTF-8 代码文件: 不做编码猜测, 裸字节透传.
 #[tokio::test]
 async fn non_utf8_code_file_passthrough() {
