@@ -7,7 +7,7 @@
 
   outputs = { self, nixpkgs }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" ];
+      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
     in
     {
@@ -23,7 +23,8 @@
         in {
           # 与 nixpkgs 同版本的 cargo/rustc，避免 rustup shim 无默认 toolchain 的坑
           default = pkgs.mkShell {
-            packages = with pkgs; [ cargo rustc clippy rustfmt gcc ];
+            # stdenv.cc：linux 上为 gcc wrapper、darwin 上为 clang wrapper
+            packages = with pkgs; [ cargo rustc clippy rustfmt stdenv.cc ];
           };
         });
     };
