@@ -4,6 +4,7 @@ pub mod assets;
 pub mod highlight;
 pub mod listing;
 pub mod markdown;
+pub mod math;
 pub mod meta;
 pub mod office;
 pub mod opts;

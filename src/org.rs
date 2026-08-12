@@ -178,6 +178,12 @@ impl HtmlHandler<IoError> for OrgHtmlHandler {
                 self.heading_index += 1;
                 write!(w, "<h{level}><a id=\"{slug}\" href=\"#{slug}\">")?;
             }
+            // 数学: orgize 不解析 LaTeX, `$..$`/`\(..\)`/`\begin{align}` 都是普通 Text.
+            // 在 Text 元素上 tokenize (src/example/code/verbatim 是独立元素, 不经过这里),
+            // 数学段服务端 KaTeX 渲染, 失败回退原文; 其余文本照常转义.
+            Element::Text { value } => {
+                write!(w, "{}", crate::math::org_text_html(value))?;
+            }
             // src 块: syntect 高亮 (无语言时交回默认 handler 输出 `<pre class="example">`)
             Element::SourceBlock(block) if !block.language.is_empty() => {
                 write!(

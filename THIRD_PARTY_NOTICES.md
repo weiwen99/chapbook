@@ -32,6 +32,39 @@ chapbook 本身采用 Apache License 2.0（见 [LICENSE](./LICENSE)）。
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 > SOFTWARE.
 
+### KaTeX v0.16.7（数学排版）
+
+`assets/katex/katex.min.css` 与 `assets/katex/fonts/*.woff2` 来自
+[KaTeX/KaTeX](https://github.com/KaTeX/KaTeX)（v0.16.7，MIT），与 `katex` crate
+内嵌的 `katex.min.js` 版本一致（该 JS 由 crate 自带，不直接分发）。
+
+`katex.min.css` 是官方 dist 的**裁剪版**：仅保留 woff2 字体的 `@font-face` 引用
+（woff/ttf 引用已移除，现代浏览器均支持 woff2），升级 KaTeX 时需同步替换
+`assets/katex/katex.min.css`、`assets/katex/fonts/` 与 Cargo.toml 中 `katex` crate
+版本，并保持三者版本一致（见 AGENTS.md 依赖表）。
+
+> The MIT License (MIT)
+>
+> Copyright (c) 2013-2023 Khan Academy
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all
+> copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+> SOFTWARE.
+
 ## 内嵌语法定义（随二进制分发）
 
 `assets/syntaxes/` 下的 14 个 TextMate 语法文件用于补充 syntect 默认集缺失的常见语言
@@ -53,6 +86,8 @@ Zig、INI、Nix、Svelte）：
 | [orgize](https://github.com/PoiScript/orgize) | MIT | .org 文档渲染 |
 | [comrak](https://github.com/kivikakk/comrak) | BSD-2-Clause | .md 文档渲染 |
 | [syntect](https://github.com/trishume/syntect) | MIT | 代码语法高亮（内嵌语法集） |
+| [katex](https://github.com/xu-cheng/katex-rs) | MIT OR Apache-2.0 | LaTeX 数学渲染（内嵌官方 KaTeX 0.16.7 JS，经 QuickJS 执行） |
+| [quick-js](https://crates.io/crates/quick-js)（含 QuickJS C 源码） | MIT | katex crate 的 JS 引擎（构建期经 cc 编译，静态链接） |
 | [maud](https://github.com/lambda-fairy/maud) | MIT OR Apache-2.0 | HTML 模板 |
 | [axum](https://github.com/tokio-rs/axum) / [tokio](https://github.com/tokio-rs/tokio) | MIT | HTTP 服务运行时 |
 

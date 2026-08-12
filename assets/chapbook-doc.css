@@ -99,6 +99,11 @@ span.done { color: #1a7f37; font-weight: 600; }
 img { max-width: 100%; height: auto; }
 hr { margin: 2em 0; border: none; border-top: 1px solid var(--cb-border); }
 
+/* KaTeX 数学 (服务端渲染的 .katex 结构):
+ * display 公式 (align/$$ 块) 常超正文栏宽, 容器横向滚动而非撑破布局;
+ * 颜色继承正文 (亮/暗自适应), 无需额外色板 */
+.katex-display { margin: 1.1em 0; overflow-x: auto; overflow-y: hidden; padding: 0.15em 0; }
+
 /* 语法高亮调色板 (syntect ClassStyle::Spaced 输出完整 scope atom 类名):
  * 取 GitHub prettylights (亮) / GitHub Dark (暗) 调色板, 与页面色系同源, 代码块背景色不动.
  * 选择器按 scope 原子组合精确定位: 函数名用 entity.name.function / support.function

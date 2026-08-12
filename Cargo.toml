@@ -28,6 +28,9 @@ percent-encoding = "2"
 maud = "0.27"
 orgize = { version = "0.9", default-features = false }
 comrak = { version = "0.54", default-features = false }
+# LaTeX 数学公式服务端渲染 (官方 KaTeX 0.16.7 经 QuickJS 执行, 纯构建期 C 编译);
+# 渲染失败返回 Err, 由 math.rs 回退原文显示
+katex = "0.4"
 syntect = "5"
 
 [dev-dependencies]
