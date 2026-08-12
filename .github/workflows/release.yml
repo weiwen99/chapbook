@@ -1,0 +1,52 @@
+name: Release
+
+# 打 v* tag 时自动构建 Linux/macOS 二进制并发布到 GitHub Releases.
+# 用法: git tag v0.2.0 && git push origin v0.2.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+
+  build:
+    name: ${{ matrix.target }}
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64: musl 静态链接, 不依赖发行版 glibc 版本 (release 树纯 Rust, 无 C 依赖)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          # macOS Apple Silicon (macos-latest 自 2026-06 起为 macOS 26 arm64)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          # macOS Intel: GitHub 官方宣布 Intel runner 于 2027 秋退役, 届时移除该项
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Linux 交叉工具链 (musl target + 链接器); macOS 原生构建不需要
+      - name: Install cross toolchain
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+          runner: none
+      # 构建 release 二进制, 打包 chapbook-<target>.tar.gz (+ sha256), 上传到 release
+      - name: Build and upload
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: chapbook
+          target: ${{ matrix.target }}
+          include: LICENSE,README.md
