@@ -1,5 +1,6 @@
 //! 路由集成测试: 元信息 / 文件服务 / 目录列表 / 文档与代码渲染 / 响应协商 / 安全.
 
+use std::io::Write as _;
 use std::path::Path;
 
 use axum::body::{to_bytes, Body};
@@ -637,4 +638,152 @@ async fn static_assets_served() {
 
     let res = get(app(dir.path()), "/__/static/css/nope.css").await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------- Office 文档 / CSV 渲染 (anydoc) ----------
+
+/// 构造最小 docx (zip 包: [Content_Types].xml + _rels/.rels + word/document.xml).
+fn docx_bytes(body_text: &str) -> Vec<u8> {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("[Content_Types].xml", options).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#,
+        )
+        .unwrap();
+        zip.start_file("_rels/.rels", options).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#,
+        )
+        .unwrap();
+        zip.start_file("word/document.xml", options).unwrap();
+        write!(
+            zip,
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{body_text}</w:t></w:r></w:p></w:body></w:document>"#
+        )
+        .unwrap();
+        zip.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+/// CSV: 浏览器 (Accept: text/html) -> anydoc 转 GFM markdown 表格 -> comrak 渲染文档页.
+/// 表格必须进 <table> (comrak GFM 表格扩展), 与 .md 同一文档页骨架.
+#[tokio::test]
+async fn office_csv_rendered_as_table() {
+    let dir = fixture();
+    let csv = "name,age\nAlice,30\nBob,25\n";
+    std::fs::write(dir.path().join("data.csv"), csv).unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/data.csv", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/html; charset=utf-8");
+    let body = body_string(res).await;
+    assert!(body.contains("<table>"), "body: {body}");
+    assert!(body.contains("Alice"), "body: {body}");
+    assert!(body.contains("Bob"), "body: {body}");
+}
+
+/// CSV: 脚本客户端 (Accept: */*) -> 原文 text/csv, 不被劫持成 HTML.
+#[tokio::test]
+async fn office_csv_raw_for_script_clients() {
+    let dir = fixture();
+    let csv = "name,age\nAlice,30\n";
+    std::fs::write(dir.path().join("data.csv"), csv).unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/data.csv", "*/*").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    // ensure_text_charset 会给 text/* 补 charset, 与 text/plain 行为一致
+    assert_eq!(content_type(&res), "text/csv; charset=utf-8");
+    assert_eq!(body_string(res).await, csv);
+}
+
+/// CSV: ?view=1 强制渲染, ?raw=1 强制原文 (与代码文件同一协商覆盖).
+#[tokio::test]
+async fn office_view_raw_overrides() {
+    let dir = fixture();
+    let csv = "name,age\nAlice,30\n";
+    std::fs::write(dir.path().join("data.csv"), csv).unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/data.csv?view=1", "*/*").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/html; charset=utf-8");
+    assert!(body_string(res).await.contains("Alice"));
+
+    let res = get_with_accept(app(dir.path()), "/data.csv?raw=1", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/csv; charset=utf-8");
+    assert_eq!(body_string(res).await, csv);
+}
+
+/// docx: anydoc 转 GFM markdown -> comrak 渲染, 正文文本出现在文档页.
+#[tokio::test]
+async fn office_docx_rendered_via_anydoc() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("report.docx"),
+        docx_bytes("Hello from docx"),
+    )
+    .unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/report.docx", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/html; charset=utf-8");
+    let body = body_string(res).await;
+    assert!(body.contains("Hello from docx"), "body: {body}");
+    // 与 .md 同一文档页骨架 (DOC_STYLE)
+    assert!(body.contains("chapbook-doc"), "body: {body}");
+}
+
+/// 损坏的 Office 文件: 转换失败 -> 裸字节透传, 浏览器下载后由本地应用打开.
+#[tokio::test]
+async fn office_garbage_falls_back_to_raw() {
+    let dir = fixture();
+    let garbage = b"this is not a docx at all, just some bytes that look like a word file";
+    std::fs::write(dir.path().join("broken.docx"), garbage).unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/broken.docx", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = content_type(&res);
+    assert!(!ct.contains("text/html"), "content-type: {ct}");
+    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(bytes.to_vec(), garbage);
+}
+
+/// 超过 office::MAX_RENDER_BYTES 的文件不做转换 (转换是 CPU 活, 大文件耗时无界).
+#[tokio::test]
+async fn oversized_office_file_not_rendered() {
+    let dir = fixture();
+    let big = "a,b\n".repeat(9 * 1024 * 1024); // "a,b\n" 4 字节 x 9 MiB 行 = 36 MiB > 32 MiB
+    std::fs::write(dir.path().join("big.csv"), big).unwrap();
+    assert!(std::fs::metadata(dir.path().join("big.csv")).unwrap().len() > 32 * 1024 * 1024);
+
+    let res = get_with_accept(app(dir.path()), "/big.csv", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/csv; charset=utf-8");
+}
+
+/// PDF 不进 anydoc 渲染路径: 浏览器原生打开 (ServeFile 透传 application/pdf).
+#[tokio::test]
+async fn pdf_still_served_raw() {
+    let dir = fixture();
+    let pdf = b"%PDF-1.4 fake pdf bytes";
+    std::fs::write(dir.path().join("doc.pdf"), pdf).unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/doc.pdf", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "application/pdf");
+    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(bytes.to_vec(), pdf);
 }

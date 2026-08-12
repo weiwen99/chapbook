@@ -5,6 +5,7 @@ pub mod highlight;
 pub mod listing;
 pub mod markdown;
 pub mod meta;
+pub mod office;
 pub mod opts;
 pub mod org;
 pub mod render;

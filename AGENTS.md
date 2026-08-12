@@ -5,8 +5,8 @@
 ## 项目简介
 
 **chapbook** 是一个轻量静态文件服务器，二进制名同为 `chapbook`。功能：目录列表（Materialize UI、可排序）、
-静态文件服务（Range 请求）、`.md` 经 comrak、`.org` 经 orgize、源代码文件经 syntect 渲染
-（全部纯 Rust、零运行时外部依赖）。
+静态文件服务（Range 请求）、`.md` 经 comrak、`.org` 经 orgize、Office/CSV 文档经 anydoc、源代码文件经
+syntect 渲染（全部纯 Rust、零运行时外部依赖）。
 
 ## 常用命令
 
@@ -46,6 +46,7 @@ src/
   highlight.rs # syntect 代码高亮（org src 块 / md 代码块 / 代码文件共用）+ 语言识别
   org.rs       # orgize 渲染 .org：预扫描元数据 + 自定义 HtmlHandler + src 块高亮
   markdown.rs  # comrak 渲染 .md：front matter、HeadingAdapter 锚点/TOC、代码高亮适配器
+  office.rs    # anydoc 转换 Office/CSV 为 GFM markdown：格式表（排除 PDF）、大小上限
   routes.rs    # axum 路由与 handler
   assets.rs    # include_str! 内嵌前端资源
 assets/        # materialize.min.css / materialize.min.js（v2.3.3 社区分支）+ chapbook-theme.css（目录页主题）
@@ -80,7 +81,13 @@ tests/
 7. 源代码文件（`highlight.rs` 的扩展名映射表内）按 **Accept 协商**返回：`text/html` → syntect
    高亮 HTML（带行号 `<span class="ln">`，同一 DOC_STYLE）；否则（curl 等）→ 原文。
    `?raw=1` / `?view=1` 显式覆盖。非 UTF-8 与 >1MB 文件不渲染，裸字节透传。
-   判定顺序：目录 → .md → .org → 代码 → ServeFile。
+8. Office/CSV 文档（`office.rs` 的 anydoc 格式表内：doc/docx/docm、ppt/pps/pot/pptx/pptm/ppsx/ppsm、
+   xls/xlsx/xlsm/xlsb、odt/ods/odp、rtf、epub、csv；**PDF 除外**——浏览器原生打开）同样按
+   **Accept 协商**返回：`text/html` → anydoc 转 GFM markdown 后经 `render_markdown_response`
+   渲染为文档页（与 .md 同一 comrak 管线，TOC/锚点/高亮一致）；否则 → 原文。
+   `?raw=1` / `?view=1` 显式覆盖。转换失败（ConvertError：加密/损坏/超限）与 >32 MiB
+   （`office::MAX_RENDER_BYTES`）文件不渲染，ServeFile 裸字节透传。
+   判定顺序：目录 → .md → .org → Office/CSV → 代码 → ServeFile。
 
 ## 安全不变量
 
@@ -102,6 +109,7 @@ tests/
 | orgize 0.9 | .org 渲染 | 纯 Rust AST 渲染，无子进程；`default-features = false`（跳过 serde） |
 | comrak 0.54 | .md 渲染 | `default-features = false`；HeadingAdapter/SyntaxHighlighterAdapter 插件化锚点与高亮 |
 | syntect 5 | 代码高亮 | 内嵌语法集（默认 ~50 语言 + `assets/syntaxes/` 补充 14 个常见语言，二进制 +~0.5MB）；`ClassStyle::Spaced` 输出 scope atom 类名 |
+| anydoc 0.1.8 | Office/CSV → GFM markdown | 纯 Rust（zip/calamine/cfb/quick-xml/pdf-inspector），无子进程；**锁精确版本**（0.1.x 早期，API 可能变动；升级需核对 `Format` 表与 `ConvertError`）；MSRV 1.88；二进制 +~6MB；经 `log` facade 报恢复事件，`tracing-log` 桥接到 RUST_LOG |
 | clap (derive) | CLI | `disable_help_flag`，`-h` 让给 `--host` |
 | chrono | 时间格式化 | `yyyy-MM-dd HH:mm:ss` 本地时区 |
 | percent-encoding | href 编码 | 见安全不变量 |
@@ -116,8 +124,8 @@ Materialize 前端资源来自 [materializecss/materialize](https://github.com/m
 
 1. 路径穿越：词法前缀比较不消除 `..` 分量 → 逐分量解析，溢出 root 返回 403；符号链接保持跟随。
 2. 文件名链接使用 percent-encoding（空格 `%20`），不用表单语义（`+`）。
-3. 零运行时外部依赖（无子进程、无外部二进制）：.md/comrak、.org/orgize、代码/syntect 全部纯 Rust；
-   文档/代码渲染全部服务端完成，无前端 JS 依赖。
+3. 零运行时外部依赖（无子进程、无外部二进制）：.md/comrak、.org/orgize、代码/syntect、Office/CSV/anydoc
+   全部纯 Rust；文档/代码渲染全部服务端完成，无前端 JS 依赖。
 4. `.md` 不走客户端 JS 渲染（Markdeep 依赖外部 CDN，离线即无法渲染，且与 org 页视觉不一致），
    改由 comrak 服务端渲染；无 `-c/--css` 选项。
 5. 全局字号约为浏览器默认的 80%，org/md 正文栏宽 100rem（与字号等比，保持每行字数）。
