@@ -29,9 +29,6 @@ jobs:
           # macOS Apple Silicon (macos-latest 自 2026-06 起为 macOS 26 arm64)
           - os: macos-latest
             target: aarch64-apple-darwin
-          # macOS Intel: GitHub 官方宣布 Intel runner 于 2027 秋退役, 届时移除该项
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
