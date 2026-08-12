@@ -20,9 +20,16 @@ use katex::Opts;
 /// 防 `$` 跨段误配对把大段正文吞进 KaTeX (解析失败也要白等).
 const MAX_MATH_LEN: usize = 2000;
 
+/// `\begin{env}..\end{env}` 环境块的长度上限 — 与内联公式分开: 大矩阵/长
+/// align 块 (真实文档 2.6KB+) 远超内联上限, 且环境有同名的 `\end{env}`
+/// 配对兜底, 误配风险低 (KaTeX 渲染超大块慢, 64KB 封顶).
+const MAX_ENV_LEN: usize = 65536;
+
 /// 渲染一段 LaTeX 为 KaTeX HTML; 解析失败或超长返回 None (调用方回退原文).
+/// 长度上限取环境块上限 (65536): md 路径由 comrak 的数学判定把关, org 路径由
+/// 各 finder 按定界符类型把关 (内联 2000 / 环境 65536), 此处只是兜底.
 pub fn render_math(latex: &str, display: bool) -> Option<String> {
-    if latex.is_empty() || latex.len() > MAX_MATH_LEN {
+    if latex.is_empty() || latex.len() > MAX_ENV_LEN {
         return None;
     }
     let opts = Opts::builder().display_mode(display).build().ok()?;
@@ -87,13 +94,11 @@ fn tokenize(value: &str) -> Vec<OrgPart<'_>> {
             break;
         };
         parts.push(OrgPart::Text(&rest[..start]));
-        // 行内 `$..$` 启发式: 首尾非空白 (org-mode 同款规则), 防 shell/Haskell 伪数学
+        // 行内 `$..$` 启发式: 首尾非空白 (org-mode 同款规则), 防 shell/Haskell 伪数学.
+        // 长度限制由各 finder 按定界符类型分别把关 (内联 MAX_MATH_LEN / 环境 MAX_ENV_LEN)
         let inline_dollar = !display && delim == 1; // 单个 `$` (区别于 `$$`/`\(`/`\[`/`\begin{`)
-        let ok = !latex.is_empty()
-            && latex.len() <= MAX_MATH_LEN
-            && (!inline_dollar
-                || (!latex.starts_with(char::is_whitespace)
-                    && !latex.ends_with(char::is_whitespace)));
+        let ok = !inline_dollar
+            || (!latex.starts_with(char::is_whitespace) && !latex.ends_with(char::is_whitespace));
         if ok {
             parts.push(OrgPart::Math { latex, display });
             rest = tail;
@@ -177,7 +182,7 @@ fn find_environment(value: &str) -> Option<(usize, usize, &str, &str, bool)> {
     let end = after_begin.find(&close_pat)?;
     let content_end = name_end + 1 + end;
     let latex = &value[start..content_end + close_pat.len()];
-    if latex.len() > MAX_MATH_LEN {
+    if latex.len() > MAX_ENV_LEN {
         return None;
     }
     Some((
@@ -380,5 +385,24 @@ mod tests {
         // `$1$` + `$\triangle{...}$` + align 环境 = 3 个渲染
         assert_eq!(html.matches("class=\"katex\"").count(), 3, "{html}");
         assert_eq!(html.matches('$').count(), 0, "{html}");
+    }
+
+    #[test]
+    fn org_large_matrix_env_renders() {
+        // 回归: 大矩阵 align 块 (2.6KB, fibonacci 帖子 k 阶递推矩阵) 超过内联
+        // 公式的 MAX_MATH_LEN=2000, 旧实现整体拒绝回退原文; 环境块用独立上限.
+        let rows = "a_{n+k} \\\\\n".repeat(300); // >2000 字节
+        let latex = format!(
+            "\\begin{{align}}\\begin{{bmatrix}}\n{rows}\\end{{bmatrix}} &= B \\\\\n&= A^nB \\\\\n\\end{{align}}"
+        );
+        assert!(latex.len() > MAX_MATH_LEN, "block must exceed inline limit");
+        let html = org_text_html(&latex);
+        // 渲染成功 (fallback 时无 katex 结构); annotation 里含 TeX 源码是正常现象
+        assert!(
+            html.contains("class=\"katex-display\""),
+            "block {} bytes",
+            latex.len()
+        );
+        assert!(html.matches("class=\"katex\"").count() == 1, "{html}");
     }
 }
