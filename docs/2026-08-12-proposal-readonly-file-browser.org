@@ -1,0 +1,139 @@
+#+TITLE: Proposal: 只读文件浏览器增强（浏览体验深化）
+#+DATE: 2026-08-12
+
+* 状态：已批准（待实施）
+
+经 2026-08-12 设计评审确定方向：只读深化（不引入写操作）、固定单一根目录、
+本机为主偶尔局域网。方案 A（渐进增强）获批准，见"方案选型"。
+
+* 背景与需求
+
+CB 当前是只读静态文件服务器，已具备高质量服务端文档渲染（.md/comrak、.org/orgize、
+Office·CSV/anydoc、代码/syntect，全部纯 Rust 零运行时外部依赖）。向"基于浏览器的
+Linux/macOS 本地文件浏览器"演进，核心壁垒是渲染质量而非文件列表本身。
+
+目标用户场景：个人本机使用为主（xdg-open 打开本地文件是核心诉求之一），偶尔
+=--host 0.0.0.0= 局域网分享浏览。
+
+需求清单（用户选定）：
+
+1. 文件名搜索（递归，服务端遍历，不建索引）。
+2. 面包屑 + 键盘导航，接近原生文件管理器手感。
+3. 侧边预览面板：点击文件不离开列表即可查看渲染内容。
+4. 网格/缩略图视图（图片目录）。
+5. 音视频浏览器内播放（Range 已支持，只需 viewer 页面/面板）。
+6. 打开方式：当前 tab / 新 tab 两种入口。
+7. 显式下载（Content-Disposition: attachment）。
+8. 通过 xdg-open（Linux）/ open（macOS）用本机默认应用打开文件——仅本机场景。
+9. 保持现有全部渲染能力与行为契约。
+
+* 范围
+
+** 目标
+
+上节需求 1–9 全部。
+
+** 非目标
+
+- 任何写操作（上传/删除/重命名/移动/新建目录）——安全模型保持只读不变。
+- 多根目录、文件系统漫游（保持启动时单一 canonicalized root）。
+- 鉴权/多用户（只读 + 本机为主场景不需要；native-open 由 loopback+token 保护）。
+- 服务端缩略图生成（先用客户端 CSS 缩放 + lazy loading，性能不达标再另立提案）。
+- 全文内容搜索、索引。
+- SPA/前端框架（维持无构建步骤）。
+- 归档文件（zip）内容列表、.ipynb 渲染等新文件类型管线（另立提案）。
+
+* 方案选型
+
+| 选项 | 收益 | 代价 |
+|------+------+------|
+| A. 渐进增强（选定） | 架构不变（maud 服务端渲染 + ~150 行 vanilla JS）；零新依赖；测试风格不变 | 交互流畅度略低于 SPA |
+| B. vendored htmx | 自写 JS 更少 | 多一个前端依赖与概念层；交互点仅三四个，红利发挥不出 |
+| C. SPA + JSON API | 体验上限最高 | 推翻"无前端构建步骤"决策；维护面翻倍；离线单二进制卖点受损 |
+
+* 设计
+
+** 路由与端点（routes.rs）
+
+- =GET /__/search?q=<query>= — 从 root 递归文件名搜索，大小写不敏感子串匹配，
+  上限 500 条（截断时页面提示），渲染结果页（复用列表表格样式 + 面包屑）。
+  遍历复用 listing.rs 坏项跳过语义。
+- =POST /__/native-open= — form 字段 =path= + =token=；校验链见"本机打开与安全"。
+- 现有 =/{*path}= 增两个查询参数：
+  - =?download=1= — 文件响应加 =Content-Disposition: attachment; filename*=UTF-8''<RFC 5987 编码>=
+    （percent-encoding 复用 meta 的 encode set）。
+  - =?fragment=1= — .md/.org/Office/代码渲染为无骨架 body 片段（不含 =<!DOCTYPE>=/head/
+    DOC_STYLE——宿主页面已注入），供预览面板 fetch。
+- 判定顺序不变：目录 → .md → .org → Office/CSV → 代码 → ServeFile。
+- 图片/音视频：直开仍走 ServeFile 原生（浏览器自带查看器/播放器，Range 已有）；
+  =?fragment=1= 时返回 =<img>/<video>/<audio>= 包装片段供预览面板。
+  扩展名集合：图片 =png jpg jpeg gif webp svg avif ico=；视频 =mp4 webm mov m4v=；
+  音频 =mp3 flac ogg opus wav m4a=。集合外类型的 =?fragment=1= 走"无预览"占位。
+- 非法 sort 返回 404 等既有行为契约不变。
+
+** 前端（新增 assets/chapbook-browser.js，vanilla，无构建步骤）
+
+- 键盘导航：=j/k/↑/↓= 移动选中行（CSS 高亮），=Enter= 当前 tab 打开，=o= 新 tab，
+  =Backspace= 上级目录，=/= 聚焦搜索框，=p= 预览，=Esc= 关闭预览/失焦。
+- 预览面板：右侧固定面板，=fetch(<url>?fragment=1)= 注入；目录 → 迷你列表片段，
+  文档/代码 → 渲染片段，图片/音视频 → 媒体元素，其余 → "无预览"占位。
+  面板操作按钮：新 tab 打开 / 下载 / 本机打开（仅 loopback 页面渲染该按钮）。
+- 视图切换：列表/网格 toggle，localStorage 持久化；网格项图片用
+  =<img loading="lazy" decoding="async">= 客户端缩放（零新依赖），非图片显示扩展名标签。
+- 行尾操作图标：↗ 新 tab（=target=_blank rel=noopener=）、⤓ 下载（=?download=1=）。
+- 页头常驻搜索框，普通 form GET 提交到 =/__/search=。
+- 渐进增强：无 JS 时所有链接、搜索、下载均可用；JS 只叠加键盘/面板/视图切换。
+- 结果页同样支持键盘导航。
+
+** 本机打开与安全（关键）
+
+- 启动时从 =/dev/urandom= 读 16 字节生成 token（Linux/macOS 通用，零新 crate）。
+- 仅当客户端为 loopback（=ConnectInfo<SocketAddr>= 判定）时，渲染页面才嵌入 token
+  与"本机打开"按钮——局域网客户端看不到入口。
+- POST 校验链（任一失败即拒）：
+  1. ConnectInfo 为 loopback，否则 403；
+  2. token 相等，否则 403（CSRF 防护：跨域恶意页面受 SOP 限制读不到 token，
+     loopback 限定 alone 不足以防 CSRF——请求正来自受害者本机浏览器）；
+  3. =resolve_within_root= 解析路径，越界 403（复用现有不变量）；
+  4. 目标存在（文件或目录），否则 404；
+  5. spawn =xdg-open <path>=（Linux）/ =open <path>=（macOS），stdio 全 null、
+     detached 不 wait；spawn 失败 500 + warn 日志。
+- 成功响应 204；前端 fetch POST 后按钮短暂反馈。
+- 风险注记：macOS =open= 对 =.command= 文件是直接执行——token 是必须项，不可省。
+
+** 渲染管线扩展
+
+- =render::doc_page= 拆出 content-only 入口；md/org/Office/code 四个 handler 统一支持
+  =?fragment=1=。
+- =.txt= / =.log= 加入 highlight.rs 扩展名映射（plaintext 语法，走代码文件 Accept
+  协商管线，带行号与 DOC_STYLE）。
+- 目录 fragment（预览面板预览目录时）：渲染迷你列表（名称+大小），点击进入该目录完整页。
+
+** CLI 变更
+
+- =--host= 默认值 =0.0.0.0= → =127.0.0.1=（本机为主）；偶尔局域网时显式
+  =--host 0.0.0.0=。其余参数不变。
+
+** 错误处理
+
+- 搜索：坏目录项逐个跳过（复用 listing 语义）；超 500 条截断并提示；空结果显示提示页。
+- fragment：不支持渲染的类型返回"无预览"占位片段（200，简化前端分支）。
+- native-open：失败语义见上；全部失败路径记录日志。
+
+** 测试（tests/router.rs 扩展，风格不变）
+
+- search：基本匹配、大小写不敏感、结果跳转链接正确、坏目录项容错、截断提示。
+- =?fragment=1=：md/code 响应不含 =<!DOCTYPE=，含渲染内容。
+- =?download=1=：Content-Disposition 头存在且 RFC 5987 编码正确（含中文/空格文件名）。
+- native-open：oneshot 请求无 ConnectInfo → 403（默认拒绝）；token 错误 → 403；
+  越界路径 → 403；不存在 → 404。spawn 成功路径不进 CI（无 GUI），手动验证。
+- .txt/.log：Accept 协商渲染与 =?raw=1= 透传。
+- JS 交互（键盘/面板/视图切换）：手动浏览器验证（符合仓库惯例）。
+
+** AGENTS.md 修订（随实施同步）
+
+- 决策 3（零子进程）增加受控例外：仅 =xdg-open= / =open=，detached，
+  路径经 resolve_within_root 校验，loopback+token 双重门。
+- 行为契约新增：search 端点、fragment 模式、download 参数、native-open 端点四条。
+- CLI 默认 bind 变更。
+- 目录结构 assets/ 增加 chapbook-browser.js。
