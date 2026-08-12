@@ -4,7 +4,7 @@
 
 ## 项目简介
 
-**chapbook** 是一个轻量静态文件服务器，二进制名同为 `chapbook`。功能：目录列表（Materialize UI、可排序）、
+**chapbook**（简称 **CB**）是一个轻量静态文件服务器，二进制名同为 `chapbook`。功能：目录列表（Materialize UI、可排序）、
 静态文件服务（Range 请求）、`.md` 经 comrak、`.org` 经 orgize、Office/CSV 文档经 anydoc、源代码文件经
 syntect 渲染（全部纯 Rust、零运行时外部依赖）。
 
