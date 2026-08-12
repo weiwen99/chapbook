@@ -38,6 +38,13 @@ tempfile = "3"
 # 测试内构造最小 docx/xlsx fixture (与 anydoc 的 zip 版本一致, 锁文件复用)
 zip = "8"
 
+# vendor 的 quick-js (katex crate 的 JS 引擎): 加大 QuickJS 默认 JS 栈
+# (256KB -> 8MB), 否则 KaTeX 解析深嵌套公式 (\cfrac 7+ 层) 栈溢出.
+# 修改点: vendor/quick-js/src/bindings.rs 的 ContextWrapper::new.
+# 上游 quick-js 0.4.1 无栈配置 API, 故本地 patch; 升级 katex 时需同步核对.
+[patch.crates-io]
+quick-js = { path = "vendor/quick-js" }
+
 [profile.release]
 lto = true
 codegen-units = 1

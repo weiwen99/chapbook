@@ -103,6 +103,9 @@ hr { margin: 2em 0; border: none; border-top: 1px solid var(--cb-border); }
  * display 公式 (align/$$ 块) 常超正文栏宽, 容器横向滚动而非撑破布局;
  * 颜色继承正文 (亮/暗自适应), 无需额外色板 */
 .katex-display { margin: 1.1em 0; overflow-x: auto; overflow-y: hidden; padding: 0.15em 0; }
+/* KaTeX 的 .tag (公式编号列) 内部 .vlist-s spacer 会超出右缘 2px, 让每个 align 块
+ * 无谓触发横向滚动条; tag 内编号 (eqn-num) 宽度小于 tag, 裁剪 spacer 无视觉损失 */
+.katex-display .tag { overflow: hidden; }
 
 /* 语法高亮调色板 (syntect ClassStyle::Spaced 输出完整 scope atom 类名):
  * 取 GitHub prettylights (亮) / GitHub Dark (暗) 调色板, 与页面色系同源, 代码块背景色不动.
