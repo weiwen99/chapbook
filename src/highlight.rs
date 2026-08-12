@@ -187,11 +187,7 @@ pub fn highlight(code: &str, lang: Option<&str>, numbered: bool) -> String {
         }
     }
     let html = generator.finalize();
-    if numbered {
-        number_lines(&html)
-    } else {
-        html
-    }
+    if numbered { number_lines(&html) } else { html }
 }
 
 /// 给每行前缀行号 span. 每行输出都以 '\n' 结尾, 按 '\n' 切分插入行号;

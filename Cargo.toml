@@ -1,7 +1,9 @@
 [package]
 name = "chapbook"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+# 实际 MSRV 由 anydoc (=0.1.8, MSRV 1.88) 决定; 显式声明让旧工具链报清晰错误
+rust-version = "1.88"
 description = "chapbook — serve a directory as a readable little book"
 license = "Apache-2.0"
 repository = "https://github.com/weiwen99/chapbook"

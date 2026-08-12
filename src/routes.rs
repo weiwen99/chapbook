@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
@@ -300,10 +300,11 @@ async fn serve_file(path: &Path, headers: HeaderMap) -> Response {
 fn ensure_text_charset(headers: &mut HeaderMap) {
     if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
         let ct = content_type.to_str().unwrap_or_default().to_string();
-        if ct.starts_with("text/") && !ct.contains("charset") {
-            if let Ok(value) = format!("{ct}; charset=utf-8").parse() {
-                headers.insert(header::CONTENT_TYPE, value);
-            }
+        if ct.starts_with("text/")
+            && !ct.contains("charset")
+            && let Ok(value) = format!("{ct}; charset=utf-8").parse()
+        {
+            headers.insert(header::CONTENT_TYPE, value);
         }
     }
 }
