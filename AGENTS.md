@@ -44,6 +44,7 @@ src/
   listing.rs   # 目录遍历与排序（坏目录项逐个跳过）
   render.rs    # HTML 生成（maud）：目录页、doc_page 骨架、共享 slug/TOC、DOC_STYLE 注入
   highlight.rs # syntect 代码高亮（org src 块 / md 代码块 / 代码文件共用）+ 语言识别
+  math.rs      # LaTeX 数学公式服务端 KaTeX 渲染（md span 替换 / org Text tokenize）
   org.rs       # orgize 渲染 .org：预扫描元数据 + 自定义 HtmlHandler + src 块高亮
   markdown.rs  # comrak 渲染 .md：front matter、HeadingAdapter 锚点/TOC、代码高亮适配器
   office.rs    # anydoc 转换 Office/CSV 为 GFM markdown：格式表（排除 PDF）、大小上限
@@ -73,8 +74,18 @@ tests/
    `render::DOC_STYLE`（同一视觉系统，覆盖 `#TOC` 与 `.sourceCode`/`.src`/`.example` 代码块）。
    md 的 YAML front matter 剥离并取 `title:`（→ `<title>` 与 `header#title-block-header` 下
    `h1.title`）；org 的 `#+TITLE`/`#+AUTHOR`/`#+DATE` 同渲染。4 级标题完整保留（orgize 与源码一致，
-   pandoc/emacs 会结构性丢失）。md 内 raw HTML 转义显示（安全：文档页不执行内嵌 HTML）；
-   数学公式按原文显示（pandoc 的 KaTeX 本就是 CDN 链接，离线不渲染）。
+   pandoc/emacs 会结构性丢失）。md 内 raw HTML 转义显示（安全：文档页不执行内嵌 HTML）。
+   数学公式**服务端 KaTeX 渲染**（`math.rs`，官方 KaTeX 0.16.7 经 QuickJS 执行）：
+   md 开 comrak `math_dollars`/`math_latex` 扩展（`$..$`/`$$..$$`/`\(..\)`/`\[..\]`，pandoc
+   同款启发式判定），输出 `<span data-math-style=...>` 由 `math::replace_comrak_math` 后处理
+   替换；org 因 orgize 无 LaTeX 节点，在自定义 HtmlHandler 的 `Element::Text` 钩子里
+   tokenize `\(..\)`/`\[..\]`/`$..$`/`$$..$$`/`\begin{env}..\end{env}`（环境名限定
+   `math::take_environment` 白名单，src/example/code/verbatim 是独立元素不经过 Text，
+   shell/Haskell 的 `$` 不会误伤）。**降级约定**：启发式拒绝（`$` 后接空白、超长）或
+   KaTeX 解析失败一律回退原文显示，内容不丢；`$ column: $`、`$2 == 'patch'$` 保持原样。
+   页面骨架在 `<head>` 注入 `/__/static/katex/katex.min.css`（裁剪版，仅 woff2 引用；
+   字体走 `assets/katex/fonts/` 二进制内嵌），`chapbook-doc.css` 对 `.katex-display`
+   加横向溢出滚动（长 align 公式不撑破布局），颜色继承正文（亮/暗自适应）。
    已废弃：Markdeep 客户端渲染与 pandoc/emacs 子进程管线（提案
    docs/2026-08-05-proposal-remove-dependency-of-pandoc.org，Phase 1/2 已实施）。
 6. 文件服务必须支持 Range（tower-http `ServeFile` 提供）；缺失文件 404。
@@ -109,6 +120,7 @@ tests/
 | orgize 0.9 | .org 渲染 | 纯 Rust AST 渲染，无子进程；`default-features = false`（跳过 serde） |
 | comrak 0.54 | .md 渲染 | `default-features = false`；HeadingAdapter/SyntaxHighlighterAdapter 插件化锚点与高亮 |
 | syntect 5 | 代码高亮 | 内嵌语法集（默认 ~50 语言 + `assets/syntaxes/` 补充 14 个常见语言，二进制 +~0.5MB）；`ClassStyle::Spaced` 输出 scope atom 类名 |
+| katex 0.4 | LaTeX 数学渲染 | 内嵌官方 KaTeX 0.16.7 `katex.min.js`，经 quick-js 执行（构建期编译 QuickJS C 源码，非运行时依赖）；渲染失败返回 Err，math.rs 回退原文；**升级时 `katex` crate 版本必须与 `assets/katex/` 的 CSS/字体版本一致**（见 THIRD_PARTY_NOTICES）；二进制 +~2.5MB（引擎 + 字体） |
 | anydoc 0.1.8 | Office/CSV → GFM markdown | 纯 Rust（zip/calamine/cfb/quick-xml/pdf-inspector），无子进程；**锁精确版本**（0.1.x 早期，API 可能变动；升级需核对 `Format` 表与 `ConvertError`）；MSRV 1.88；二进制 +~6MB；经 `log` facade 报恢复事件，`tracing-log` 桥接到 RUST_LOG |
 | clap (derive) | CLI | `disable_help_flag`，`-h` 让给 `--host` |
 | chrono | 时间格式化 | `yyyy-MM-dd HH:mm:ss` 本地时区 |
@@ -125,7 +137,8 @@ Materialize 前端资源来自 [materializecss/materialize](https://github.com/m
 1. 路径穿越：词法前缀比较不消除 `..` 分量 → 逐分量解析，溢出 root 返回 403；符号链接保持跟随。
 2. 文件名链接使用 percent-encoding（空格 `%20`），不用表单语义（`+`）。
 3. 零运行时外部依赖（无子进程、无外部二进制）：.md/comrak、.org/orgize、代码/syntect、Office/CSV/anydoc
-   全部纯 Rust；文档/代码渲染全部服务端完成，无前端 JS 依赖。
+   全部纯 Rust；LaTeX 数学/katex crate（官方 KaTeX JS 经 quick-js 执行，quick-js 是构建期编译的
+   C 源码，静态链接进二进制，不引入运行时依赖）；文档/代码渲染全部服务端完成，无前端 JS 依赖。
 4. `.md` 不走客户端 JS 渲染（Markdeep 依赖外部 CDN，离线即无法渲染，且与 org 页视觉不一致），
    改由 comrak 服务端渲染；无 `-c/--css` 选项。
 5. 全局字号约为浏览器默认的 80%，org/md 正文栏宽 100rem（与字号等比，保持每行字数）。

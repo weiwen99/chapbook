@@ -88,6 +88,8 @@ pub fn doc_page(title: &str, body: &str) -> String {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
                 title { (title) }
+                // KaTeX 数学排版 (服务端渲染输出的 .katex 结构依赖此样式表与字体)
+                link rel="stylesheet" href="/__/static/katex/katex.min.css";
             }
             body { (maud::PreEscaped(body)) }
         }

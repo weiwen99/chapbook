@@ -40,11 +40,23 @@ async fn static_asset(AxumPath(path): AxumPath<String>) -> Response {
         "css/materialize.min.css" => asset_response(assets::MATERIALIZE_CSS, "text/css"),
         "css/chapbook-theme.css" => asset_response(assets::THEME_CSS, "text/css"),
         "js/materialize.min.js" => asset_response(assets::MATERIALIZE_JS, "application/javascript"),
+        "katex/katex.min.css" => asset_response(assets::KATEX_CSS, "text/css"),
+        path if path.starts_with("katex/fonts/") => {
+            let name = &path["katex/fonts/".len()..];
+            match assets::KATEX_FONTS.iter().find(|(font, _)| *font == name) {
+                Some((_, bytes)) => asset_bytes_response(bytes, "font/woff2"),
+                None => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 fn asset_response(content: &'static str, content_type: &'static str) -> Response {
+    ([(header::CONTENT_TYPE, content_type)], content).into_response()
+}
+
+fn asset_bytes_response(content: &'static [u8], content_type: &'static str) -> Response {
     ([(header::CONTENT_TYPE, content_type)], content).into_response()
 }
 

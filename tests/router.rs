@@ -324,6 +324,45 @@ async fn markdown_rendered_via_comrak() {
     assert!(body.contains(">1<"), "body: {body}");
 }
 
+/// .md 数学: comrak math_dollars/math_latex 扩展 + 服务端 KaTeX 渲染.
+/// `$..$`/`$$..$$`/`\(..\)` 输出 .katex 结构; 页面引入 katex.min.css.
+#[tokio::test]
+async fn markdown_math_rendered_via_katex() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("math.md"),
+        "# Math\n\n欧拉公式 $e^{i\\pi} + 1 = 0$ 与 \\(x^2\\), 以及\n\n$$\\cfrac{1}{1+\\cfrac{1}{2}} = \\frac{2}{3}$$\n",
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/math.md").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    // 两个 inline + 一个 display 数学都渲染成 KaTeX HTML
+    assert_eq!(body.matches(r#"class="katex""#).count(), 3, "body: {body}");
+    assert!(body.contains(r#"class="katex-display""#), "body: {body}");
+    // 数学 span 全部替换, 不残留 comrak 定界符
+    assert!(!body.contains("data-math-style"), "body: {body}");
+    // 页面引入 KaTeX 样式表 (与服务端渲染输出配套)
+    assert!(
+        body.contains(r#"href="/__/static/katex/katex.min.css""#),
+        "body: {body}"
+    );
+}
+
+/// .md 数学降级: comrak 判定为数学但 KaTeX 不认识的宏 → 保留 span 原文 (内容不丢).
+#[tokio::test]
+async fn markdown_math_fallback_keeps_raw() {
+    let dir = fixture();
+    std::fs::write(dir.path().join("badmath.md"), "# Bad\n\n$\\badmacro{x}$\n").unwrap();
+
+    let res = get(app(dir.path()), "/badmath.md").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(!body.contains(r#"class="katex""#), "body: {body}");
+    assert!(body.contains(r"\badmacro{x}"), "body: {body}");
+}
+
 /// md 与 org 共用同一 slug 函数: TOC href 与正文标题 id 一一对应 (含去重后缀).
 #[tokio::test]
 async fn markdown_toc_anchors_match_heading_ids() {
@@ -434,6 +473,90 @@ async fn org_rendered_via_orgize() {
     );
     // CSS 中 pre.src 选择器保住代码块底色
     assert!(body.contains("pre.src"), "body: {body}");
+}
+
+/// .org 数学: orgize 不解析 LaTeX, 由 Text 元素 tokenize 后服务端 KaTeX 渲染.
+/// `\(..\)`/`$..$` inline 与 `$$..$$`/`\begin{align}` display 都出 .katex 结构;
+/// src 块内的 `$` (shell/Haskell) 不经过 Text, 保持原文.
+#[tokio::test]
+async fn org_math_rendered_via_katex() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("math.org"),
+        r#"* Math
+设其第 \( \sqrt{2} \) 项的渐进分数为 $a_{i-1}$。
+
+\begin{align}
+x^{3.0001} &= x^3 \cdot x^{0.0001} \\
+&= \sqrt[10000]{x}
+\end{align}
+
+$$G^2_{i-1} - DB^2_{i-1} = Q_i$$
+
+#+begin_src sh
+echo $RELEASE_VERSION
+#+end_src
+"#,
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/math.org").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    // 2 inline + 1 裸 align 环境 + 1 $$ 块 = 4 个 KaTeX 渲染
+    assert_eq!(body.matches("class=\"katex\"").count(), 4, "body: {body}");
+    // align 环境渲染为 mtable (对齐结构), 且内容完整
+    assert!(body.contains("<mtable"), "body: {body}");
+    assert!(!body.contains("data-math-style"), "body: {body}");
+    // src 块里的 shell $ 变量不被当数学 (syntect 高亮把 `$` 与变量名拆成相邻 span)
+    assert!(body.contains("RELEASE_VERSION"), "body: {body}");
+}
+
+/// .org 伪数学 ($ 后接空白 / KaTeX 解析失败): 保持原文, 不渲染.
+#[tokio::test]
+async fn org_fake_math_stays_raw() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("fakemath.org"),
+        "价格 $ column: $ 与 $2 == 'patch' || $ 不变\n",
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/fakemath.org").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    // 页面 head 含 katex.min.css 链接, 断言须限定 .katex 渲染结构
+    assert!(!body.contains("class=\"katex\""), "body: {body}");
+    assert!(body.contains("$ column: $"), "body: {body}");
+    assert!(
+        body.contains("$2 == &apos;patch&apos; || $"),
+        "body: {body}"
+    );
+}
+
+/// KaTeX 静态资源: 样式表 (裁剪版, 仅 woff2 引用) 与字体二进制可达; 未知字体 404.
+#[tokio::test]
+async fn katex_static_assets_served() {
+    let dir = fixture();
+    let res = get(app(dir.path()), "/__/static/katex/katex.min.css").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "text/css");
+    let css = body_string(res).await;
+    // 裁剪: 只留 woff2 引用 (woff/ttf 已移除)
+    assert!(css.contains("woff2"), "css: {css}");
+    assert!(!css.contains(".woff)"), "css: {css}");
+    assert!(!css.contains(".ttf)"), "css: {css}");
+
+    let res = get(
+        app(dir.path()),
+        "/__/static/katex/fonts/KaTeX_Main-Regular.woff2",
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "font/woff2");
+
+    let res = get(app(dir.path()), "/__/static/katex/fonts/nope.woff2").await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 /// 4 级标题保真: pandoc/emacs 都会丢 h4, orgize 保留 (spike plan-56 场景).

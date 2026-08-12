@@ -7,7 +7,8 @@
 //! 与旧 pandoc 管线的差异 (Phase 2, 见
 //! docs/2026-08-05-proposal-remove-dependency-of-pandoc.org):
 //! - 代码块经 syntect 高亮, 类名与 org/代码文件一致 (同一调色板)
-//! - 数学公式按原文显示 (pandoc 的 KaTeX 本就是 CDN 链接, 离线不渲染; katex-rs 候选未采用)
+//! - 数学公式服务端 KaTeX 渲染 (comrak math_dollars/math_latex 扩展 +
+//!   math::replace_comrak_math 后处理; 解析失败回退原文)
 //! - 文档内 raw HTML 转义显示 (pandoc 原样透传; 安全改进, 服务端渲染不执行内嵌 HTML)
 
 use std::borrow::Cow;
@@ -36,6 +37,11 @@ pub fn render(source: &str, file_name: &str) -> (String, String) {
     options.extension.tagfilter = true;
     options.extension.footnotes = true;
     options.extension.description_lists = true;
+    // LaTeX 数学: `$...$`/`$$...$$` 与 `\(...\)`/`\[...\]` 解析为
+    // `<span data-math-style=...>` (pandoc 同款启发式, 无误报), 后处理替换为
+    // 服务端 KaTeX 渲染 (math::replace_comrak_math)
+    options.extension.math_dollars = true;
+    options.extension.math_latex = true;
     options.parse.smart = true; // 与 pandoc markdown 的 smart 排版对齐
     // raw HTML 转义显示 (安全: 文档页不应执行内嵌 HTML)
     options.render.escape = true;
@@ -47,6 +53,8 @@ pub fn render(source: &str, file_name: &str) -> (String, String) {
     plugins.render.codefence_syntax_highlighter = Some(&MdHighlighter);
 
     let body = markdown_to_html_with_plugins(source, &options, &plugins);
+    // 数学 span → 服务端 KaTeX HTML (解析失败保留原 span 内容)
+    let body = crate::math::replace_comrak_math(&body);
 
     // pandoc 行为对齐: front matter 有 title 时渲染 title-block-header
     let header = front_title
