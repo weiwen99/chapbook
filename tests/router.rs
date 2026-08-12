@@ -3,9 +3,9 @@
 use std::io::Write as _;
 use std::path::Path;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header, Request, Response, StatusCode};
 use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, Response, StatusCode, header};
 use tempfile::TempDir;
 use tower::ServiceExt;
 

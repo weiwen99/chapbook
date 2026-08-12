@@ -3,9 +3,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use maud::{html, Markup, DOCTYPE};
+use maud::{DOCTYPE, Markup, html};
 
-use crate::meta::{format_time, FileMeta};
+use crate::meta::{FileMeta, format_time};
 use crate::sort::{SortBy, SortColumn, SortOrder};
 
 /// 目录列表页面
@@ -155,10 +155,10 @@ pub fn toc_html(entries: &[TocEntry], max_depth: Option<usize>) -> String {
     let mut roots: Vec<usize> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
     for entry in entries {
-        if let Some(depth) = max_depth {
-            if entry.level > depth {
-                continue;
-            }
+        if let Some(depth) = max_depth
+            && entry.level > depth
+        {
+            continue;
         }
         let level = entry.level.min(6);
         while let Some(&top) = stack.last() {

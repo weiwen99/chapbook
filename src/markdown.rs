@@ -17,7 +17,7 @@ use std::sync::Mutex;
 
 use comrak::adapters::{HeadingAdapter, HeadingMeta, SyntaxHighlighterAdapter};
 use comrak::nodes::Sourcepos;
-use comrak::{markdown_to_html_with_plugins, options::Plugins, Options};
+use comrak::{Options, markdown_to_html_with_plugins, options::Plugins};
 
 use crate::{highlight, render};
 
@@ -37,7 +37,7 @@ pub fn render(source: &str, file_name: &str) -> (String, String) {
     options.extension.footnotes = true;
     options.extension.description_lists = true;
     options.parse.smart = true; // 与 pandoc markdown 的 smart 排版对齐
-                                // raw HTML 转义显示 (安全: 文档页不应执行内嵌 HTML)
+    // raw HTML 转义显示 (安全: 文档页不应执行内嵌 HTML)
     options.render.escape = true;
     options.render.tasklist_classes = true;
 
@@ -79,12 +79,12 @@ fn strip_front_matter(source: &str) -> (Option<String>, &str) {
             // 找到闭合: 剥离 front matter, 正文从下一行开始
             return (title, rest);
         }
-        if title.is_none() {
-            if let Some(value) = trimmed.strip_prefix("title:") {
-                let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
-                if !value.is_empty() {
-                    title = Some(value.to_string());
-                }
+        if title.is_none()
+            && let Some(value) = trimmed.strip_prefix("title:")
+        {
+            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            if !value.is_empty() {
+                title = Some(value.to_string());
             }
         }
         if rest.is_empty() {

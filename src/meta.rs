@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
-use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
 
 /// URL path segment 的编码集: 仅保留 RFC 3986 unreserved 字符.
 /// 必须用 percent-encoding (空格 -> `%20`); 表单语义编码 (空格 -> `+`) 在 path segment 中是错误行为.
