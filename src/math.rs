@@ -354,4 +354,17 @@ mod tests {
         assert!(html.contains(r#"data-math-style="inline""#), "{html}");
         assert!(html.contains(r"\badmacro{x}"), "{html}");
     }
+
+    #[test]
+    fn deep_nested_cfrac_renders() {
+        // 回归: QuickJS 默认 256KB JS 栈下, 8 层 \cfrac 嵌套 (pell 连分数文档
+        // 的真实公式) 会 InternalError: stack overflow → 回退原文.
+        // vendor/quick-js patch 把栈提到 8MB, 此公式必须渲染.
+        let latex = "c=a_0+\\cfrac{1}{a_1+\\cfrac{1}{a_2+\\cfrac{1}{a_3+\\cfrac{1}{a_4+\\cfrac{1}{a_5+\\cfrac{1}{a_6+\\cfrac{1}{a_7+\\ldots}}}}}}}\\tag{1}";
+        let html = replace_comrak_math(&format!(
+            r#"<span data-math-style="display">{latex}</span>"#
+        ));
+        assert!(html.contains("class=\"katex\""), "{html}");
+        assert!(!html.contains("data-math-style"), "{html}");
+    }
 }

@@ -87,7 +87,7 @@ Zig、INI、Nix、Svelte）：
 | [comrak](https://github.com/kivikakk/comrak) | BSD-2-Clause | .md 文档渲染 |
 | [syntect](https://github.com/trishume/syntect) | MIT | 代码语法高亮（内嵌语法集） |
 | [katex](https://github.com/xu-cheng/katex-rs) | MIT OR Apache-2.0 | LaTeX 数学渲染（内嵌官方 KaTeX 0.16.7 JS，经 QuickJS 执行） |
-| [quick-js](https://crates.io/crates/quick-js)（含 QuickJS C 源码） | MIT | katex crate 的 JS 引擎（构建期经 cc 编译，静态链接） |
+| [quick-js](https://github.com/theduke/quickjs-rs)（**vendor/ 本地副本**，含 QuickJS C 源码） | MIT | katex crate 的 JS 引擎（构建期经 cc 编译，静态链接）。本地仅一处改动：`src/bindings.rs` 中 `JS_SetMaxStackSize` 由 256KB 提到 8MB，见 AGENTS.md |
 | [maud](https://github.com/lambda-fairy/maud) | MIT OR Apache-2.0 | HTML 模板 |
 | [axum](https://github.com/tokio-rs/axum) / [tokio](https://github.com/tokio-rs/tokio) | MIT | HTTP 服务运行时 |
 

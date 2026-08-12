@@ -52,7 +52,11 @@ src/
   assets.rs    # include_str! 内嵌前端资源
 assets/        # materialize.min.css / materialize.min.js（v2.3.3 社区分支）+ chapbook-theme.css（目录页主题）
                # + chapbook-doc.css（文档/代码页样式）
+               # + katex/（KaTeX 0.16.7 样式表 woff2 裁剪版 + 20 个 woff2 字体）
                # + syntaxes/（14 个补充语法定义，syntect 默认集缺失的常见语言；见 THIRD_PARTY_NOTICES）
+vendor/        # quick-js 0.4.1（katex crate 的 JS 引擎）本地副本：唯一改动是
+               # src/bindings.rs ContextWrapper::new 里 JS_SetMaxStackSize 256KB -> 8MB
+               # （KaTeX 解析 7+ 层 \cfrac 嵌套会栈溢出），经 [patch.crates-io] 生效
 tests/
   router.rs    # 路由集成测试（渲染/协商/安全）
   sort.rs      # SortBy 解析测试
@@ -121,6 +125,7 @@ tests/
 | comrak 0.54 | .md 渲染 | `default-features = false`；HeadingAdapter/SyntaxHighlighterAdapter 插件化锚点与高亮 |
 | syntect 5 | 代码高亮 | 内嵌语法集（默认 ~50 语言 + `assets/syntaxes/` 补充 14 个常见语言，二进制 +~0.5MB）；`ClassStyle::Spaced` 输出 scope atom 类名 |
 | katex 0.4 | LaTeX 数学渲染 | 内嵌官方 KaTeX 0.16.7 `katex.min.js`，经 quick-js 执行（构建期编译 QuickJS C 源码，非运行时依赖）；渲染失败返回 Err，math.rs 回退原文；**升级时 `katex` crate 版本必须与 `assets/katex/` 的 CSS/字体版本一致**（见 THIRD_PARTY_NOTICES）；二进制 +~2.5MB（引擎 + 字体） |
+| quick-js 0.4.1（vendor/ 本地 patch） | katex 的 JS 引擎 | 上游无栈配置 API；本地副本把 QuickJS JS 栈 256KB→8MB（`JS_SetMaxStackSize`，见 vendor/quick-js/src/bindings.rs），否则 KaTeX 解析深嵌套公式（`\cfrac` 7+ 层，pell 连分数文档真实场景）栈溢出回退原文；经 `[patch.crates-io]` 生效，升级 katex 时需同步核对 |
 | anydoc 0.1.8 | Office/CSV → GFM markdown | 纯 Rust（zip/calamine/cfb/quick-xml/pdf-inspector），无子进程；**锁精确版本**（0.1.x 早期，API 可能变动；升级需核对 `Format` 表与 `ConvertError`）；MSRV 1.88；二进制 +~6MB；经 `log` facade 报恢复事件，`tracing-log` 桥接到 RUST_LOG |
 | clap (derive) | CLI | `disable_help_flag`，`-h` 让给 `--host` |
 | chrono | 时间格式化 | `yyyy-MM-dd HH:mm:ss` 本地时区 |
