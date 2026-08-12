@@ -1,0 +1,52 @@
+#+TITLE: Proposal: Office 文档与 CSV 渲染（anydoc）
+#+DATE: 2026-08-12
+
+* 状态：已实施（2026-08-12）
+
+* 背景与需求
+
+现状: 浏览器原生打不开的文档格式（doc/docx/ppt/xlsx/odt/rtf/epub/csv 等）在 chapbook
+里只能原样下载, 与"把目录变成一本可读的小册子"的定位有缺口（.md/.org/代码文件均可读）。
+
+| 格式族        | 现状     | 目标         |
+|---------------+----------+--------------|
+| Word/PPT/Excel/ODF/RTF/EPUB | 下载 | 渲染为文档页 |
+| CSV           | text/plain 原文 | 渲染为表格 |
+| PDF           | 浏览器原生打开 | 保持现状（渲染丢排版） |
+
+约束（沿用既有设计决策）: 纯 Rust、无子进程、无外部二进制; 服务端渲染; 渲染失败
+优雅降级为原文件下载。
+
+* 方案
+
+** 方案 A（已实施）: anydoc 转 GFM 后复用 comrak 管线
+
+- 依赖 =anydoc =0.1.8= (firecrawl, MIT, 纯 Rust: zip/calamine/cfb/quick-xml/pdf-inspector)。
+  锁精确版本: 0.1.x 早期, API 可能变动。MSRV 1.88 ≤ 项目工具链。
+- 新模块 =src/office.rs=: 格式表直接复用 =anydoc::Format::from_path= 并排除 PDF;
+  =MAX_RENDER_BYTES = 32 MiB= 大文件闸。
+- 路由: =serve_office= 与代码文件同一 Accept 协商（浏览器 → 渲染页, 脚本 → 原文,
+  =?view=1=/?raw=1= 显式覆盖）; 转换失败（ConvertError: 加密/损坏/超限）→ ServeFile
+  裸字节透传。
+- 渲染: anydoc 输出 GFM markdown → =render_markdown_response=（从 =serve_markdown=
+  抽出的共享函数）→ comrak 文档页。TOC/锚点/代码高亮与 .md 完全一致, 零新增前端。
+- PDF 排除: 浏览器内置查看器直接打开（ServeFile 透传 =application/pdf=）,
+  anydoc 的 pdf-inspector 转换对阅读场景丢排版（图片/矢量/分页）, 得不偿失。
+  附带效果: 扫描版 PDF（无文本层）不报错, 无降级噪音。
+- 日志: tracing-subscriber 开 =tracing-log= 特性, anydoc 的 =log= facade 恢复事件
+  （warn 级）桥接到 RUST_LOG, 转换失败原因可见。
+
+** 备选（未采用）
+
+- 手写 docx/xlsx 解析（zip + quick-xml / calamine）: 只覆盖 2 族格式,
+  且放弃 anydoc 统一 document model 带来的跨格式一致性。
+- pandoc/libreoffice 子进程: 违反零运行时依赖约束。
+
+* 验收（测试锁定）
+
+- CSV: 浏览器 Accept → =<table>= 文档页; 脚本 Accept → 原文 =text/csv=;
+  =?view=1=/?raw=1= 显式覆盖。
+- docx（测试内 zip 构造最小 fixture）: 正文文本出现在文档页。
+- 损坏 docx: 转换失败 → 裸字节透传, Content-Type 保持 Office MIME。
+- >32 MiB 文件不转换, 原文透传。
+- PDF: Accept: text/html 仍返回 =application/pdf= 原文。

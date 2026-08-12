@@ -1,5 +1,6 @@
 # 构建产物
 /target
+result
 
 # 编辑器 / IDE
 .idea/

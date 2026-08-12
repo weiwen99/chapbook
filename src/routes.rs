@@ -12,7 +12,7 @@ use axum::Router;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
-use crate::{assets, highlight, listing, markdown, org, render, sort::SortBy};
+use crate::{assets, highlight, listing, markdown, office, org, render, sort::SortBy};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -88,6 +88,9 @@ async fn serve_path(
     } else if fs_path.to_string_lossy().ends_with(".org") {
         // 如果是 .org 文件，使用 orgize 渲染
         serve_org(&fs_path).await
+    } else if let Some(format) = office::format_for_path(&fs_path) {
+        // Office 文档 / CSV: anydoc 转 markdown 后走 comrak 渲染 (浏览器) 或原文 (脚本)
+        serve_office(&fs_path, format, &metadata, &query, headers).await
     } else if let Some(lang) = highlight::language_for_path(&fs_path) {
         // 如果是源代码文件，按 Accept 协商: 浏览器 -> 高亮 HTML, 脚本 -> 原文
         serve_code(&fs_path, lang, &metadata, &query, headers).await
@@ -122,15 +125,7 @@ fn resolve_within_root(root: &Path, decoded: &str) -> Option<PathBuf> {
 async fn serve_markdown(path: &Path) -> Response {
     match tokio::fs::read(path).await {
         Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(source) => {
-                let file_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let (title, body) = markdown::render(&source, &file_name);
-                let page = render::doc_page(&title, &body);
-                Html(render::inject_doc_style(&page)).into_response()
-            }
+            Ok(source) => render_markdown_response(&source, path).await,
             Err(_) => serve_raw_text(path).await,
         },
         Err(e) => {
@@ -138,6 +133,18 @@ async fn serve_markdown(path: &Path) -> Response {
             StatusCode::NOT_FOUND.into_response()
         }
     }
+}
+
+/// 共享: 把 markdown 源渲染为完整文档页 (.md 与 anydoc 转换结果共用).
+/// comrak 纯 Rust 渲染 (表格/任务列表/footnotes 等 GFM 扩展), 不会失败.
+async fn render_markdown_response(source: &str, path: &Path) -> Response {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (title, body) = markdown::render(source, &file_name);
+    let page = render::doc_page(&title, &body);
+    Html(render::inject_doc_style(&page)).into_response()
 }
 
 /// 语法高亮渲染源代码文件 (syntect, 纯 Rust; 提案 docs/2026-08-05-proposal-syntax-highlight-code-files.org, 方案 A).
@@ -186,6 +193,44 @@ fn accepts_html(headers: &HeaderMap) -> bool {
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|accept| accept.contains("text/html"))
+}
+
+/// Office 文档 / CSV 渲染 (anydoc 纯 Rust; 提案 docs/2026-08-12-proposal-render-office-documents.org, 方案 A).
+///
+/// 响应协商与代码文件一致 (浏览器与脚本两类消费者):
+/// - 默认按 Accept 头: 含 text/html (浏览器) -> anydoc 转 GFM markdown 后经
+///   comrak 渲染文档页 (TOC/锚点/高亮与 .md 一致); 否则 (curl 的 */*) -> 原文
+/// - 显式覆盖: ?raw=1 强制原文, ?view=1 强制渲染 (用于分享链接)
+///
+/// 降级: 转换失败 (加密/损坏/超限, anydoc ConvertError) -> ServeFile 裸字节
+/// 透传, 浏览器下载后由本地 Office 打开; 超大文件 (> office::MAX_RENDER_BYTES)
+/// 同样透传. PDF 不在此路径 (浏览器原生打开, 见 office 模块).
+async fn serve_office(
+    path: &Path,
+    format: office::Format,
+    metadata: &std::fs::Metadata,
+    query: &HashMap<String, String>,
+    headers: HeaderMap,
+) -> Response {
+    let wants_html =
+        query.contains_key("view") || (!query.contains_key("raw") && accepts_html(&headers));
+    // 大文件保护: 转换是 CPU 活, 超过阈值不做渲染
+    if !wants_html || metadata.len() > office::MAX_RENDER_BYTES {
+        return serve_file(path, headers).await;
+    }
+    match tokio::fs::read(path).await {
+        Ok(bytes) => match anydoc::to_markdown_bytes(&bytes, format) {
+            Ok(markdown) => render_markdown_response(&markdown, path).await,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "failed to convert office document, serving raw");
+                serve_file(path, headers).await
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "failed to read office document");
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 /// 渲染失败时的回退: 以纯文本返回原文.

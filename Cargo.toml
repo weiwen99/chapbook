@@ -17,7 +17,10 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
+# 纯 Rust Office/CSV -> GFM markdown (firecrawl/anydoc, MIT); MSRV 1.88 满足 (本机 1.97).
+# 锁精确版本: 0.1.x 早期, API 可能变动; PDF 不启用 (浏览器原生打开).
+anydoc = "=0.1.8"
 chrono = "0.4"
 percent-encoding = "2"
 maud = "0.27"
@@ -27,6 +30,8 @@ syntect = "5"
 
 [dev-dependencies]
 tempfile = "3"
+# 测试内构造最小 docx/xlsx fixture (与 anydoc 的 zip 版本一致, 锁文件复用)
+zip = "8"
 
 [profile.release]
 lto = true
