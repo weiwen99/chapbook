@@ -559,6 +559,36 @@ async fn katex_static_assets_served() {
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
+/// .org 裸图片链接 (`[[file:img.png]]` 无描述) → `<img>`; 有描述的链接保持 `<a>`.
+#[tokio::test]
+async fn org_bare_image_links_render_as_img() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("img.org"),
+        "图片测试\n\n[[./static/pic.jpg]]\n\n[[./static/pic.png][查看原图]]\n\n[[https://example.com/doc.pdf]]\n",
+    )
+    .unwrap();
+
+    let res = get(app(dir.path()), "/img.org").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    // 裸图片链接 → img (alt 与 src 同路径)
+    assert!(
+        body.contains(r#"<img src="./static/pic.jpg" alt="./static/pic.jpg">"#),
+        "body: {body}"
+    );
+    // 有描述 → 普通链接
+    assert!(
+        body.contains(r#"<a href="./static/pic.png">查看原图</a>"#),
+        "body: {body}"
+    );
+    // 非图片 (pdf) → 普通链接
+    assert!(
+        body.contains(r#"<a href="https://example.com/doc.pdf">"#),
+        "body: {body}"
+    );
+}
+
 /// 4 级标题保真: pandoc/emacs 都会丢 h4, orgize 保留 (spike plan-56 场景).
 #[tokio::test]
 async fn org_keeps_level4_headings() {

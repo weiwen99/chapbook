@@ -167,6 +167,16 @@ impl HtmlHandler<IoError> for OrgHtmlHandler {
                 write!(w, "{}", self.meta.toc_html)?;
                 write!(w, "<main>")?;
             }
+            // 裸图片链接 → `<img>` (org-mode 行为: `[[file:img.png]]` 无描述即内嵌图片);
+            // 有描述的链接保持 `<a>` (如 `[[file:x.png][说明]]`, 用户可能想引用而非展示)
+            Element::Link(link) if link.desc.is_none() && is_image_path(&link.path) => {
+                write!(
+                    w,
+                    "<img src=\"{}\" alt=\"{}\">",
+                    HtmlEscape(&link.path),
+                    HtmlEscape(&link.path)
+                )?;
+            }
             Element::Title(title) => {
                 let level = title.level.min(6);
                 let slug = self
@@ -209,4 +219,14 @@ impl HtmlHandler<IoError> for OrgHtmlHandler {
         }
         Ok(())
     }
+}
+
+/// 裸链接是否为图片路径 (按扩展名判定, 大小写不敏感; 忽略 query 部分).
+fn is_image_path(path: &str) -> bool {
+    const IMAGE_EXT: &[&str] = &[
+        "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "avif", "ico",
+    ];
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let ext = path.rsplit('.').next().unwrap_or("");
+    IMAGE_EXT.contains(&ext.to_ascii_lowercase().as_str())
 }
