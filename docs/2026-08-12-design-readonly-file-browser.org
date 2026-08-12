@@ -1,0 +1,473 @@
+#+TITLE: Design: 只读文件浏览器增强（浏览体验深化）
+#+DATE: 2026-08-12
+
+* 状态：有条件批准（待复审确认）
+
+第一轮评审的 8 项门槛已写入上一修订版。第二轮评审
+（docs/2026-08-12-review-readonly-file-browser.org）确认其中 4 项关闭、4 项部分关闭，
+并新增/深化为 1 个 P0、3 个 P1、1 个 P2 问题。本版按第二轮 5 项实施前门槛再次修订；
+不自行恢复“已批准”，待复审确认全部关闭后才进入实施。方案 A（渐进增强）维持不变。
+
+* 背景与需求
+
+CB 当前是只读静态文件服务器，已具备高质量服务端文档渲染（.md/comrak、.org/orgize、
+Office·CSV/anydoc、代码/syntect，全部纯 Rust 零运行时外部依赖）。向"基于浏览器的
+Linux/macOS 本地文件浏览器"演进，核心壁垒是渲染质量而非文件列表本身。
+
+目标用户场景：个人本机使用为主（xdg-open 打开本地文件是核心诉求之一），偶尔
+=--host 0.0.0.0= 局域网分享浏览。
+
+需求清单（用户选定）：
+
+1. 文件名搜索（递归，服务端遍历，不建索引）。
+2. 面包屑 + 键盘导航，接近原生文件管理器手感。
+3. 侧边预览面板：点击文件不离开列表即可查看渲染内容。
+4. 网格/缩略图视图（图片目录）。
+5. 音视频浏览器内播放（Range 已支持，只需 viewer 页面/面板）。
+6. 打开方式：当前 tab / 新 tab 两种入口。
+7. 显式下载（Content-Disposition: attachment）。
+8. 通过 xdg-open（Linux）/ open（macOS）用本机默认应用打开文件——仅本机场景。
+9. 保持现有全部渲染能力与行为契约。
+
+* 范围
+
+** 目标
+
+上节需求 1–9 全部。
+
+** 非目标
+
+- 任何写操作（上传/删除/重命名/移动/新建目录）——安全模型保持只读不变。
+- 多根目录、文件系统漫游（保持启动时单一 canonicalized root）。
+- 鉴权/多用户（只读 + 本机为主场景不需要；native-open 由 loopback+Host+Origin+token 保护）。
+- 服务端缩略图生成（先用客户端 CSS 缩放 + lazy loading，性能不达标再另立提案）。
+- 全文内容搜索、索引。
+- SPA/前端框架（维持无构建步骤）。
+- 归档文件（zip）内容列表、.ipynb 渲染等新文件类型管线（另立提案）。
+
+* 方案选型
+
+| 选项 | 收益 | 代价 |
+|------+------+------|
+| A. 渐进增强（选定） | 架构不变（maud 服务端渲染 + ~200 行 vanilla JS）；零新依赖；测试风格不变 | 交互流畅度略低于 SPA |
+| B. vendored htmx | 自写 JS 更少 | 多一个前端依赖与概念层；交互点仅三四个，红利发挥不出 |
+| C. SPA + JSON API | 体验上限最高 | 推翻"无前端构建步骤"决策；维护面翻倍；离线单二进制卖点受损 |
+
+* 设计
+
+** 响应模式 ResponseMode（统一解析，先于类型分派）[门槛 5]
+
+所有 =/{*path}= 请求在文件类型 handler 之前集中解析响应意图，形成单一内部接口：
+
+#+begin_src rust
+enum ResponseMode {
+    Download,  // 原始字节 + Content-Disposition: attachment
+    Raw,       // 原始字节 (ServeFile)
+    Fragment,  // 安全 HTML fragment (预览面板)
+    Full,      // 完整页面 (渲染或协商)
+}
+#+end_src
+
+解析规则（在 =serve_path= 内、目录/文件分派之前执行一次）：
+
+1. =download= 存在 → Download（最高优先，绕过所有渲染器）。
+2. 否则 =raw= 存在 → Raw。
+3. 否则 =fragment= 存在 → Fragment。
+4. 否则 =view= 存在 → Full（强制渲染，既有语义）。
+5. 否则按既有行为：.md/.org → Full；Office/代码按 Accept 协商（含 text/html → Full，
+   否则 → Raw）；其他文件 → Raw。
+
+优先级 =download > raw > fragment > view= 为总序，多参数同现时按此裁定，测试锁定。
+
+契约：
+
+- Download 一律走 ServeFile 原始字节 + attachment header；.md/.org/Office/代码无一例外；
+  Range 与条件请求能力由 ServeFile 保留。
+- Raw 走既有 =serve_file= 管线（含 text/* charset 修补）。.md/.org 因此新增 =?raw=1=
+  原文支持（此前 =raw= 被忽略仍渲染 HTML，属新增行为，测试锁定）。
+- 所有 ServeFile 响应统一附加 raw-content sandbox；Download 响应虽由 attachment 阻止内联，
+  仍保留同一 header，避免形成第二个出口。详见“主动内容与可信 UI 的 origin isolation”。
+- Fragment 见下节"严格接口"；不受 fetch 默认 =Accept: */*= 影响（模式已显式选定）。
+- 目录：Fragment → 迷你列表片段；Download/Raw/View 对目录无意义，忽略并返回完整目录页。
+- 判定顺序不变：目录 → .md → .org → Office/CSV → 代码 → ServeFile。
+
+** 路由与端点（routes.rs）
+
+- =GET /__/search?q=<query>= — 从 root 递归文件名搜索，渲染结果页（详见"递归搜索"）。
+- =POST /__/native-open= — form 字段 =path= + =token=；校验链见"本机打开与安全"。
+- 现有 =/{*path}= 增三个查询参数：=download= / =fragment=（语义见 ResponseMode）与既有的
+  =raw= / =view=。
+- 图片/音视频：Full/Raw/Download 走 ServeFile 原生（浏览器自带查看器/播放器，Range 已有）；
+  Fragment 返回 =<img>/<video>/<audio>= 包装片段。
+  扩展名集合：图片 =png jpg jpeg gif webp svg avif ico=；视频 =mp4 webm mov m4v=；
+  音频 =mp3 flac ogg opus wav m4a=。
+- 非法 sort 返回 404 等既有行为契约不变。
+- ConnectInfo plumbing：=main.rs= 改为
+  =axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())= [门槛 1]。
+
+** fragment：严格接口（安全契约）[门槛 2]
+
+fragment 是预览面板的唯一内容来源，必须是严格接口——**任何路径都不得返回裸内容**：
+
+- 集中出口：单一 helper（=serve_fragment(path, kind, metadata)=）处理全部类型，
+  四个文件类型 handler 不各自形成 fallback 语义。kind 由类型分派确定：
+  Dir / Markdown / Org / Office(Format) / Code(lang) / Media / Unsupported。
+- 成功响应：CB 生成的安全 HTML fragment，统一为 =<div class="cb-doc">…</div>=
+  （文档/代码）或媒体/迷你列表包装；Content-Type =text/html; charset=utf-8= +
+  =X-Content-Type-Options: nosniff=。不含 =<!DOCTYPE>=/=<head>=/页面级样式（宿主已带
+  .cb-doc 样式，见"渲染管线扩展"）。
+- 失败响应（非 UTF-8、超限、anydoc 转换失败、不支持的类型）：统一返回占位 fragment
+  =<div class="cb-doc"><p class="cb-no-preview">无法预览：<原因></p></div>=（200，
+  maud 转义文案，**不含原始文件字节**）。fragment 模式禁止回退到 ServeFile 或
+  text/plain 原文。
+- 渲染安全性由各生成管线明确保证：
+  - Markdown raw HTML 继续由 comrak 转义。
+  - Org 的 =OrgHtmlHandler= 必须显式覆盖 HTML =ExportBlock= 与 HTML =Snippet=，
+    分别对 =contents= / =value= 使用 =HtmlEscape= 输出文本；非 HTML export/snippet
+    维持 orgize 默认行为。Full 与 Fragment 均复用同一 =org::render=，不得出现第二条
+    未转义路径。
+  - 代码经 syntect 转义；媒体以 =<img>= 嵌入（SVG 脚本在 img 上下文不执行，不做 inline）。
+- 前端职责：=fetch= 后检查 =response.ok= 且 Content-Type 含 =text/html= 才注入
+  =innerHTML=；否则用 =textContent= 显示错误，不得注入。
+
+验收锁定：超限代码、非 UTF-8 Markdown、Office 转换失败的 fragment 均不含原始字节；
+hostile Markdown 与 hostile Org ExportBlock/Snippet 在 Full/Fragment 下都只显示转义文本，
+不生成活动元素或事件属性；正常 md/org/Office/代码 fragment 不含
+=<!DOCTYPE>=/=<head>=/=<style>=。
+
+** 主动内容与可信 UI 的 origin isolation [第二轮门槛 1]
+
+选择 **CSP sandbox**，不增加第二 listener/port/origin。分离 origin 能保留原始 HTML 的
+同源 XHR，但会给单端口、局域网地址、链接生成和 CLI 增加第二套寻址规则；对本机只读浏览器过重。
+
+- =serve_file= 是唯一 raw-content 出口；它对 **每个** ServeFile 响应附加：
+  =Content-Security-Policy: sandbox allow-scripts=。
+  不做 html/svg 扩展名或 MIME allowlist，避免未来新增主动格式时漏保护。
+- CSP **不得**包含 =allow-same-origin=。顶层 HTML、SVG、XML 等主动文档因此获得 opaque
+  origin；浏览器发送的 Origin 为 =null=，不能读取目录页、搜索页或 token，也不能通过
+  native-open 的 Origin 精确匹配。
+- 保留 =allow-scripts= 是兼容性取舍：原始 HTML 的脚本仍可执行，但 fetch/XHR、storage 与
+  同源 DOM 访问失效；forms/popups/downloads 等能力因未加入对应 sandbox token 而保持禁用。
+  当前“HTML 交给浏览器渲染”的行为保留，但不承诺本地 Web 应用的同源 API 能力。
+- CB 生成的目录页、搜索页、完整文档页、fragment 与静态资源不经过 ServeFile，不加 sandbox；
+  它们是可信 UI origin。媒体作为 =img/video/audio= 子资源时不执行文档脚本，Range 不受影响。
+- =download= 仍附加 attachment；sandbox header 对下载无行为影响。
+
+验收：ServeFile 返回的 =evil.html= 与顶层 =evil.svg= 响应都带
+=sandbox allow-scripts= 且不含 =allow-same-origin=；浏览器中二者的 =fetch("/")=
+不可读 token-bearing 页面，从其发出的 native-open 请求因 =Origin: null= 返回 403；
+可信目录 UI 的正向请求仍返回 204。
+
+** 递归搜索 [门槛 3]
+
+- =GET /__/search?q=<query>=：大小写不敏感子串匹配文件名（目录也参与匹配），
+  从 root 递归，上限 500 条，截断时页面提示，空 q/纯空白 q 直接返回提示页不遍历。
+- 进程级并发门：=AppState= 持有 =Arc<Semaphore>=，容量固定为 1。非空查询先
+  =try_acquire_owned()=；忙时立即返回 429 + =Retry-After: 1=，不排队第二次磁盘扫描。
+  permit 移入 =spawn_blocking= closure，直到真实遍历结束才释放；客户端断开或 handler
+  future 被取消不会释放 permit，也不会取消已经启动的 blocking task。
+- 实现（=listing.rs= 新增 =search=，阻塞函数；handler 仅负责 gate 与 =spawn_blocking=）：
+  - 迭代式 BFS 队列（=VecDeque<PathBuf>=，seed 为 root），不用递归，避免深目录爆栈。
+  - 在处理每个目录前先收集全部 =DirEntry=，按 Unix 原始文件名 bytes
+    （=OsStrExt::as_bytes()=）升序排序，再进行匹配与入队。全局顺序定义为：
+    深度升序；同一深度按父目录既有 BFS 顺序；同一目录按上述 bytes 顺序。
+  - root identity 预先加入 visited。目录项复用已跟随符号链接的 metadata，同时构造
+    =FileMeta= 与 =(dev, ino)=，不重复 stat；按确定顺序首次遇到的 identity 才参与
+    匹配和入队，后续别名整项跳过。因此 alias 选择规则为“最浅层优先，同层 bytewise
+    路径优先”，=loop -> .=、=parent -> ..= 与多别名均终止且可复现。
+  - 目录项/metadata 失败逐项跳过；子目录 =read_dir= 失败跳过该子树（debug 日志），
+    不使整个搜索 500。
+  - 查询字符串在 handler 内 =to_lowercase()= 一次；候选项逐个
+    =name.to_lowercase().contains(q)=。
+  - 结果直接使用确定性遍历顺序，不做“截断后再排序”。遇到第 501 个 match 立即停止，
+    返回前 500 项 + truncated。确定性保证以扫描期间文件树未变化为前提。
+- =spawn_blocking= 扫描启动后不可 abort；Ctrl-C 可能等待当前一次有限遍历结束。这是同步
+  文件系统 API 的已知边界，并发门确保最多只有一次扫描占用 blocking pool。
+- 结果页：页头搜索框（q 预填）+ 面包屑（root / 搜索："q"）+ 复用 striped 表格，
+  列：名称（链接到文件/目录）、位置（父目录相对路径，整体一个链接指向父目录页）、
+  大小、修改时间。行尾操作图标与目录页一致。结果页同样支持键盘导航与预览面板。
+
+** 面包屑与交互契约 [门槛 8]
+
+*** 面包屑（目录页与搜索页）
+
+- 结构：=nav.cb-breadcrumb=，=根目录名 / seg1 / seg2 / … / 当前目录=。
+- 根节点：标签为 root 目录名（basename），href 为 =/=。
+- 中间节点：href 为逐级累计路径，每段用 =PATH_SEGMENT_ENCODE_SET= 编码
+  （与 =FileMeta::href= 同一编码器，空格 =%20=，中文/+/=/# 均安全）。
+- 当前节点：纯文本不生成链接。
+- 搜索页面包屑：root 链接 + "搜索"当前节点；行内父目录链接见上节。
+- 特殊字符目录名的逐级跳转由测试锁定。
+
+*** 鼠标与键盘操作总表（无歧义）
+
+| 操作 | 行为 |
+|------+------|
+| 单击文件名链接 | 当前 tab 打开（无 JS 时的原生行为，保持可用） |
+| Ctrl/⌘+单击、中键 | 新 tab（浏览器原生 anchor 行为） |
+| 单击行非链接区域 | 选中该行 |
+| 双击行 | 当前 tab 打开 |
+| 行尾 =预览= 图标 | 预览面板打开该文件 |
+| 行尾 =↗= 图标 | 新 tab（=target=_blank rel=noopener=） |
+| 行尾 =⤓= 图标 | 下载（=?download=1=） |
+| =j/k/↑/↓= | 移动选中行（到边界停，不循环） |
+| =Enter= | 当前 tab 打开选中行 |
+| =o= | 新 tab 打开选中行 |
+| =p= | 预览选中行/切换预览面板 |
+| =v= | 切换列表/网格视图 |
+| =Backspace= | 上级目录 |
+| =/= | 聚焦搜索框 |
+| =Esc= | 关闭预览；搜索框聚焦时先失焦 |
+
+- 快捷键守卫：事件 target 为 =input/textarea/select/[contenteditable]= 或带
+  Ctrl/Meta/Alt 修饰键时一律忽略（搜索框内可正常输入 o、p、/ 并按 Backspace）。
+- 被替代的浏览器默认行为显式 =preventDefault=（=/=、Backspace、Enter、o、p、v）。
+
+** 前端（新增 assets/chapbook-browser.js，vanilla，无构建步骤）
+
+- 预览面板：目录页/搜索页静态骨架右侧固定面板（≈40rem），=fetch(<url>?fragment=1)=
+  后按上节契约注入；面板工具栏：当前 tab 打开 / 新 tab 打开 / 下载 /
+  本机打开（仅当页面嵌入了 token，见下节）。
+- 面板内目录迷你列表的条目链接由 JS 拦截为面板内下钻（fragment 级联加载）；
+  工具栏"当前 tab 打开"用于离开面板进入完整页。
+- 视图切换：列表/网格 toggle，localStorage 持久化；网格项图片用
+  =<img loading="lazy" decoding="async">= 客户端缩放（零新依赖），非图片显示扩展名标签。
+- 页头常驻搜索框，普通 form GET 提交到 =/__/search=（无 JS 可用）。
+- 渐进增强：无 JS 时文件名链接、搜索、面包屑、排序、下载均可用；JS 只叠加
+  键盘/面板/视图切换/行尾图标行为。
+
+** 本机打开与安全（关键）[门槛 1、6]
+
+*** token 生成与嵌入
+
+- 启动时从 =/dev/urandom= 读 16 字节生成 token（hex 32 字符，零新 crate）；
+  读取失败直接启动失败并报错（不降级为弱安全运行）。
+- 嵌入条件（二者同时满足，仅目录页/搜索页）：
+  1. =Result<ConnectInfo<SocketAddr>, _>= 提取成功且 peer 为 loopback（提取失败按
+     非 loopback 处理，fail closed）；
+  2. 请求 =Host= 为字面 loopback 主机：=localhost=（大小写不敏感）/ =127.0.0.1= /
+     =[::1]=，允许附带任意端口；其余一律不嵌入。
+- 嵌入形式：=head= 内 =<meta name="cb-native-open-token" content="…">= +
+  行尾/面板"本机打开"按钮（无 token 时按钮不渲染，局域网客户端看不到入口）。
+- 这同时是 DNS rebinding 防线：rebinding 后 peer 是 loopback 但 =Host= 仍是恶意域名，
+  页面拿不到 token，POST 也在 Host 校验处被拒。不把 SOP / Private Network Access
+  当作防线。
+
+*** POST /__/native-open 校验链（任一失败即拒，顺序固定）
+
+1. peer 为 loopback，否则 403——提取形式为 =Result<ConnectInfo<SocketAddr>, _>=
+   （axum 对任意 =FromRequestParts= 提取器提供 =Result= 形式；=ConnectInfo= 本身
+   无 =OptionalFromRequestParts= 实现，=Option<ConnectInfo>= 不可用），Err 即 403；
+2. =Host= 为字面 loopback 主机（规则同上），否则 403；
+3. =Origin= 必须存在且等于 ="http://" + Host=（两者 lowercase 后比较；CB 无 TLS），
+   否则 403——同源页面 fetch POST 必带 Origin，跨域表单/脚本同样带 Origin 但域名不匹配；
+4. form =token= 与启动 token 相等，否则 403；
+5. form =path= 经 =resolve_within_root= 解析（复用现有不变量），越界 403；
+6. 目标存在（文件或目录），否则 404；
+7. =opener.open(resolved)=，见下。
+
+- 日志：失败路径记 warn（原因 + path），**token 与请求提供的错误 token 均不得写入日志**。
+- 成功响应 204；前端按钮短暂反馈。
+- 风险注记：macOS =open= 对 =.command= 文件是直接执行——上述整条链不可省。
+
+*** native-open path wire contract [第二轮门槛 4]
+
+- wire value 定义为 **无前导斜杠的、root-relative decoded path**；root 自身为空字符串。
+  每个路径 segment 是文件系统名的展示字符串，包含空格、中文、=+=、=%=、=#= 或字面
+  =%2e%2e= 时保持原字符，不预先做 URL percent decode/encode。
+- 单一 server helper 从 =root= + resolved =Path= 生成 =data-native-path=；目录表格、
+  搜索结果、网格项和 fragment wrapper 全部调用该 helper，maud 负责 HTML attribute 转义。
+  禁止从 =href=、=location.pathname= 或 =decodeURIComponent= 反推文件系统路径。
+- JS 只读取 =element.dataset.nativePath= 并写入 =URLSearchParams=；这一步执行唯一一次
+  =application/x-www-form-urlencoded= 编码。
+- Axum =Form= extractor 执行唯一一次 form decode，所得 =path= 直接传给
+  =resolve_within_root=；handler 不再 percent-decode。字面 segment =%2e%2e= 因此仍是
+  =Component::Normal=，绝不会变成 =ParentDir=。
+
+该字段同时作为预览面板工具栏的当前目标；切换/下钻 fragment 时用响应 wrapper 上同一
+=data-native-path= 更新，不复用旧行的 href。
+
+*** 子进程回收与 opener seam [第二轮门槛 3、5]
+
+- =AppState= 持有随机 token 与私有 =Arc<dyn OpenWith>=；trait 不导出：
+
+#+begin_src rust
+trait OpenWith: Send + Sync {
+    /// spawn 成功即返回 Ok; Child 由实现异步回收. 仅 spawn 失败返回 Err.
+    fn open(&self, path: &Path) -> std::io::Result<()>;
+}
+#+end_src
+
+- 生产 adapter =PlatformOpener= 使用 =tokio::process::Command=：=xdg-open <path>=
+  （Linux）/ =open <path>=（macOS），stdin/stdout/stderr 全 null，
+  =kill_on_drop(true)=。
+- =spawn()= 成功后立即把 =Child= 移入普通 =tokio::spawn= task 并 =wait().await=；
+  handler 随即返回 204，不等待 opener 完成。正常退出会被异步 reap；wait 失败只记 warn。
+  runtime shutdown 可取消 wait task，不会等待不可取消的 blocking closure；若 opener
+  仍挂起，Child drop 触发 kill-on-drop，保证 Ctrl-C 不被它阻塞。
+- 私有 =spawn_reaper(child) -> JoinHandle<()>= 封装 wait task，生产 adapter 丢弃 handle，
+  私有单元测试可 await/观察其生命周期。
+- =open()= spawn 失败 → 500 + warn；opener 收到的必须是 =resolve_within_root= 后的绝对路径。
+
+*** App 构造与私有测试装配 [第二轮门槛 5]
+
+- 生产接口改为 =pub fn app(root: PathBuf) -> io::Result<Router>=。内部
+  =generate_token() -> io::Result<String>= 打开 =/dev/urandom= 并 =read_exact= 16 字节；
+  open/read 错误原样返回，不 panic、不生成弱 token。
+- =main.rs= 在 bind listener 前构造 app；Err 时记录清晰初始化错误并退出。成功后再使用
+  =into_make_service_with_connect_info::<SocketAddr>()=。
+- Router 的真实装配为私有
+  =fn app_with(root, token, opener: Arc<dyn OpenWith>) -> Router=；它同时创建搜索
+  =Semaphore(1)=。=OpenWith=、=RecordingOpener=、=FailingOpener= 与 =app_with= 均不 public。
+- native-open 的正向/失败/校验链测试移入 =routes.rs= 的 =#[cfg(test)]= 私有模块，
+  直接使用 =app_with=；其余公共路由契约继续放 =tests/router.rs=，helper 对
+  =routes::app(...)= 调用 =expect=。
+- token reader 另有私有、接收 =Read= 的小函数，以 failing/short reader 锁定结构化错误；
+  不增加 =#[doc(hidden)] pub= 或 feature-gated testing API。
+
+** 渲染管线扩展：.cb-doc / .cb-doc-page [门槛 4]
+
+深化文档渲染模块，而不是在目录页叠加第二套全局 CSS。=assets/chapbook-doc.css=
+重构为单文件双作用域（变量与调色板不变）：
+
+- =:root= 自定义属性：保持全局（=--cb-*= 命名隔离，对目录页无害）。
+- =.cb-doc=（内容排版作用域）：font-family/size/line-height/color、标题、段落、链接、
+  表格、代码块、行号、blockquote、task-list、img、hr、标题块、TOC 卡片样式、
+  语法高亮调色板——所有原全局元素选择器加 =.cb-doc= 前缀。
+- =.cb-doc-page=（页面布局作用域）：原 =body=/=html= 规则（max-width/margin/padding/
+  背景、scroll-behavior）、=body:has(#TOC)= 的 margin-left 媒体查询、=#TOC= 的
+  fixed 侧栏媒体查询——分别改为 =.cb-doc-page= / =.cb-doc-page:has(#TOC)= /
+  =.cb-doc-page #TOC=。
+- 原 =* { box-sizing: border-box }= 收敛为 =.cb-doc *, .cb-doc *::before, .cb-doc *::after=，
+  避免影响目录页 Materialize 表格。
+- =.cb-doc= 不设置 transform/filter/perspective（避免破坏 .cb-doc-page 内 #TOC 的
+  fixed 定位）。
+
+markup 统一：
+
+- =render::doc_page= 输出 =body class="cb-doc-page"=，正文包 =<div class="cb-doc">…</div>=
+  （完整文档页布局与现状逐像素一致，既有测试不得改动断言语义）。
+- fragment 出口返回同一 =<div class="cb-doc">…</div>= 内容模块，不复制另一套 markup；
+  文档正文（含 TOC）在面板内呈卡片式 TOC（fixed 规则不命中），不泄漏页面级布局。
+- 目录页 =head= 增加 =<link rel="stylesheet" href="/__/static/css/chapbook-doc.css">=
+  （=static_asset= 同步注册），宿主页因此具备 .cb-doc 内容样式；.cb-doc-page 规则
+  在目录页无元素命中，目录表格位置/条纹/列宽不变。
+
+其余管线扩展：
+
+- =.txt= / =.log= 加入 highlight.rs 扩展名映射（plaintext 语法，走代码文件 Accept
+  协商管线，带行号与 DOC_STYLE；fragment 走代码分支）。
+- 目录 fragment：迷你列表（名称+大小，名称链接指向对应路径）。
+
+** Content-Disposition 与 RFC 8187 [门槛 7]
+
+- =meta.rs= 新增独立编码器 =ATTR_CHAR_ENCODE_SET=：RFC 8187 §3.2.1 =attr-char=
+  之外的字符全部 percent-encode（非 ASCII 字节恒编码）。**不复用**
+  =PATH_SEGMENT_ENCODE_SET=——它面向 RFC 3986 path segment，会保留 =(= 、=)= 、=*=，
+  而 =attr-char= 不含这些字符。
+- header 形如：
+  =Content-Disposition: attachment; filename="<ascii-fallback>"; filename*=UTF-8''<encoded>=
+  - 只编码文件 **basename**，不把目录路径写入 filename。
+  - ascii-fallback：basename 中 =[A-Za-z0-9._-]= 之外替换为 =_=，并转义反斜杠与双引号。
+- 示例：=报告 (final)*.md= → =filename*=UTF-8''%E6%8A%A5%E5%91%8A%20%28final%29%2A.md=。
+- 文档术语统一为 RFC 8187（已取代 RFC 5987）。
+- header 在 Download 模式下由 =serve_file= 出口统一附加（单点）。
+
+** CLI 变更
+
+- =--host= 默认值 =0.0.0.0= → =127.0.0.1=（本机为主）；偶尔局域网时显式
+  =--host 0.0.0.0=。其余参数不变。
+
+** 错误处理
+
+- 搜索：坏目录项/失败子树逐个跳过；501 项截断并提示；空结果显示提示页；空 q 不遍历；
+  gate 忙时返回 429 + =Retry-After: 1=。已开始扫描不可取消，permit 持有到真实结束。
+- fragment：全部失败路径返回占位片段（200），永不返回裸内容；Org HTML export/snippet
+  在成功渲染路径也必须转义。
+- ServeFile：所有响应统一附加 =CSP: sandbox allow-scripts=，不得加入
+  =allow-same-origin=。
+- native-open：见校验链；spawn 失败 500；token 不入日志；path 只做一次 form decode。
+- app 初始化：=/dev/urandom= open/read 错误作为 =io::Error= 返回 main，禁止 panic/弱 token。
+- download：目标不存在/越界沿用 404/403（模式解析在权限判定之后）。
+
+** 测试
+
+*** 公共路由集成测试（tests/router.rs）
+
+- ResponseMode：=download/raw/fragment/view= 两两组合的优先级裁定（如
+  =download&fragment= → 原始字节 + attachment）；md/org 的 =?raw=1= 原文。
+- download：md/org/Office/代码/二进制均返回原始字节（逐字节相等）且带 attachment；
+  =Accept: text/html= 不改变结果；Range 请求仍 206。
+- RFC 8187：中文、空格、=报告 (final)*.md= 三例；header 可解析、=*= 与括号已编码、
+  basename 解码后与原文件名一致。
+- fragment：正常 md/org/Office/代码不含 =<!DOCTYPE= / =<head= / =<style=；超限代码、
+  非 UTF-8 md、Office 转换失败均为占位且无原始字节；Content-Type 为 =text/html=
+  且带 =nosniff=。
+- Org hostile HTML：ExportBlock 与 Snippet 各覆盖 Full/Fragment；响应只含
+  =&lt;img…= 文本，不含活动 =<img= 或 =onerror= attribute。
+- raw origin isolation：=evil.html=、顶层 =evil.svg= 以及普通 ServeFile 响应均带
+  =Content-Security-Policy: sandbox allow-scripts=，值中无 =allow-same-origin=；
+  目录/搜索/CB 完整文档页不带 sandbox。
+- 搜索：
+  - 基本匹配、大小写不敏感、目录命中、坏项容错、环终止。
+  - 多子目录以随机创建顺序放置 >500 项，重复请求得到完全相同的 500 个 href **及顺序**。
+  - 多别名指向同一目录时只保留按“最浅层、同层 bytewise”选出的路径，重复请求一致。
+  - 第 501 项触发 truncated，响应恰含 500 项；结果/父目录 href 编码正确。
+- 面包屑：含空格/+/=/#/中文 的多级目录，逐级 href 正确；当前节点非链接；根节点 =/=。
+- .txt/.log：Accept 协商渲染与 =?raw=1= 透传。
+- 目录页引入 chapbook-doc.css 后：含 TOC 预览时目录表格结构/条纹断言不变。
+
+*** 私有路由单元测试（src/routes.rs）
+
+- search gate：测试先持有 state 的唯一 permit，再请求搜索；响应 429 +
+  =Retry-After: 1= 且 search runner 未调用。另一路径确认 permit 被移入 blocking closure，
+  直至 runner 真正返回才允许下次搜索。
+- native-open：
+  - 无 ConnectInfo、非 loopback、Host 非法、Origin 缺失/不匹配、token 错误均 403，
+    opener 未调用。
+  - 越界 403 / 不存在 404 用例必须先通过 peer/Host/Origin/token。
+  - 全部合法 → 204，RecordingOpener 恰好一次收到 resolved 绝对路径；
+    FailingOpener → 500。
+  - =data-native-path= / form round-trip 覆盖空格、中文、=+=、=%=、=#= 与字面
+    =%2e%2e= segment；不得发生双重 decode。
+- token：failing reader 与 short reader 均返回 =io::Error=；不 panic。
+- async reaper：以当前 test executable 作为零外部依赖 child；立即退出时 wait task 完成。
+  长运行 helper 放入独立 Tokio runtime，drop runtime 在固定短超时内返回，证明不存在
+  =spawn_blocking(wait)= shutdown hang；kill-on-drop 终止 helper。
+- public interface：编译层面不存在 =app_for_testing=、public =OpenWith= 或 public fake。
+
+*** 浏览器验收（实施完成时）
+
+- 实际打开 =evil.html= 与顶层 =evil.svg=：其中 =fetch("/")= 因 opaque origin 无法读取
+  token-bearing 页面；native-open POST 的 Origin 为 =null= 并返回 403。
+- 可信目录 UI 的 native-open 正向路径仍返回 204。
+- 含 TOC 的 Markdown 预览不改变目录表格位置/条纹/列宽；关闭面板无残留布局。
+- 键盘/面板/视图切换/editable 守卫按交互表逐项验证。
+
+** AGENTS.md 修订（随实施同步）
+
+- 决策 3（零子进程）增加受控例外：仅 =xdg-open= / =open=；使用
+  =tokio::process::Command= + async wait 回收，runtime shutdown 时 kill-on-drop；
+  路径经 resolve_within_root 校验，loopback+Host+Origin+token 四重门。
+- 行为契约新增：ResponseMode 与优先级、fragment 严格接口、deterministic search
+  （sorted BFS、identity 去重、Semaphore(1)、429）、download/RFC 8187、
+  native-open path wire format 与校验链。
+- 安全不变量新增：
+  - 所有 ServeFile 响应带 =CSP: sandbox allow-scripts= 且严禁 =allow-same-origin=，
+    原始主动内容与 token-bearing UI origin 隔离。
+  - Org HTML ExportBlock/Snippet 必须经 =HtmlEscape=；Full/Fragment 共用实现。
+  - DNS rebinding 防线（Host 白名单 + Origin 精确匹配，不依赖 SOP）；token 不入日志。
+- 公共接口更新：=routes::app(root) -> io::Result<Router>=；token 生成错误显式返回；
+  opener/app_with/fake 全部私有。
+- 渲染契约更新：=chapbook-doc.css= 的 =.cb-doc= / =.cb-doc-page= 双作用域；目录页引入样式表。
+- CLI 默认 bind 变更（=127.0.0.1=）；assets 增加 chapbook-browser.js。
+
+* 第二轮修订门槛对照
+
+| 第二轮门槛 | 本版设计落点 | 状态 |
+|------------+--------------+------|
+| 1. 主动内容 origin isolation + Org raw HTML 转义 | “fragment”与“主动内容与可信 UI” | 已修订，待复审 |
+| 2. 确定性搜索 + 并发门 | “递归搜索” | 已修订，待复审 |
+| 3. 可取消的异步 Child wait | “子进程回收与 opener seam” | 已修订，待复审 |
+| 4. native-open path 单次编码契约 | “native-open path wire contract” | 已修订，待复审 |
+| 5. app 错误返回 + 私有测试 seam | “App 构造与私有测试装配” | 已修订，待复审 |
