@@ -57,85 +57,83 @@ enum OrgPart<'a> {
     Math { latex: &'a str, display: bool },
 }
 
-/// org 数学 tokenize: 按优先级扫描 `\(`/`\[` 配对、`\begin{env}..\end{env}`
-/// (同环境名, 含 `*` 后缀)、`$$..$$`、`$..$`.
-/// 行内 `$..$` 套用 org-mode 启发式: 内容非空、首尾非空白; 跨段风险由
-/// MAX_MATH_LEN 封顶; 最终防线是 KaTeX 解析失败回退原文.
+/// org 数学 tokenize: 按**位置**扫描 (而非类型优先级), 每次处理最早出现的定界符.
+/// 五种定界符: `\(..\)` `\[..\]` `\begin{env}..\end{env}` `$$..$$` `$..$`.
+/// 关键: `\begin{...}` 常出现在段落中段, 若把其前文本整体当普通文本, 前面的
+/// `$..$` 数学会丢失 (真实文档复现); 启发式不合格 (行内 `$` 首尾空白) 时把
+/// 开定界符当普通文本从其后面继续扫描, 不丢弃段落其余合法数学.
 fn tokenize(value: &str) -> Vec<OrgPart<'_>> {
     let mut parts = Vec::new();
     let mut rest = value;
     while !rest.is_empty() {
-        if let Some((head, latex, tail)) = take_pair(rest, "\\(", "\\)") {
-            parts.push(OrgPart::Text(head));
-            parts.push(OrgPart::Math {
-                latex,
-                display: false,
-            });
-            rest = tail;
-            continue;
+        // 全部定界符候选, 取 start 最小者
+        let mut best: Option<(usize, usize, &str, &str, bool)> = None;
+        for c in [
+            find_pair(rest, "\\(", "\\)", false),
+            find_pair(rest, "\\[", "\\]", true),
+            find_environment(rest),
+            find_dollar(rest, true),
+            find_dollar(rest, false),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if best.is_none_or(|(s, ..)| c.0 < s) {
+                best = Some(c);
+            }
         }
-        if let Some((head, latex, tail)) = take_pair(rest, "\\[", "\\]") {
-            parts.push(OrgPart::Text(head));
-            parts.push(OrgPart::Math {
-                latex,
-                display: true,
-            });
+        let Some((start, delim, latex, tail, display)) = best else {
+            parts.push(OrgPart::Text(rest));
+            break;
+        };
+        parts.push(OrgPart::Text(&rest[..start]));
+        // 行内 `$..$` 启发式: 首尾非空白 (org-mode 同款规则), 防 shell/Haskell 伪数学
+        let inline_dollar = !display && delim == 1; // 单个 `$` (区别于 `$$`/`\(`/`\[`/`\begin{`)
+        let ok = !latex.is_empty()
+            && latex.len() <= MAX_MATH_LEN
+            && (!inline_dollar
+                || (!latex.starts_with(char::is_whitespace)
+                    && !latex.ends_with(char::is_whitespace)));
+        if ok {
+            parts.push(OrgPart::Math { latex, display });
             rest = tail;
-            continue;
+        } else {
+            // 定界符按文本处理 (head 已输出): 只补开定界符本身, 继续扫描
+            parts.push(OrgPart::Text(&rest[start..start + delim]));
+            rest = &rest[start + delim..];
         }
-        if let Some((head, latex, tail)) = take_environment(rest) {
-            parts.push(OrgPart::Text(head));
-            parts.push(OrgPart::Math {
-                latex,
-                display: true,
-            });
-            rest = tail;
-            continue;
-        }
-        if let Some((head, latex, tail)) = take_dollar(rest, true) {
-            parts.push(OrgPart::Text(head));
-            parts.push(OrgPart::Math {
-                latex,
-                display: true,
-            });
-            rest = tail;
-            continue;
-        }
-        if let Some((head, latex, tail)) = take_dollar(rest, false) {
-            parts.push(OrgPart::Text(head));
-            parts.push(OrgPart::Math {
-                latex,
-                display: false,
-            });
-            rest = tail;
-            continue;
-        }
-        // 无定界符命中: 整段都是普通文本
-        parts.push(OrgPart::Text(rest));
-        break;
     }
     parts
 }
 
-/// 找 `open`..`close` 配对; 返回 (定界符前文本, 内容, 定界符后剩余).
-/// `\(..\)`/`\[..\]` 不套用首尾空白检查 (org 文档里 `\( \sqrt{2} \)` 常见);
-/// `$..$` 的启发式由 take_dollar 负责.
-fn take_pair<'a>(value: &'a str, open: &str, close: &str) -> Option<(&'a str, &'a str, &'a str)> {
+/// 找 `open`..`close` 配对; 返回 (开定界符位置, 定界符长, 内容, 剩余, display).
+/// `\(..\)`/`\[..\]` 不套用首尾空白检查 (org 文档里 `\( \sqrt{2} \)` 常见).
+fn find_pair<'a>(
+    value: &'a str,
+    open: &str,
+    close: &str,
+    display: bool,
+) -> Option<(usize, usize, &'a str, &'a str, bool)> {
     let start = value.find(open)?;
     let content_start = start + open.len();
     let end = value[content_start..].find(close)?;
-    let content_end = content_start + end;
-    let latex = &value[content_start..content_end];
+    let latex = &value[content_start..content_start + end];
     if latex.is_empty() || latex.len() > MAX_MATH_LEN {
         return None;
     }
-    Some((&value[..start], latex, &value[content_end + close.len()..]))
+    Some((
+        start,
+        open.len(),
+        latex,
+        &value[content_start + end + close.len()..],
+        display,
+    ))
 }
 
 /// `\begin{NAME}..\end{NAME}` (NAME 可为 `align*` 等, 原样匹配).
-/// 返回的 latex 含 `\begin{..}\end{..}` 包裹 — KaTeX 的 align 等环境必须带包裹解析.
+/// latex 含 `\begin{..}\end{..}` 包裹 — KaTeX 的 align 等环境必须带包裹解析.
 /// 环境名限定常见数学环境, 避免误吞任意 `\begin{...}` 文本.
-fn take_environment(value: &str) -> Option<(&str, &str, &str)> {
+fn find_environment(value: &str) -> Option<(usize, usize, &str, &str, bool)> {
     const ENVS: &[&str] = &[
         "align",
         "align*",
@@ -168,7 +166,6 @@ fn take_environment(value: &str) -> Option<(&str, &str, &str)> {
     const CLOSE: &str = "\\end{";
 
     let start = value.find(OPEN)?;
-    let head = &value[..start];
     let body_start = start + OPEN.len();
     let name_end = value[body_start..].find('}')? + body_start;
     let name = &value[body_start..name_end];
@@ -183,29 +180,34 @@ fn take_environment(value: &str) -> Option<(&str, &str, &str)> {
     if latex.len() > MAX_MATH_LEN {
         return None;
     }
-    let tail = &after_begin[end + close_pat.len()..];
-    Some((head, latex, tail))
+    Some((
+        start,
+        OPEN.len(),
+        latex,
+        &after_begin[end + close_pat.len()..],
+        true,
+    ))
 }
 
-/// `$$..$$` (display) 或 `$..$` (inline).
-fn take_dollar(value: &str, double: bool) -> Option<(&str, &str, &str)> {
+/// `$$..$$` (display) 或 `$..$` (inline); 返回 (开定界符位置, 定界符长, 内容, 剩余, display).
+/// 内容非空且不超限; 行内 `$` 的首尾空白检查由主循环统一处理 (需支持"跳过继续").
+fn find_dollar(value: &str, double: bool) -> Option<(usize, usize, &str, &str, bool)> {
     let delim = if double { "$$" } else { "$" };
     let start = value.find(delim)?;
     let content_start = start + delim.len();
     // 内容里再出现的 `$$`/`$` 优先作为闭合 (不做嵌套扫描 — LaTeX 里 `$` 不嵌套)
     let end = value[content_start..].find(delim)?;
-    let content_end = content_start + end;
-    let latex = &value[content_start..content_end];
-    if latex.len() > MAX_MATH_LEN {
+    let latex = &value[content_start..content_start + end];
+    if latex.is_empty() || latex.len() > MAX_MATH_LEN {
         return None;
     }
-    if !double && (latex.starts_with(char::is_whitespace) || latex.ends_with(char::is_whitespace)) {
-        return None;
-    }
-    if latex.is_empty() {
-        return None;
-    }
-    Some((&value[..start], latex, &value[content_end + delim.len()..]))
+    Some((
+        start,
+        delim.len(),
+        latex,
+        &value[content_start + end + delim.len()..],
+        double,
+    ))
 }
 
 /// 替换 comrak 输出的数学 span `<span data-math-style="inline|display">…</span>`
@@ -366,5 +368,17 @@ mod tests {
         ));
         assert!(html.contains("class=\"katex\""), "{html}");
         assert!(!html.contains("data-math-style"), "{html}");
+    }
+
+    #[test]
+    fn org_math_before_mid_paragraph_environment() {
+        // 回归: `\begin{align}` 出现在段落中段时, 旧实现把其前整段当普通文本,
+        // 前面的 `$..$` 数学全部丢失 (内接三角形文档真实场景).
+        let html = org_text_html(
+            "命题 $1$ : 锐角三角形 $\\triangle{A_1B_1C_1}$ 的最小面积\n\\begin{align*}\n\\Delta_{min} = \\dfrac{2\\Delta^2}{4\\Delta} \\tag{3}\n\\end{align*}",
+        );
+        // `$1$` + `$\triangle{...}$` + align 环境 = 3 个渲染
+        assert_eq!(html.matches("class=\"katex\"").count(), 3, "{html}");
+        assert_eq!(html.matches('$').count(), 0, "{html}");
     }
 }
