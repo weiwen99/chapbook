@@ -1,12 +1,13 @@
 #+TITLE: Design: 只读文件浏览器增强（浏览体验深化）
 #+DATE: 2026-08-12
 
-* 状态：有条件批准（待复审确认）
+* 状态：已批准（待实施）
 
-第一轮评审的 8 项门槛已写入上一修订版。第二轮评审
-（docs/2026-08-12-review-readonly-file-browser.org）确认其中 4 项关闭、4 项部分关闭，
-并新增/深化为 1 个 P0、3 个 P1、1 个 P2 问题。本版按第二轮 5 项实施前门槛再次修订；
-不自行恢复“已批准”，待复审确认全部关闭后才进入实施。方案 A（渐进增强）维持不变。
+第一至十轮评审形成的安全、响应模式、搜索、进程生命周期、路径 identity、统一安全显示编码
+与浏览器验收约束均已写入设计。第十一轮 Advisor 复审
+（docs/2026-08-12-review-readonly-file-browser.org）确认第十轮 encodedPath-only URL action
+门槛关闭，并对完整设计回归审查；未发现新的或回归的 P0/P1。按约定结束
+design 修正—review 闭环，状态恢复为“已批准（待实施）”。
 
 * 背景与需求
 
@@ -43,6 +44,8 @@ Linux/macOS 本地文件浏览器"演进，核心壁垒是渲染质量而非文�
 - 服务端缩略图生成（先用客户端 CSS 缩放 + lazy loading，性能不达标再另立提案）。
 - 全文内容搜索、索引。
 - SPA/前端框架（维持无构建步骤）。
+- Unix 非 UTF-8 文件名的完整浏览器操作支持（raw-byte path codec + 非 String 路由）——本版采用
+  “byte-escaped 显示、不可操作”的安全最小策略；如需完整支持另立设计。
 - 归档文件（zip）内容列表、.ipynb 渲染等新文件类型管线（另立提案）。
 
 * 方案选型
@@ -121,19 +124,26 @@ fragment 是预览面板的唯一内容来源，必须是严格接口——**任
   maud 转义文案，**不含原始文件字节**）。fragment 模式禁止回退到 ServeFile 或
   text/plain 原文。
 - 渲染安全性由各生成管线明确保证：
-  - Markdown raw HTML 继续由 comrak 转义。
-  - Org 的 =OrgHtmlHandler= 必须显式覆盖 HTML =ExportBlock= 与 HTML =Snippet=，
-    分别对 =contents= / =value= 使用 =HtmlEscape= 输出文本；非 HTML export/snippet
-    维持 orgize 默认行为。Full 与 Fragment 均复用同一 =org::render=，不得出现第二条
-    未转义路径。
+  - Markdown raw HTML 与危险 URL 继续由 Comrak 默认的 =unsafe=false= 处理。
+  - Org 的 =OrgHtmlHandler= 必须显式覆盖三类元素，Full 与 Fragment 复用同一
+    =org::render=，不得在 fragment 出口另做字符串清洗：
+    1. HTML =ExportBlock=：对 =contents= 使用 =HtmlEscape= 输出文本；
+    2. HTML =Snippet=：对 =value= 使用 =HtmlEscape= 输出文本；
+    3. =Element::Link=：先执行私有 =dangerous_org_url=，再分别以 =HtmlEscape=
+       输出 href 与 label。危险 URL 保留 anchor/label 但输出 =href=""=，与 Comrak 行为一致。
+  - =dangerous_org_url= 采用 Comrak denylist 语义并对浏览器 URL 规范化旁路做加固：
+    截取首个 =:= 前的 scheme candidate，移除其中 ASCII whitespace/control、转为 ASCII
+    lowercase；命中 =javascript= / =vbscript= / =data= / =file= 即危险。无冒号的相对
+    URL、=#fragment=、以及 =http/https/mailto= 保留；未知但未命中 denylist 的 scheme
+    维持 Comrak 兼容行为。Org link 的 =data:= 一律拒绝，不复用 Comrak 对部分
+    =data:image/*= 的图片例外，因为此处是导航链接而非图片渲染。
   - 代码经 syntect 转义；媒体以 =<img>= 嵌入（SVG 脚本在 img 上下文不执行，不做 inline）。
 - 前端职责：=fetch= 后检查 =response.ok= 且 Content-Type 含 =text/html= 才注入
   =innerHTML=；否则用 =textContent= 显示错误，不得注入。
 
 验收锁定：超限代码、非 UTF-8 Markdown、Office 转换失败的 fragment 均不含原始字节；
-hostile Markdown 与 hostile Org ExportBlock/Snippet 在 Full/Fragment 下都只显示转义文本，
-不生成活动元素或事件属性；正常 md/org/Office/代码 fragment 不含
-=<!DOCTYPE>=/=<head>=/=<style>=。
+hostile Markdown、Org ExportBlock/Snippet 和危险 Org link 在 Full/Fragment 下都不生成活动
+内容；正常 md/org/Office/代码 fragment 不含 =<!DOCTYPE>=/=<head>=/=<style>=。
 
 ** 主动内容与可信 UI 的 origin isolation [第二轮门槛 1]
 
@@ -141,8 +151,11 @@ hostile Markdown 与 hostile Org ExportBlock/Snippet 在 Full/Fragment 下都只
 同源 XHR，但会给单端口、局域网地址、链接生成和 CLI 增加第二套寻址规则；对本机只读浏览器过重。
 
 - =serve_file= 是唯一 raw-content 出口；它对 **每个** ServeFile 响应附加：
-  =Content-Security-Policy: sandbox allow-scripts=。
-  不做 html/svg 扩展名或 MIME allowlist，避免未来新增主动格式时漏保护。
+  =Content-Security-Policy: sandbox allow-scripts=。唯一例外是 Chromium 在
+  document sandbox 下拒绝加载音视频（浏览器验收矩阵已预设该调整路径，见下）：
+  非 download 的 200/206 =audio/*=、=video/*= 响应省略 sandbox，并强制
+  =X-Content-Type-Options: nosniff=。例外**只按媒体类型**区分，绝不因扩展名/MIME
+  泛化为 allowlist 出口，且一律不含 =allow-same-origin=。
 - CSP **不得**包含 =allow-same-origin=。顶层 HTML、SVG、XML 等主动文档因此获得 opaque
   origin；浏览器发送的 Origin 为 =null=，不能读取目录页、搜索页或 token，也不能通过
   native-open 的 Origin 精确匹配。
@@ -158,34 +171,75 @@ hostile Markdown 与 hostile Org ExportBlock/Snippet 在 Full/Fragment 下都只
 不可读 token-bearing 页面，从其发出的 native-open 请求因 =Origin: null= 返回 403；
 可信目录 UI 的正向请求仍返回 204。
 
+** token-bearing UI anti-framing [第三轮门槛 2]
+
+Origin 校验只证明 native-open 请求由可信页面发出，不能证明可信页面未被 clickjack。
+目录页与搜索页因此通过统一 =trusted_ui_response(markup)= 出口添加：
+
+- =Content-Security-Policy: frame-ancestors 'none'=
+- =X-Frame-Options: DENY=（仅作旧浏览器兼容，主防线是 CSP）
+
+=frame-ancestors= 必须是 HTTP response header，不能放进 =<meta>=。目录页与搜索页无论当前
+peer/Host 是否满足 token 嵌入条件都带相同 header，避免安全行为随入口分叉。fragment 与静态
+资源不是 frameable token-bearing document，不单独添加。该策略与 ServeFile 的
+=sandbox allow-scripts= 分属可信 UI / raw content 两条出口，不合并 header，也不互相替代。
+
+验收：目录页与搜索页响应均带两项 anti-framing header；跨 origin iframe 无法呈现页面，
+合成点击不能触发 native-open；可信顶层目录页的正向路径仍返回 204。
+
 ** 递归搜索 [门槛 3]
 
 - =GET /__/search?q=<query>=：大小写不敏感子串匹配文件名（目录也参与匹配），
   从 root 递归，上限 500 条，截断时页面提示，空 q/纯空白 q 直接返回提示页不遍历。
-- 进程级并发门：=AppState= 持有 =Arc<Semaphore>=，容量固定为 1。非空查询先
-  =try_acquire_owned()=；忙时立即返回 429 + =Retry-After: 1=，不排队第二次磁盘扫描。
+- 进程级并发门：=AppState= 持有 =Arc<Semaphore>=，容量固定为 1。非空查询通过私有
+  =run_blocking_search= 获取 permit；忙时立即返回 429 + =Retry-After: 1=，不排队第二次扫描。
   permit 移入 =spawn_blocking= closure，直到真实遍历结束才释放；客户端断开或 handler
   future 被取消不会释放 permit，也不会取消已经启动的 blocking task。
-- 实现（=listing.rs= 新增 =search=，阻塞函数；handler 仅负责 gate 与 =spawn_blocking=）：
+- 私有并发/生命周期 seam [第四轮门槛 2]：
+
+  #+begin_src rust
+  enum BlockingSearchError {
+      Busy,
+      Task(tokio::task::JoinError),
+  }
+
+  async fn run_blocking_search<T, F>(
+      gate: Arc<Semaphore>,
+      job: F,
+  ) -> Result<T, BlockingSearchError>
+  where
+      T: Send + 'static,
+      F: FnOnce() -> T + Send + 'static;
+  #+end_src
+
+  helper 内先 =try_acquire_owned=；Busy 时不调用 job。成功后把 owned permit 与 job
+  一起移入 =spawn_blocking=，await JoinHandle 并显式映射 JoinError。HTTP handler
+  仅传入 =move || listing::search(...)=，将 Busy 映射为 429、Task 映射为 500 + warn。
+  helper/error 全部 private，不给 =AppState= 增加 test runner 或第二套 adapter。
+- 实现（=listing.rs= 新增 =search= 阻塞函数；handler 仅负责参数、helper 调用与 HTTP 映射）：
   - 迭代式 BFS 队列（=VecDeque<PathBuf>=，seed 为 root），不用递归，避免深目录爆栈。
   - 在处理每个目录前先收集全部 =DirEntry=，按 Unix 原始文件名 bytes
     （=OsStrExt::as_bytes()=）升序排序，再进行匹配与入队。全局顺序定义为：
     深度升序；同一深度按父目录既有 BFS 顺序；同一目录按上述 bytes 顺序。
-  - root identity 预先加入 visited。目录项复用已跟随符号链接的 metadata，同时构造
-    =FileMeta= 与 =(dev, ino)=，不重复 stat；按确定顺序首次遇到的 identity 才参与
-    匹配和入队，后续别名整项跳过。因此 alias 选择规则为“最浅层优先，同层 bytewise
-    路径优先”，=loop -> .=、=parent -> ..= 与多别名均终止且可复现。
+  - root identity 预先加入 =visited_dirs=。每个成功读取 metadata 的目录项都先独立执行
+    名称匹配并可进入结果；普通文件从不加入 identity set，因此 hard link 的每个名称/路径
+    都保留。
+  - 若匹配后的条目是目录，再以跟随符号链接所得 =(dev, ino)= 检查 =visited_dirs=；
+    仅首次 identity 入队遍历子树，后续 alias 自身仍可作为匹配结果，但不再次下钻。
+    因此 alias 子树选择规则为“最浅层优先，同层 bytewise 路径优先”，=loop -> .=、
+    =parent -> ..= 与多别名均终止且可复现。
   - 目录项/metadata 失败逐项跳过；子目录 =read_dir= 失败跳过该子树（debug 日志），
     不使整个搜索 500。
   - 查询字符串在 handler 内 =to_lowercase()= 一次；候选项逐个
-    =name.to_lowercase().contains(q)=。
+    =display_name.to_lowercase().contains(q)=。非 UTF-8 名称因此可用 escaped label 搜索。
   - 结果直接使用确定性遍历顺序，不做“截断后再排序”。遇到第 501 个 match 立即停止，
     返回前 500 项 + truncated。确定性保证以扫描期间文件树未变化为前提。
 - =spawn_blocking= 扫描启动后不可 abort；Ctrl-C 可能等待当前一次有限遍历结束。这是同步
   文件系统 API 的已知边界，并发门确保最多只有一次扫描占用 blocking pool。
 - 结果页：页头搜索框（q 预填）+ 面包屑（root / 搜索："q"）+ 复用 striped 表格，
-  列：名称（链接到文件/目录）、位置（父目录相对路径，整体一个链接指向父目录页）、
-  大小、修改时间。行尾操作图标与目录页一致。结果页同样支持键盘导航与预览面板。
+  列：名称（可操作 UTF-8 路径为链接，非 UTF-8 路径为 display-only span）、位置
+  （可操作时父目录为链接，否则按 segment byte-escaped 显示）、大小、修改时间。
+  行尾操作只对 actionable row 渲染；结果页同样支持键盘导航与预览面板。
 
 ** 面包屑与交互契约 [门槛 8]
 
@@ -223,13 +277,22 @@ hostile Markdown 与 hostile Org ExportBlock/Snippet 在 Full/Fragment 下都只
   Ctrl/Meta/Alt 修饰键时一律忽略（搜索框内可正常输入 o、p、/ 并按 Backspace）。
 - 被替代的浏览器默认行为显式 =preventDefault=（=/=、Backspace、Enter、o、p、v）。
 
+- 非 UTF-8 display-only 行仍可被鼠标/键盘选中以读取元信息，但没有 anchor、action URL 或
+  =data-native-path-encoded=；双击、Enter、=o/p= 和所有行尾动作对该行均为 no-op。
+  列表/网格均显示“非 UTF-8 名称（仅显示）”提示，不能误以为操作已执行。
+
+- 所有 filename/path segment 的可见容器统一由 =display_segment(os_str)= 生成
+  =<bdi dir="auto">安全 label</bdi>=；选择/键盘状态只读 exact Path identity，
+  不从 textContent 或 accessible label 反推 action。
+
 ** 前端（新增 assets/chapbook-browser.js，vanilla，无构建步骤）
 
-- 预览面板：目录页/搜索页静态骨架右侧固定面板（≈40rem），=fetch(<url>?fragment=1)=
-  后按上节契约注入；面板工具栏：当前 tab 打开 / 新 tab 打开 / 下载 /
+- 预览面板：目录页/搜索页静态骨架右侧固定面板（≈40rem）。所有行与 fragment wrapper
+  只携带 ASCII-only =encodedPath=；预览 URL 由统一前端 helper 基于 encodedPath 构造，
+  返回后按 fragment 契约注入。面板工具栏：当前 tab 打开 / 新 tab 打开 / 下载 /
   本机打开（仅当页面嵌入了 token，见下节）。
-- 面板内目录迷你列表的条目链接由 JS 拦截为面板内下钻（fragment 级联加载）；
-  工具栏"当前 tab 打开"用于离开面板进入完整页。
+- 面板内目录迷你列表的条目链接由 JS 拦截为面板内下钻；下钻同样保存 encodedPath，
+  不保存 decoded URL target。工具栏“当前 tab 打开”用于离开面板进入完整页。
 - 视图切换：列表/网格 toggle，localStorage 持久化；网格项图片用
   =<img loading="lazy" decoding="async">= 客户端缩放（零新依赖），非图片显示扩展名标签。
 - 页头常驻搜索框，普通 form GET 提交到 =/__/search=（无 JS 可用）。
@@ -270,22 +333,124 @@ hostile Markdown 与 hostile Org ExportBlock/Snippet 在 Full/Fragment 下都只
 - 成功响应 204；前端按钮短暂反馈。
 - 风险注记：macOS =open= 对 =.command= 文件是直接执行——上述整条链不可省。
 
-*** native-open path wire contract [第二轮门槛 4]
+*** 浏览器路径身份与 Unix 非 UTF-8 filename [第四轮门槛 1]
 
-- wire value 定义为 **无前导斜杠的、root-relative decoded path**；root 自身为空字符串。
-  每个路径 segment 是文件系统名的展示字符串，包含空格、中文、=+=、=%=、=#= 或字面
-  =%2e%2e= 时保持原字符，不预先做 URL percent decode/encode。
-- 单一 server helper 从 =root= + resolved =Path= 生成 =data-native-path=；目录表格、
-  搜索结果、网格项和 fragment wrapper 全部调用该 helper，maud 负责 HTML attribute 转义。
-  禁止从 =href=、=location.pathname= 或 =decodeURIComponent= 反推文件系统路径。
-- JS 只读取 =element.dataset.nativePath= 并写入 =URLSearchParams=；这一步执行唯一一次
-  =application/x-www-form-urlencoded= 编码。
-- Axum =Form= extractor 执行唯一一次 form decode，所得 =path= 直接传给
-  =resolve_within_root=；handler 不再 percent-decode。字面 segment =%2e%2e= 因此仍是
-  =Component::Normal=，绝不会变成 =ParentDir=。
+选择安全最小策略：非 UTF-8 路径 **仅显示、不可通过浏览器操作**。本版不引入 raw-byte
+path codec，也不把 lossy Unicode 当作 identity。
 
-该字段同时作为预览面板工具栏的当前目标；切换/下钻 fragment 时用响应 wrapper 上同一
-=data-native-path= 更新，不复用旧行的 href。
+- =FileMeta= 明确拆分：
+  - =relative_to_root: PathBuf=：唯一文件系统 identity，始终保留原始 OsStr bytes；
+  - =display_name: String=：仅用于显示/搜索文本，绝不反推 Path；
+  - =browser_path(&self) -> Option<&str>=：仅调用整个 =relative_to_root.to_str()=；
+  - =browser_path_encoded(&self) -> Option<String>=：仅在 browser_path 为 Some 时逐 segment
+    做 RFC 3986 percent-encoding，返回无前导斜杠的 ASCII-only DOM transport；
+  - =href(&self) -> Option<String>=：在同一 encoded 值前加 =/=，不实现第二套 path codec。
+  href/DOM transport/native path/download filename 均禁止 =to_string_lossy=。
+- 私有 =escape_os_name= 是 identity 之外的统一安全显示编码 [第五至八轮门槛]。
+  =Default_Ignorable_Code_Point= matcher 固定为 **Unicode 17.0.0**；升级必须按对应
+  =DerivedCoreProperties.txt= 更新 matcher、总数和边界测试，不跟随 Rust toolchain 隐式漂移。
+  =White_Space= 直接使用 =char::is_whitespace()=，不增加第二张生产 range table 或运行时依赖；
+  Unicode 17.0 的 25 项固定测试向量锁定当前显示契约。
+- 私有 =is_default_ignorable(char) -> bool= 以静态 =matches!=/range table 覆盖
+  Unicode 17.0.0 的全部 4,174 个 =Default_Ignorable_Code_Point=。按 UCD 的 27 个源范围
+  固定为：
+
+  #+begin_src text
+  00AD; 034F; 061C; 115F..1160; 17B4..17B5; 180B..180D; 180E; 180F;
+  200B..200F; 202A..202E; 2060..2064; 2065; 2066..206F; 3164;
+  FE00..FE0F; FEFF; FFA0; FFF0..FFF8; 1BCA0..1BCA3; 1D173..1D17A;
+  E0000; E0001; E0002..E001F; E0020..E007F; E0080..E00FF;
+  E0100..E01EF; E01F0..E0FFF
+  #+end_src
+
+  =Bidi_Control= 是该 matcher 的安全关键子集，不维护第二份生产 matcher；独立 12 项测试保留。
+- Unix 实现按原始 byte stream 分段解码 UTF-8，并仅对 =U+0020 SPACE= run 做
+  segment-aware 预扫描：
+  - 恰好一个且不位于 segment 首尾的 =U+0020= 原样保留（如 =My File.txt=）；
+  - segment 首/尾或长度 ≥2 的 U+0020 run 中，每个 byte 都输出大写 =\\x20=。
+  其余每个输入 byte/scalar 只进入以下一个分支，顺序固定：
+  1. 非法 UTF-8 byte → 大写 =\\xNN=；
+  2. 字面反斜杠 → =\\=；
+  3. 除 U+0020 外的 =char::is_whitespace()= → 大写 =\\u{NNNN}=；
+  4. 其余 ASCII control/DEL → 大写 =\\xNN=；
+  5. 其余 =char::is_control()= scalar → 大写 =\\u{NNNN}=；
+  6. =is_default_ignorable(c)= → 大写 =\\u{NNNN}=，不得原样进入 DOM；
+  7. 其余合法 UTF-8 scalar 原样保留。
+  whitespace 分支位于 control 与普通 scalar 分支之前，因此 U+0009–U+000D、U+0085 及
+  18 个非 ASCII、非 Cc =White_Space= 都统一输出 =\\u{NNNN}=。
+  Unicode escape 使用大写 hex、至少 4 位。escape introducer 反斜杠自身先被转义，因此：
+  - 原始 byte =0xFF= → =\\xFF=；合法 =U+FFFD= → =�=；字面 =\\xFF= → =\\\\xFF=；
+  - 原始 =U+00A0= → =\\u{00A0}=；字面 =\\u{00A0}= → =\\\\u{00A0}=；
+  - 原始 =U+200B= → =\\u{200B}=；字面 =\\u{200B}= → =\\\\u{200B}=；
+  - 原始 =U+202E= → =\\u{202E}=；字面 =\\u{202E}= → =\\\\u{202E}=；
+  - 尾随 U+0020 → =\\x20=；字面 =\\x20= → =\\\\x20=。
+  这些 label 均不碰撞。maud 在最后一步负责 HTML text/attribute escaping。
+- 私有 =display_segment(&OsStr) -> Markup= 只做一件事：
+  =<bdi dir="auto">{escape_os_name(name)}</bdi>=。每个 segment 单独 isolate，路径分隔符、
+  metadata 列、扩展名 badge 与行尾图标位于 =bdi= 外；不用固定 =dir="ltr"=，保留正常
+  Arabic/Hebrew filename 的自然方向，同时限制跨 segment 的 bidi 影响。
+- 用户可见 filename/path 出口必须穷举并统一：
+  - 可承载 markup：目录表格、网格、搜索名称/location、面包屑、=Index of …= heading、
+    目录 fragment、预览标题/工具栏，逐 segment 使用 =display_segment=，分隔符在 =bdi= 外。
+  - 纯文本/attribute：目录完整页 =<title>=、tooltip、=title=/=aria-label= accessible name，
+    以及 Markdown/Org/Office/code 完整页未提供文档 title 时的 filename fallback，
+    使用 =escape_os_name=（多 segment 路径逐段 join）。
+  - Markdown front matter title / Org =#+TITLE= 属于文档内容而非 path identity，不替换为
+    OS-name helper；仅缺失 metadata 时的 filename fallback 走 helper。
+  任何 renderer/JS 禁止把 raw basename、=Path::display()= 或 =to_string_lossy= 写入
+  用户可见文本。私有 =display_path_text= / =display_path_markup= 集中完成逐 segment join，
+  不允许各页面自行拼接。
+- 非 UTF-8 名称仍按 escaped =display_name= 参与列表排序与大小写不敏感搜索；命中结果同样
+  display-only。root 本身由 =/= 表示，root basename 若非 UTF-8 以同一规则生成 breadcrumb
+  label，不影响其 UTF-8 子路径的 actionability。
+- browser actionability 以 **整个 root-relative Path 的 =to_str()=** 为准，不只检查 basename。
+  任一祖先 segment 非 UTF-8 时，该行在目录页、搜索结果和网格中都：
+  - 以 =<span>= 显示 escaped label，不渲染文件名 anchor；
+  - 不渲染当前 tab、新 tab、预览、下载、native-open 控制；
+  - 不输出 href、=data-native-path-encoded= 或其他可被 JS 当作 action identity 的值；
+  - 若它是目录，也不能从浏览器进入。UTF-8 名称的 symlink 即使目标真实路径含非 UTF-8，
+    仍以 symlink 自身的精确 UTF-8 relative path 操作，不受此限制。
+- Axum =Path<String>= 因而只承载可逆 UTF-8 browser paths；完整 raw-byte URL codec 与
+  =OsStringExt::from_vec= 路由明确不属于本版。
+
+验收：同目录中的非 UTF-8、字面 escape、Bidi_Control、Default_Ignorable、Unicode
+=White_Space= 与异常 U+0020 fixtures 都显示为互不相同的安全 label。重点包含
+=U+00A0=、=U+1680=、=U+2000-U+200A=、=U+2028=、=U+2029=、=U+202F=、=U+205F=、
+=U+3000= 及它们的字面 =\\u{...}= 对照，也保留既有 default-ignorable 对照。
+非 UTF-8 行完全无 action identity/controls；含上述合法 UTF-8 scalar 的行仍可操作，
+但所有可见出口只显示统一 codec 结果。任何 RecordingOpener 断言比较完整 =PathBuf=，
+禁止以显示 label 或 =to_string_lossy= 比较。
+
+*** browser action path contract [第二轮门槛 4，第四轮收紧，第九/十轮 transport 修正]
+
+- 本契约只适用于 =browser_path() == Some= 的 UTF-8 行。服务器最终接收的 filesystem value 是
+  **无前导斜杠的、root-relative decoded exact UTF-8 path**；root 自身为空字符串。
+  它源于 =relative_to_root.to_str()=，绝不源于 display label、href 或浏览器 URL。
+- decoded path **禁止直接写入 HTML attribute**。单一 server helper 调用
+  =browser_path_encoded()=，生成 =data-native-path-encoded=：逐 segment 使用既有
+  =PATH_SEGMENT_ENCODE_SET=，segment 间保留 =/=，无前导斜杠。结果只含 ASCII；
+  U+000D/U+000A 不受 HTML input-stream newline normalization 影响。
+- =encodedPath = element.dataset.nativePathEncoded= 是 JS 唯一保存的 row/panel action target。
+  目录表格、搜索结果、网格项和 fragment wrapper 全部调用同一 server helper；attribute
+  缺失时禁用全部 action。禁止从 label、导航 href、=location.pathname= 或 DOM 可见文本
+  反推 identity。
+- 当前 tab、新 tab、预览、目录 fragment 下钻与下载 **不得 decode encodedPath**。
+  单一 =actionUrl(encodedPath, mode)= 构造 =new URL("/" + encodedPath, location.origin)=，
+  再仅通过 =url.searchParams.set("fragment", "1")= /
+  =url.searchParams.set("download", "1")= 增加模式；Full 不加参数。不得把 decoded string
+  传给 =URL=/=fetch=/=location=/=window.open=，也不得用字符串拼接追加 query。
+- 只有 native-open Form 路径调用 =decodeURIComponent(encodedPath)= 一次，随后交给
+  =URLSearchParams= 执行一次 =application/x-www-form-urlencoded= 编码。Axum =Form=
+  执行一次 form decode，所得 path 直接交给 =resolve_within_root=；handler 不再
+  percent-decode。
+- 字面 =%= 先由 server 编成 =%25=；例如 basename 字面 =%2e%2e= 的 attribute 是
+  =%252e%252e=。URL actions 直接使用该 encoded 值；native-open 一次 decode 后仍为字面
+  =%2e%2e=，经 Form round-trip 后始终是 =Component::Normal=，不会变成 =ParentDir=。
+- 切换/下钻 fragment 时必须先清空 panel action state，再从新响应 wrapper 安装 encodedPath。
+  attribute 缺失、格式非法或 native-open decode 异常时保持 actions disabled，显示操作失败；
+  不发送请求，不复用旧 target。
+- clean cutover：删除 decoded =data-native-path=、任何 decoded URL target 与散落的 URL
+  构造；不保留双格式或 decode-then-URL 兼容路径。
 
 *** 子进程回收与 opener seam [第二轮门槛 3、5]
 
@@ -381,7 +546,8 @@ markup 统一：
 ** 错误处理
 
 - 搜索：坏目录项/失败子树逐个跳过；501 项截断并提示；空结果显示提示页；空 q 不遍历；
-  gate 忙时返回 429 + =Retry-After: 1=。已开始扫描不可取消，permit 持有到真实结束。
+  gate 忙时返回 429 + =Retry-After: 1=。已开始扫描不可取消，owned permit 由
+  =run_blocking_search= 持有到真实 job 结束。
 - fragment：全部失败路径返回占位片段（200），永不返回裸内容；Org HTML export/snippet
   在成功渲染路径也必须转义。
 - ServeFile：所有响应统一附加 =CSP: sandbox allow-scripts=，不得加入
@@ -403,33 +569,115 @@ markup 统一：
 - fragment：正常 md/org/Office/代码不含 =<!DOCTYPE= / =<head= / =<style=；超限代码、
   非 UTF-8 md、Office 转换失败均为占位且无原始字节；Content-Type 为 =text/html=
   且带 =nosniff=。
-- Org hostile HTML：ExportBlock 与 Snippet 各覆盖 Full/Fragment；响应只含
-  =&lt;img…= 文本，不含活动 =<img= 或 =onerror= attribute。
+- Org hostile HTML 与 URL：
+  - ExportBlock 与 Snippet 各覆盖 Full/Fragment；响应只含转义文本，无活动元素/事件属性。
+  - Full/Fragment 分别覆盖 =javascript:=、混合大小写、前导/内嵌 ASCII whitespace/control、
+    =vbscript:=、=data:=、=file:=；危险链接均为 =href=""=。
+  - =https:=、=http:=、=mailto:=、相对路径和 =#fragment= 仍生成已转义的有效 href。
 - raw origin isolation：=evil.html=、顶层 =evil.svg= 以及普通 ServeFile 响应均带
   =Content-Security-Policy: sandbox allow-scripts=，值中无 =allow-same-origin=；
   目录/搜索/CB 完整文档页不带 sandbox。
+- anti-framing：目录页与搜索页均带 =frame-ancestors 'none'= 和
+  =X-Frame-Options: DENY=；fragment/静态资源无需该 header。
 - 搜索：
   - 基本匹配、大小写不敏感、目录命中、坏项容错、环终止。
   - 多子目录以随机创建顺序放置 >500 项，重复请求得到完全相同的 500 个 href **及顺序**。
-  - 多别名指向同一目录时只保留按“最浅层、同层 bytewise”选出的路径，重复请求一致。
+  - hard link：不匹配的早序别名不得遮蔽后续匹配名；两个匹配名称必须返回两个 href。
+  - 多目录 symlink 指向同一目标且名称都匹配时，alias 自身全部返回；后代仅出现在
+    “最浅层、同层 bytewise”选出的首次路径下，重复请求一致。
   - 第 501 项触发 truncated，响应恰含 500 项；结果/父目录 href 编码正确。
 - 面包屑：含空格/+/=/#/中文 的多级目录，逐级 href 正确；当前节点非链接；根节点 =/=。
+- Unix 非 UTF-8 filename（=#[cfg(unix)]=）：
+  - 使用 =OsStringExt::from_vec= 同时创建 =bad-<0xFF>.txt=、=bad-<U+FFFD>.txt=
+    与字面 =bad-\\xFF.txt=；三者 HTML label 必须不同。
+  - 非 UTF-8 行没有 anchor、href、=data-native-path-encoded=、预览、下载或 native-open
+    控制；合法 U+FFFD/字面反斜杠行仍完整可操作。
+  - 搜索 escaped label 可显示命中，但结果保持 display-only；UTF-8 行不受影响。
+- Unicode filename display：
+  - 对 Unicode 17.0.0 的 27 个 =Default_Ignorable_Code_Point= 源范围逐个测试 start/end，
+    并遍历范围内全部 scalar；总命中数精确为 4,174。相邻非成员边界断言 false。
+  - 独立表驱动保留 =Bidi_Control= 12 项安全子集测试。
+  - 同目录创建普通 basename，以及分别含 =U+00AD=、=U+034F=、=U+200B=、=U+2060=、
+    =U+2061-U+2064=、=U+FE0F=、=U+FEFF= 的 basename；DOM label 显示对应
+    =\\u{NNNN}= 且不含原始 code point。
+  - 每个真实 default-ignorable filename 与其字面 =\\u{NNNN}= filename label 不同；
+    =photo<U+202E>gnp.command= 继续显示为逻辑 =photo\\u{202E}gnp.command=。
+  - 正常 Arabic/Hebrew filename 保留原文并由 =bdi= 隔离；非 UTF-8 collision/display-only
+    与 whitespace 测试继续通过。
+- Unicode =White_Space=：
+  - 表驱动覆盖 Unicode 17.0 =PropList.txt= 的 25 个 code point：
+    =U+0009-U+000D=、=U+0020=、=U+0085=、=U+00A0=、=U+1680=、
+    =U+2000-U+200A=、=U+2028-U+2029=、=U+202F=、=U+205F=、=U+3000=。
+  - U+0020 继续按内部单空格/首尾及连续 run 规则处理；其余 24 项精确输出
+    =\\u{NNNN}= 且原始 scalar 不出现在 label。每个真实 whitespace filename 与其字面
+    =\\u{NNNN}= filename label 不同。
+  - 同目录创建 =a b.txt= 及分别含 18 个非 ASCII、非 Cc =White_Space= 的 basename；
+    所有行保持可操作，但 DOM label 只含可见 escape。
+- 全可见出口矩阵：
+  - 目录完整页：=<title>=、=Index of …= heading、表格、网格、breadcrumb；
+  - 搜索页：name、location、tooltip/accessibility；
+  - fragment/预览：目录 fragment、预览标题和工具栏；
+  - 完整文档页：Markdown/Org/Office 无显式 title 的 filename fallback、code =<title>=。
+  每项分别用 U+202E、U+200B、U+00A0、U+2028、双 U+0020、尾随 U+0020 fixture
+  断言同一安全 label；测试禁止 =Path::display()= / =to_string_lossy()= 可见输出残留。
+- ASCII SPACE filename display：
+  - 同目录创建 =a b.txt=、=a  b.txt=、=<SP>report.md=、=report.md=、
+    =report.md<SP>= 与字面 =report.md\\x20=；六个 label 全部可区分。
+  - DOM 断言：单个内部空格保持 =a b.txt=；连续空格输出
+    =a\\x20\\x20b.txt=；首尾空格分别输出 =\\x20report.md= /
+    =report.md\\x20=；字面 token 输出 =report.md\\\\x20=。
+  - 目录列表、网格、搜索名称/location、面包屑、目录 fragment、预览标题/工具栏、
+    tooltip 与 accessible name 使用同一结果；禁止局部 CSS selector 补丁。
+- Unicode whitespace 与 ASCII SPACE 共用 identity 验收：
+  - =getAttribute("href")= 与 =dataset.nativePathEncoded= 都使用 RFC 3986 encoded 原始
+    whitespace scalar；前者有前导 =/=，后者无前导 =/=，其余 path bytes 必须一致。
+  - JS 对 dataset 值一次 =decodeURIComponent= 后必须恢复 decoded exact UTF-8；
+    =URLSearchParams= / Axum =Form= round-trip 后服务器获得同一 scalar 序列。
+  - 表驱动请求全部 24 个非 U+0020 =White_Space= 路径，服务器必须分别解析到 exact
+    root-relative Path；RecordingOpener 的 PathBuf 保留原始 scalar，显示 =\\u{...}= /
+    =\\x20= 不进入 identity。
+  - 既有 Bidi_Control、Default_Ignorable、正常 RTL、ASCII space-run、反斜杠与非 UTF-8
+    collision/display-only 测试继续通过。
 - .txt/.log：Accept 协商渲染与 =?raw=1= 透传。
 - 目录页引入 chapbook-doc.css 后：含 TOC 预览时目录表格结构/条纹断言不变。
 
 *** 私有路由单元测试（src/routes.rs）
 
-- search gate：测试先持有 state 的唯一 permit，再请求搜索；响应 429 +
-  =Retry-After: 1= 且 search runner 未调用。另一路径确认 permit 被移入 blocking closure，
-  直至 runner 真正返回才允许下次搜索。
+- search gate helper 使用私有可控 job，不依赖 tempdir 规模、sleep 或调度竞速：
+  1. 预先占有 gate，传入设置 AtomicBool 的 job；断言返回 Busy 且 job 未调用；
+  2. 首个 job 通过 channel 发出“closure 已启动”，随后阻塞等待 release；
+  3. release 前第二次 helper 调用稳定返回 Busy；HTTP 映射测试另断言 429 +
+     =Retry-After: 1=；
+  4. release 并 await 首个调用后，第三次 helper 调用成功；
+  5. panic job 映射为私有 =BlockingSearchError::Task=，HTTP 层返回 500，不泄漏 permit。
+  started/release 均用 Barrier/channel，不用 sleep；明确区分未启动、正在 job、已完成三态。
 - native-open：
   - 无 ConnectInfo、非 loopback、Host 非法、Origin 缺失/不匹配、token 错误均 403，
     opener 未调用。
   - 越界 403 / 不存在 404 用例必须先通过 peer/Host/Origin/token。
-  - 全部合法 → 204，RecordingOpener 恰好一次收到 resolved 绝对路径；
-    FailingOpener → 500。
-  - =data-native-path= / form round-trip 覆盖空格、中文、=+=、=%=、=#= 与字面
-    =%2e%2e= segment；不得发生双重 decode。
+  - 全部合法 → 204，RecordingOpener 恰好一次收到 resolved **完整 PathBuf**；
+    FailingOpener → 500。比较禁止使用 =to_string_lossy=。
+  - UTF-8 identity round-trip 覆盖中文、=+=、=%=、=#=、=?=、反斜杠、字面
+    =%2e%2e= / =%2F=、原始 U+202E / U+200B / U+2060 / U+FEFF、全部 24 个非 U+0020
+    =White_Space=，以及一个/两个内部 U+0020、前导/尾随 U+0020：
+    - href 断言带前导 =/= 的 RFC 3986 encoded 字符串；
+    - =data-native-path-encoded= 断言相同 encoded path 但无前导 =/=；
+    - URL action helper 全程不调用 =decodeURIComponent=，生成的 pathname 精确为
+      =/= + encodedPath，模式只由 =URL.searchParams= 添加；
+    - native-open 单独执行一次 decode；Form round-trip 结果逐 scalar 等于原始 UTF-8；
+  - HTML/URL normalization 专项 fixture tree 包含同目录的
+    =report<U+000D>.command=、=report<U+000A>.command=、
+    =report<U+000D><U+000A>.command=、字面 =report%0D.command=、=%2F.txt=、
+    =name?#.txt=、=back\\slash.txt=，以及字面 =%2e%2e= 目录下的 =file.txt=：
+    - DOM encoded values 分别保持 =%0D= / =%0A= / =%0D%0A= / =%250D= /
+      =%252e%252e= / =%252F= / =%3F%23= / =%5C=，禁止 raw CR/LF；
+    - 当前 tab、新 tab、预览、fragment 下钻、下载逐项捕获请求，均必须到达 exact fixture，
+      不得被 URL parser 移除 newline、折叠 dot segment、拆成 query/fragment 或把反斜杠当 =/=；
+    - native-open 一次 decode + Form round-trip 精确恢复原始序列；
+    - 导航、预览、下载与 RecordingOpener 不得串到 sibling。
+  - panel 先加载合法 target，再提供缺失/非法 encoded replacement 或制造 decode 失败：
+    action 保持 disabled，无网络请求，旧 target 不得复用。
+  - 非 UTF-8 行不生成任何 action request；不能以 replacement-character path 代替。
 - token：failing reader 与 short reader 均返回 =io::Error=；不 panic。
 - async reaper：以当前 test executable 作为零外部依赖 child；立即退出时 wait task 完成。
   长运行 helper 放入独立 Tokio runtime，drop runtime 在固定短超时内返回，证明不存在
@@ -438,9 +686,52 @@ markup 统一：
 
 *** 浏览器验收（实施完成时）
 
-- 实际打开 =evil.html= 与顶层 =evil.svg=：其中 =fetch("/")= 因 opaque origin 无法读取
-  token-bearing 页面；native-open POST 的 Origin 为 =null= 并返回 403。
-- 可信目录 UI 的 native-open 正向路径仍返回 204。
+- 安全路径：
+  - 实际打开 =evil.html= 与顶层 =evil.svg=：其中 =fetch("/")= 因 opaque origin
+    无法读取 token-bearing 页面；native-open POST 的 Origin 为 =null= 并返回 403。
+  - 从独立 origin iframe 加载目录页/搜索页：浏览器因 =frame-ancestors 'none'=
+    拒绝呈现，合成点击不能触发 native-open。
+  - 危险 Org link 在 Full/Fragment 中点击均不得改变 DOM、读取目录页或请求 native-open；
+    可信目录 UI 的 native-open 正向路径仍返回 204。
+- Browser action URL transport：
+  - 对 =%0D=、=%0A=、=%0D%0A=、=%250D=、=%252e%252e=、=%252F=、=%23=、
+    =%3F=、=%5C=、=%2B= 与非 ASCII encodedPath，在 JS 中观测 =actionUrl= 输出；
+    pathname 必须是 =/= + 输入 encodedPath，且 URL action 路径不调用 =decodeURIComponent=。
+  - 实际触发当前 tab、新 tab、预览、目录 fragment 下钻与下载，拦截网络请求并断言服务器
+    解析到 exact root-relative Path；模式参数只能由 =URL.searchParams= 添加。
+  - native-open 另测单次 decode/Form 链；URL action 与 form action 不共享 decoded target。
+  - 新 fragment 缺失/非法 target 时，工具栏全部 disabled、无请求且旧 target 已清空。
+- Unicode filename 浏览器验收（Chromium）：
+  - =report.md= 与分别含 U+200B、U+2060、U+FEFF 的变体明确显示不同
+    =\\u{NNNN}= label/宽度；不得都显示成 =report.md=。
+  - =photo<U+202E>gnp.command= 在所有可见出口显示逻辑 escape，不得显示成
+    =photo.command.png=；正常 Arabic/Hebrew segment 仍由 =bdi dir="auto"= 隔离。
+  - 对每个 fixture 分开检查：=getAttribute("href")= 与
+    =dataset.nativePathEncoded= 是同一 RFC 3986 encoded path（仅前导 =/= 不同）；
+    一次 =decodeURIComponent= 恢复原始 scalar。浏览器不实际触发 native-open，exact opener
+    路径由私有 RecordingOpener 单元测试证明。
+- Whitespace filename 浏览器验收（Chromium）：
+  - 同时呈现 =a b.txt= 与分别含 U+00A0、U+2007、U+2028、U+2029 的变体；
+    =textContent= / 截图证明每个变体显示对应 =\\u{NNNN}= token，不再与普通空格同形；
+    =getBoundingClientRect()= 证明普通空格行与各 escape 行点击区域不再相同。
+  - 同时呈现单/双内部 U+0020、无/有尾随 U+0020、前导 U+0020 和字面 =\\x20= 文件；
+    截图与几何检查证明既有 U+0020 collision 仍关闭。
+  - 列表、网格、搜索、面包屑、目录/文件完整页标题、目录预览和文件预览工具栏显示同一
+    安全 label；tooltip 与 accessible name 的字符串一致。
+  - DOM href 与 =dataset.nativePathEncoded= 保留 percent-encoded 原始 whitespace；
+    一次 decode 恢复 decoded 原始 scalar。浏览器不实际触发 native-open，
+    exact opener identity 由私有 RecordingOpener 测试证明。
+- 全量 ServeFile sandbox 回归矩阵：
+  | 场景 | 验收 |
+  |------+------|
+  | 顶层 PDF | 仍进入浏览器原生 viewer，可滚动/缩放 |
+  | 顶层图片 | 正常显示；同文件在预览面板 =img= 中也正常 |
+  | 音频/视频 | controls 可播放并 seek；网络面板观察到预期 206 Range 响应 |
+  | =?download=1= | 仍触发 attachment 下载，保存字节与源文件一致 |
+  | 原始 HTML | =allow-scripts= 下自身脚本仍运行，但 fetch 可信 UI 失败 |
+  该矩阵至少在 Linux Chromium/Firefox 执行；macOS 发布验收补 Safari。任一浏览器因 sandbox
+  破坏 PDF/媒体/download 行为时，实施必须调整 header 应用策略并重新做安全 review，
+  不得静默移除 sandbox 或加入 =allow-same-origin=。
 - 含 TOC 的 Markdown 预览不改变目录表格位置/条纹/列宽；关闭面板无残留布局。
 - 键盘/面板/视图切换/editable 守卫按交互表逐项验证。
 
@@ -450,24 +741,38 @@ markup 统一：
   =tokio::process::Command= + async wait 回收，runtime shutdown 时 kill-on-drop；
   路径经 resolve_within_root 校验，loopback+Host+Origin+token 四重门。
 - 行为契约新增：ResponseMode 与优先级、fragment 严格接口、deterministic search
-  （sorted BFS、identity 去重、Semaphore(1)、429）、download/RFC 8187、
-  native-open path wire format 与校验链。
+  （sorted BFS、=visited_dirs=、Semaphore(1)、私有 =run_blocking_search=、429）、
+  download/RFC 8187、仅 UTF-8 browser path 的 native-open wire format 与校验链。
+- 非 UTF-8/Unicode filename display：=FileMeta= 的 exact =PathBuf= identity 与安全 display label
+  分离；只有 =relative_to_root.to_str()= 成功才渲染任何浏览器 action。固定 Unicode 17.0.0
+  的完整 =Default_Ignorable_Code_Point= 与除 U+0020 外全部 =char::is_whitespace()= 转义为
+  可见 =\\u{NNNN}=，每个 segment 用 =bdi dir="auto"= 隔离；segment 首尾/连续 U+0020
+  转义为 =\\x20=，单个内部 U+0020 保持可读。禁止 lossy、zero-width/bidi spoof 或
+  whitespace glyph/collapse 形成视觉 path identity。
 - 安全不变量新增：
   - 所有 ServeFile 响应带 =CSP: sandbox allow-scripts= 且严禁 =allow-same-origin=，
     原始主动内容与 token-bearing UI origin 隔离。
-  - Org HTML ExportBlock/Snippet 必须经 =HtmlEscape=；Full/Fragment 共用实现。
+  - 目录页/搜索页统一带 =CSP: frame-ancestors 'none'=（兼容附加 =X-Frame-Options: DENY=），
+    禁止 token-bearing UI 被跨站 framing。
+  - Org HTML ExportBlock/Snippet 必须经 =HtmlEscape=；Org link 必须拒绝
+    =javascript/vbscript/data/file= 危险 scheme；Full/Fragment 共用实现。
   - DNS rebinding 防线（Host 白名单 + Origin 精确匹配，不依赖 SOP）；token 不入日志。
 - 公共接口更新：=routes::app(root) -> io::Result<Router>=；token 生成错误显式返回；
   opener/app_with/fake 全部私有。
 - 渲染契约更新：=chapbook-doc.css= 的 =.cb-doc= / =.cb-doc-page= 双作用域；目录页引入样式表。
 - CLI 默认 bind 变更（=127.0.0.1=）；assets 增加 chapbook-browser.js。
 
-* 第二轮修订门槛对照
+* 第十一轮复审结论
 
-| 第二轮门槛 | 本版设计落点 | 状态 |
-|------------+--------------+------|
-| 1. 主动内容 origin isolation + Org raw HTML 转义 | “fragment”与“主动内容与可信 UI” | 已修订，待复审 |
-| 2. 确定性搜索 + 并发门 | “递归搜索” | 已修订，待复审 |
-| 3. 可取消的异步 Child wait | “子进程回收与 opener seam” | 已修订，待复审 |
-| 4. native-open path 单次编码契约 | “native-open path wire contract” | 已修订，待复审 |
-| 5. app 错误返回 + 私有测试 seam | “App 构造与私有测试装配” | 已修订，待复审 |
+| 复审项 | Advisor 结论 | 状态 |
+|--------+--------------+------|
+| 第十轮门槛：URL actions 全程使用 encodedPath | 当前/新 tab、预览、目录下钻、下载不 decode；native-open 独占单次 decode seam | 已关闭 |
+| 完整设计 P0/P1 回归审查 | 未发现新的或回归的 P0/P1 | 通过 |
+
+* Advisor 闭环修订记录
+
+| 轮次 | Advisor 结论 | 设计更改 | 验证 |
+|------+--------------+----------+------|
+| 9 | 1 个 P1：decoded attribute 将 U+000D 归一化为 U+000A | 迁移到 =data-native-path-encoded=；server 单点编码、JS 单次 decode、失败清空目标；补 CR/LF/CRLF/字面 percent 全链路验收 | Maud 0.27 源码确认 CR 不转义；Chromium 复现碰撞并验证 ASCII-only encoded transport 可逆 |
+| 10 | 1 个 P1：decode 后再构造 URL 会移除 CR/LF、折叠 percent-like dot segment 或改变 URL 结构 | encodedPath 成为唯一 panel target；五类 URL action 禁止 decode 并集中经 =URL.searchParams= 加模式；decode 仅限 native-open Form | Chromium 证明 direct encoded URL 保持 =%0D/%252e/%3F/%5C=，decode-then-URL 分别丢字符、越级或改写结构 |
+| 11 | 无新/回归 P0/P1；达到终止条件 | 无行为修改；确认第十轮 seam 后将状态恢复为“已批准（待实施）” | Advisor 覆盖 CR/LF/CRLF、percent-like dot/slash、=?=、=#=、反斜杠、=+=、非 ASCII、异常 replacement 与 root 空 path |

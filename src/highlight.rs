@@ -70,6 +70,9 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
         "r" => "r",
         "tex" | "ltx" => "latex",
         "diff" | "patch" => "diff",
+        // txt/log 用 syntect 的 Plain Text 语法 (按名称匹配): 无 token 高亮,
+        // 内容转义显示, 行号照常输出 — 浏览器可读且保持代码页结构
+        "txt" | "log" => "Plain Text",
         _ => return None,
     })
 }
@@ -224,4 +227,65 @@ pub fn code_block(code: &str, lang: Option<&str>) -> String {
         "<pre class=\"sourceCode\"><code>{}</code></pre>",
         highlight(code, lang, true)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// .txt/.log -> Plain Text 语法 (syntect 按名称匹配 plain text syntax).
+    #[test]
+    fn language_for_path_maps_txt_and_log_to_plain_text() {
+        assert_eq!(
+            language_for_path(Path::new("notes.txt")),
+            Some("Plain Text")
+        );
+        assert_eq!(
+            language_for_path(Path::new("server.log")),
+            Some("Plain Text")
+        );
+        // 扩展名大小写不敏感
+        assert_eq!(
+            language_for_path(Path::new("UPPER.TXT")),
+            Some("Plain Text")
+        );
+        assert_eq!(language_for_path(Path::new("a.LOG")), Some("Plain Text"));
+    }
+
+    /// 既有映射全部保留; 未知扩展名维持 None.
+    #[test]
+    fn language_for_path_retains_existing_mappings() {
+        assert_eq!(language_for_path(Path::new("main.rs")), Some("rust"));
+        assert_eq!(language_for_path(Path::new("Cargo.toml")), Some("toml"));
+        assert_eq!(language_for_path(Path::new("Makefile")), Some("makefile"));
+        assert_eq!(language_for_path(Path::new("page.html")), None);
+        assert_eq!(language_for_path(Path::new("data.xyz123")), None);
+        assert_eq!(language_for_path(Path::new("noext")), None);
+    }
+
+    /// Plain Text 语法: 内容转义显示, 只有 plaintext scope atom 包装 span
+    /// (`text plain`), 无语法高亮 token; 行号模式仍输出行号.
+    #[test]
+    fn plain_text_highlight_escapes_without_token_spans() {
+        let plain = highlight("<script> & </script>", Some("Plain Text"), false);
+        assert!(plain.contains("&lt;script&gt;"), "plain: {plain}");
+        assert!(plain.contains("&amp;"), "plain: {plain}");
+        assert!(plain.contains(r#"class="text plain""#), "plain: {plain}");
+        assert!(!plain.contains(r#"class="keyword""#), "plain: {plain}");
+        assert!(!plain.contains(r#"class="string""#), "plain: {plain}");
+
+        let numbered = highlight("a\nb\n", Some("Plain Text"), true);
+        assert!(
+            numbered.contains(r#"<span class="ln">1</span>"#),
+            "numbered: {numbered}"
+        );
+        assert!(
+            numbered.contains(r#"<span class="ln">2</span>"#),
+            "numbered: {numbered}"
+        );
+        assert!(
+            !numbered.contains(r#"class="keyword""#),
+            "numbered: {numbered}"
+        );
+    }
 }
