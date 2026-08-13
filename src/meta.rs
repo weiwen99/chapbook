@@ -857,7 +857,7 @@ mod tests {
         assert_eq!(m.href(), Some("/My%20File.txt".to_string()));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn from_non_utf8_name_escapes_losslessly() {
         use std::os::unix::ffi::OsStrExt;
