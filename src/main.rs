@@ -1,5 +1,7 @@
 //! chapbook — a simple static file server.
 
+use std::net::SocketAddr;
+
 use chapbook::opts::Opts;
 use chapbook::routes;
 use clap::Parser;
@@ -20,6 +22,16 @@ async fn main() {
         "server parameters"
     );
 
+    // 初始化 app (token 生成) 先于 bind: 初始化失败记录清晰错误并退出,
+    // 绝不降级为弱 token 运行.
+    let app = match routes::app(opts.root) {
+        Ok(app) => app,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to initialize server (token generation)");
+            std::process::exit(1);
+        }
+    };
+
     let listener = match tokio::net::TcpListener::bind((opts.host.as_str(), opts.port)).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -28,10 +40,12 @@ async fn main() {
         }
     };
 
-    let app = routes::app(opts.root);
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
     {
         tracing::error!(error = %e, "server error");
         std::process::exit(1);

@@ -168,14 +168,48 @@ impl HtmlHandler<IoError> for OrgHtmlHandler {
                 write!(w, "<main>")?;
             }
             // 裸图片链接 → `<img>` (org-mode 行为: `[[file:img.png]]` 无描述即内嵌图片);
-            // 有描述的链接保持 `<a>` (如 `[[file:x.png][说明]]`, 用户可能想引用而非展示)
-            Element::Link(link) if link.desc.is_none() && is_image_path(&link.path) => {
-                write!(
-                    w,
-                    "<img src=\"{}\" alt=\"{}\">",
-                    HtmlEscape(&link.path),
-                    HtmlEscape(&link.path)
-                )?;
+            // 有描述的链接保持 `<a>` (如 `[[file:x.png][说明]]`, 用户可能想引用而非展示).
+            // 所有链接先过 URL 安全校验: 危险协议 (javascript/vbscript/data/file) 的链接
+            // 保留锚点标签但 href 置空, 危险协议的裸图片不得升级为 `<img>`.
+            // orgize 的 Link 是叶子元素 (desc 为纯文本, 无嵌套行内标记事件), 整段
+            // `<a>` 在 start 输出, end 无对应事件 — 与 DefaultHtmlHandler 结构一致.
+            Element::Link(link) => {
+                if !dangerous_org_url(&link.path)
+                    && link.desc.is_none()
+                    && is_image_path(&link.path)
+                {
+                    write!(
+                        w,
+                        "<img src=\"{}\" alt=\"{}\">",
+                        HtmlEscape(&link.path),
+                        HtmlEscape(&link.path)
+                    )?;
+                } else {
+                    let href = if dangerous_org_url(&link.path) {
+                        ""
+                    } else {
+                        link.path.as_ref()
+                    };
+                    let label = link.desc.as_ref().unwrap_or(&link.path);
+                    write!(
+                        w,
+                        "<a href=\"{}\">{}</a>",
+                        HtmlEscape(href),
+                        HtmlEscape(label)
+                    )?;
+                }
+            }
+            // HTML export block 只输出转义文本, 绝不委托活动 HTML (默认 handler 会原样写出)
+            Element::ExportBlock(block) => {
+                if block.data.eq_ignore_ascii_case("HTML") {
+                    write!(w, "{}", HtmlEscape(&block.contents))?;
+                }
+            }
+            // HTML snippet (orgize `@@html:…@@`) 同样只输出转义文本
+            Element::Snippet(snippet) => {
+                if snippet.name.eq_ignore_ascii_case("HTML") {
+                    write!(w, "{}", HtmlEscape(&snippet.value))?;
+                }
             }
             Element::Title(title) => {
                 let level = title.level.min(6);
@@ -221,6 +255,24 @@ impl HtmlHandler<IoError> for OrgHtmlHandler {
     }
 }
 
+/// 链接 URL 是否危险 (javascript / vbscript / data / file 协议).
+/// 取首个 `:` 之前的候选协议名, 去掉所有 ASCII 空白/控制字符后 ASCII 小写比较;
+/// 无 `:` 的相对路径与 `#fragment` 天然安全, 未知协议名保持允许.
+fn dangerous_org_url(url: &str) -> bool {
+    let Some((scheme, _)) = url.split_once(':') else {
+        return false;
+    };
+    let normalized: String = scheme
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && !c.is_ascii_control())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "javascript" | "vbscript" | "data" | "file"
+    )
+}
+
 /// 裸链接是否为图片路径 (按扩展名判定, 大小写不敏感; 忽略 query 部分).
 fn is_image_path(path: &str) -> bool {
     const IMAGE_EXT: &[&str] = &[
@@ -229,4 +281,124 @@ fn is_image_path(path: &str) -> bool {
     let path = path.split(['?', '#']).next().unwrap_or(path);
     let ext = path.rsplit('.').next().unwrap_or("");
     IMAGE_EXT.contains(&ext.to_ascii_lowercase().as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body_of(source: &str) -> String {
+        render(source, "test.org").1
+    }
+
+    /// HTML export block 只输出转义文本: 不得出现活动元素标签.
+    #[test]
+    fn html_export_block_outputs_only_escaped_text() {
+        let body = body_of(
+            "#+begin_export html\n<script>alert(1)</script><img src=x onerror=alert(2)>\n#+end_export\n",
+        );
+        assert!(!body.contains("<script"), "body: {body}");
+        assert!(!body.contains("<img"), "body: {body}");
+        assert!(
+            body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("&lt;img src=x onerror=alert(2)&gt;"),
+            "body: {body}"
+        );
+    }
+
+    /// HTML snippet 只输出转义文本: 不得出现活动元素标签.
+    #[test]
+    fn html_snippet_outputs_only_escaped_text() {
+        let body = body_of("@@html:<b onclick=alert(3)>x</b>@@");
+        assert!(!body.contains("<b "), "body: {body}");
+        assert!(
+            body.contains("&lt;b onclick=alert(3)&gt;x&lt;/b&gt;"),
+            "body: {body}"
+        );
+    }
+
+    /// 非 HTML export block 保持默认行为 (不输出).
+    #[test]
+    fn non_html_export_stays_hidden() {
+        let body = body_of("#+begin_export latex\n\\textbf{hi}\n#+end_export\n");
+        assert!(!body.contains("\\textbf"), "body: {body}");
+    }
+
+    /// 危险协议 (大小写混合 / 内嵌 ASCII 空白或控制字符) -> href 为空, 标签保留;
+    /// 危险协议的图片扩展名不得升级为 `<img>`.
+    #[test]
+    fn dangerous_urls_get_empty_href() {
+        for url in [
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            "java script:alert(1)",
+            "java\tscript:alert(1)",
+            "java\u{1}script:alert(1)",
+            "vbscript:msgbox(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "file:///etc/passwd",
+            "file:img.png",
+        ] {
+            let body = body_of(&format!("[[{url}]]"));
+            assert!(!body.contains("<img"), "url {url}: {body}");
+            assert!(
+                body.contains(&format!(r#"<a href="">{url}</a>"#)),
+                "url {url}: {body}"
+            );
+        }
+    }
+
+    /// 相对路径 / #fragment / http / https / mailto / 未知协议保持可点击 (href 转义保留).
+    #[test]
+    fn safe_urls_keep_escaped_href() {
+        for url in [
+            "https://example.com/doc.pdf",
+            "http://example.com/x?a=1",
+            "mailto:user@example.com",
+            "relative/path.txt",
+            "#fragment",
+            "custom-scheme:opaque",
+        ] {
+            let body = body_of(&format!("[[{url}]]"));
+            assert!(
+                body.contains(&format!(r#"<a href="{url}">"#)),
+                "url {url}: {body}"
+            );
+        }
+    }
+
+    /// href 与 label 都经 HtmlEscape (属性引号/尖括号/& 不外泄).
+    #[test]
+    fn link_href_and_label_are_escaped() {
+        let body = body_of(r#"[[https://example.com/a?x=1&y=2]["q" < & label]]"#);
+        assert!(
+            body.contains(
+                r#"<a href="https://example.com/a?x=1&amp;y=2">&quot;q&quot; &lt; &amp; label</a>"#
+            ),
+            "body: {body}"
+        );
+    }
+
+    /// 危险链接的标签同样转义.
+    #[test]
+    fn dangerous_link_label_is_escaped() {
+        let body = body_of(r#"[[javascript:alert("x")]]"#);
+        assert!(
+            body.contains(r#"<a href="">javascript:alert(&quot;x&quot;)</a>"#),
+            "body: {body}"
+        );
+    }
+
+    /// 既有裸图片行为保留: 安全相对路径仍渲染 `<img>`.
+    #[test]
+    fn safe_bare_image_still_renders_img() {
+        let body = body_of("[[./static/pic.jpg]]");
+        assert!(
+            body.contains(r#"<img src="./static/pic.jpg" alt="./static/pic.jpg">"#),
+            "body: {body}"
+        );
+    }
 }

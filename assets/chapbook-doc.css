@@ -1,5 +1,6 @@
 /* chapbook-doc-style */
-*, *::before, *::after { box-sizing: border-box; }
+/* 盒模型只作用于文档内容 (片段/整页都经 .cb-doc 包装); 不污染宿主页面 */
+.cb-doc *, .cb-doc *::before, .cb-doc *::after { box-sizing: border-box; }
 :root {
   --cb-text: #1f2328;
   --cb-bg: #ffffff;
@@ -18,35 +19,41 @@
     --cb-soft-bg: #161b22;
   }
 }
-html {
-  color: var(--cb-text);
-  background-color: var(--cb-bg);
+/* 视口滚动 (锚点平滑、落点偏移) 由根元素提供: body 上的 scroll-behavior/scroll-padding-top
+ * 不会传播到视口; :has() 限定完整文档页, 片段嵌入宿主时不改宿主滚动行为 */
+html:has(> body.cb-doc-page) {
   scroll-behavior: smooth;
   scroll-padding-top: 1.5rem;
 }
-body {
+/* 页面级布局: 只挂在完整文档页的 body (.cb-doc-page), 内容片段不携带固定页布局.
+ * border-box 使 max-width 含内边距, 整页栏宽不再被 1.5rem 水平内边距撑宽 */
+.cb-doc-page {
+  box-sizing: border-box;
+  background-color: var(--cb-bg);
   /* 字号 ~80%, 栏宽与字号等比 (84rem@67% -> 100rem@80%), 保持每行字数 */
   max-width: 100rem;
   margin: 0 auto;
   padding: 1.2rem 1.5rem 5rem;
+}
+/* 文档基础排版挂在 .cb-doc: 整页与片段共用; 页面布局 (背景/栏宽/边距) 留在 .cb-doc-page */
+.cb-doc {
   color: var(--cb-text);
-  background-color: var(--cb-bg);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
   /* 全局字体缩放 ~80% (用户要求): 16px * 0.8; em 派生的标题/代码随之等比缩放 */
   font-size: 12.8px;
   line-height: 1.75;
 }
-header#title-block-header { margin-bottom: 2.5em; }
-h1.title { margin: 0.3em 0 0.15em; border-bottom: none; }
-p.author, p.date { margin: 0.1em 0; color: var(--cb-muted); }
-h1, h2, h3, h4, h5, h6 { margin: 1.6em 0 0.7em; line-height: 1.35; font-weight: 600; }
-h1 { font-size: 1.75em; padding-bottom: 0.25em; border-bottom: 1px solid var(--cb-border); }
-h2 { font-size: 1.45em; padding-bottom: 0.2em; border-bottom: 1px solid var(--cb-border); }
-h3 { font-size: 1.2em; }
-h4 { font-size: 1.05em; }
-a { color: var(--cb-accent); text-decoration: none; }
-a:hover { text-decoration: underline; }
-#TOC, #table-of-contents {
+.cb-doc header#title-block-header { margin-bottom: 2.5em; }
+.cb-doc h1.title { margin: 0.3em 0 0.15em; border-bottom: none; }
+.cb-doc p.author, .cb-doc p.date { margin: 0.1em 0; color: var(--cb-muted); }
+.cb-doc h1, .cb-doc h2, .cb-doc h3, .cb-doc h4, .cb-doc h5, .cb-doc h6 { margin: 1.6em 0 0.7em; line-height: 1.35; font-weight: 600; }
+.cb-doc h1 { font-size: 1.75em; padding-bottom: 0.25em; border-bottom: 1px solid var(--cb-border); }
+.cb-doc h2 { font-size: 1.45em; padding-bottom: 0.2em; border-bottom: 1px solid var(--cb-border); }
+.cb-doc h3 { font-size: 1.2em; }
+.cb-doc h4 { font-size: 1.05em; }
+.cb-doc a { color: var(--cb-accent); text-decoration: none; }
+.cb-doc a:hover { text-decoration: underline; }
+.cb-doc #TOC, .cb-doc #table-of-contents {
   margin: 0 0 2em;
   padding: 0.9em 1.4em;
   background: var(--cb-soft-bg);
@@ -54,12 +61,12 @@ a:hover { text-decoration: underline; }
   border-radius: 8px;
   font-size: 0.95em;
 }
-#TOC ul, #table-of-contents ul { margin: 0.2em 0; padding-left: 1.1em; list-style: none; }
-#TOC > ul, #text-table-of-contents > ul { padding-left: 0; }
-#TOC li, #table-of-contents li { margin: 0.28em 0; }
-#TOC a, #table-of-contents a { color: var(--cb-text); }
-#TOC a:hover, #table-of-contents a:hover { color: var(--cb-accent); text-decoration: none; }
-code {
+.cb-doc #TOC ul, .cb-doc #table-of-contents ul { margin: 0.2em 0; padding-left: 1.1em; list-style: none; }
+.cb-doc #TOC > ul, .cb-doc #text-table-of-contents > ul { padding-left: 0; }
+.cb-doc #TOC li, .cb-doc #table-of-contents li { margin: 0.28em 0; }
+.cb-doc #TOC a, .cb-doc #table-of-contents a { color: var(--cb-text); }
+.cb-doc #TOC a:hover, .cb-doc #table-of-contents a:hover { color: var(--cb-accent); text-decoration: none; }
+.cb-doc code {
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   font-size: 0.88em;
   background: var(--cb-soft-bg);
@@ -69,7 +76,7 @@ code {
 }
 /* pre.sourceCode: pandoc 开启语法高亮后会给 pre 加 .sourceCode 类并设 background-color: transparent,
  * 类选择器 (0,1,0) 优先级高于元素选择器 (0,0,1), 必须显式覆盖 */
-pre, pre.sourceCode, pre.src, pre.example {
+.cb-doc pre, .cb-doc pre.sourceCode, .cb-doc pre.src, .cb-doc pre.example {
   background: var(--cb-soft-bg);
   border: 1px solid var(--cb-border);
   /* 用户要求: 代码块一律方框, 不带圆角 */
@@ -78,8 +85,8 @@ pre, pre.sourceCode, pre.src, pre.example {
   overflow-x: auto;
   line-height: 1.5;
 }
-pre code { background: transparent; padding: 0; font-size: 0.85em; }
-blockquote {
+.cb-doc pre code { background: transparent; padding: 0; font-size: 0.85em; }
+.cb-doc blockquote {
   margin: 1em 0;
   padding: 0.3em 1.1em;
   color: var(--cb-muted);
@@ -87,41 +94,41 @@ blockquote {
   border-left: 4px solid var(--cb-accent);
   border-radius: 0 6px 6px 0;
 }
-blockquote p { margin: 0.4em 0; }
-table { display: block; width: max-content; max-width: 100%; margin: 1.2em 0; border-collapse: collapse; overflow-x: auto; }
-th, td { border: 1px solid var(--cb-border); padding: 0.45em 0.8em; }
-th { background: var(--cb-soft-bg); font-weight: 600; }
-tr:nth-child(even) { background: var(--cb-soft-bg); }
-ul.task-list, ul.contains-task-list { list-style: none; padding-left: 1.2em; }
-ul.task-list input[type="checkbox"], ul.contains-task-list input[type="checkbox"] { margin-right: 0.45em; accent-color: var(--cb-accent); }
-span.todo { color: #cf222e; font-weight: 600; }
-span.done { color: #1a7f37; font-weight: 600; }
-img { max-width: 100%; height: auto; }
-hr { margin: 2em 0; border: none; border-top: 1px solid var(--cb-border); }
+.cb-doc blockquote p { margin: 0.4em 0; }
+.cb-doc table { display: block; width: max-content; max-width: 100%; margin: 1.2em 0; border-collapse: collapse; overflow-x: auto; }
+.cb-doc th, .cb-doc td { border: 1px solid var(--cb-border); padding: 0.45em 0.8em; }
+.cb-doc th { background: var(--cb-soft-bg); font-weight: 600; }
+.cb-doc tr:nth-child(even) { background: var(--cb-soft-bg); }
+.cb-doc ul.task-list, .cb-doc ul.contains-task-list { list-style: none; padding-left: 1.2em; }
+.cb-doc ul.task-list input[type="checkbox"], .cb-doc ul.contains-task-list input[type="checkbox"] { margin-right: 0.45em; accent-color: var(--cb-accent); }
+.cb-doc span.todo { color: #cf222e; font-weight: 600; }
+.cb-doc span.done { color: #1a7f37; font-weight: 600; }
+.cb-doc img { max-width: 100%; height: auto; }
+.cb-doc hr { margin: 2em 0; border: none; border-top: 1px solid var(--cb-border); }
 
 /* KaTeX 数学 (服务端渲染的 .katex 结构):
  * display 公式 (align/$$ 块) 常超正文栏宽, 容器横向滚动而非撑破布局;
  * 颜色继承正文 (亮/暗自适应), 无需额外色板 */
-.katex-display { margin: 1.1em 0; overflow-x: auto; overflow-y: hidden; padding: 0.15em 0; }
+.cb-doc .katex-display { margin: 1.1em 0; overflow-x: auto; overflow-y: hidden; padding: 0.15em 0; }
 /* KaTeX 的 .tag (公式编号列) 内部 .vlist-s spacer 会超出右缘 2px, 让每个 align 块
  * 无谓触发横向滚动条; tag 内编号 (eqn-num) 宽度小于 tag, 裁剪 spacer 无视觉损失 */
-.katex-display .tag { overflow: hidden; }
+.cb-doc .katex-display .tag { overflow: hidden; }
 
 /* 语法高亮调色板 (syntect ClassStyle::Spaced 输出完整 scope atom 类名):
  * 取 GitHub prettylights (亮) / GitHub Dark (暗) 调色板, 与页面色系同源, 代码块背景色不动.
  * 选择器按 scope 原子组合精确定位: 函数名用 entity.name.function / support.function
  * (避免 meta.function 容器把整个函数体染色), 类型/变量用 type/variable. */
-pre code span.keyword { color: #cf222e; }
-pre code span.operator { color: #cf222e; }
-pre code span.string { color: #0a3069; }
-pre code span.comment { color: #57606a; }
-pre code span.entity.name.function, pre code span.support.function, pre code span.support.macro { color: #8250df; }
-pre code span.constant { color: #0550ae; }
-pre code span.type, pre code span.variable { color: #953800; }
+.cb-doc pre code span.keyword { color: #cf222e; }
+.cb-doc pre code span.operator { color: #cf222e; }
+.cb-doc pre code span.string { color: #0a3069; }
+.cb-doc pre code span.comment { color: #57606a; }
+.cb-doc pre code span.entity.name.function, .cb-doc pre code span.support.function, .cb-doc pre code span.support.macro { color: #8250df; }
+.cb-doc pre code span.constant { color: #0550ae; }
+.cb-doc pre code span.type, .cb-doc pre code span.variable { color: #953800; }
 
 /* 行号 (代码文件页): 固定宽度右对齐, 不可选中.
  * 声明在调色板之后: 行号可能嵌套在上一行上下文 span 内, 同优先级下本规则胜出. */
-pre code span.ln {
+.cb-doc pre code span.ln {
   display: inline-block;
   min-width: 2.4em;
   padding-right: 0.9em;
@@ -131,21 +138,22 @@ pre code span.ln {
 }
 
 @media (prefers-color-scheme: dark) {
-  pre code span.keyword { color: #ff7b72; }
-  pre code span.operator { color: #ff7b72; }
-  pre code span.string { color: #a5d6ff; }
-  pre code span.comment { color: #8b949e; }
-  pre code span.entity.name.function, pre code span.support.function, pre code span.support.macro { color: #d2a8ff; }
-  pre code span.constant { color: #79c0ff; }
-  pre code span.type, pre code span.variable { color: #ffa657; }
+  .cb-doc pre code span.keyword { color: #ff7b72; }
+  .cb-doc pre code span.operator { color: #ff7b72; }
+  .cb-doc pre code span.string { color: #a5d6ff; }
+  .cb-doc pre code span.comment { color: #8b949e; }
+  .cb-doc pre code span.entity.name.function, .cb-doc pre code span.support.function, .cb-doc pre code span.support.macro { color: #d2a8ff; }
+  .cb-doc pre code span.constant { color: #79c0ff; }
+  .cb-doc pre code span.type, .cb-doc pre code span.variable { color: #ffa657; }
 }
 /* 宽屏: TOC 固定为左侧边栏, 正文右移并在剩余空间中居中; 窄屏/打印: 保持顶部卡片.
- * margin-left 仅在页面确实有 TOC 时生效 — 代码文件页无 TOC, 否则会留出空侧栏位 */
+ * margin-left 仅在页面确实有 TOC 时生效 — 代码文件页无 TOC, 否则会留出空侧栏位.
+ * 固定定位属页面级行为, 挂在 .cb-doc-page (片段嵌入宿主时不搬走宿主布局) */
 @media screen and (min-width: 75rem) {
-  body:has(#TOC), body:has(#table-of-contents) {
+  .cb-doc-page:has(#TOC), .cb-doc-page:has(#table-of-contents) {
     margin-left: max(19rem, calc((100% - 100rem) / 2 + 9.5rem));
   }
-  #TOC, #table-of-contents {
+  .cb-doc-page #TOC, .cb-doc-page #table-of-contents {
     position: fixed;
     top: 0;
     left: 0;

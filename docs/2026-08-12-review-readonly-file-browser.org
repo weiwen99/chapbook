@@ -1,220 +1,89 @@
-#+TITLE: Review: 只读文件浏览器增强设计（第三轮）
+#+TITLE: Review: 只读文件浏览器增强设计（第十一轮）
 #+DATE: 2026-08-12
+#+AUTHOR: Advisor
 
 * Review 结论
 
-评审对象： =docs/2026-08-12-design-readonly-file-browser.org= 。
+评审对象： =docs/2026-08-12-design-readonly-file-browser.org= 第十轮修订版。
+评审角色：Advisor；独立复核设计，不参与实现。
 
-本版已经关闭第二轮 5 项门槛中的 3 项，并正确深化了另外 2 项：
+第十轮唯一实施前门槛已经关闭：
 
-- =CSP: sandbox allow-scripts= 且不含 =allow-same-origin= ，可以把 ServeFile 主动文档放入
-  opaque origin；该方向成立。
-- Tokio async Child wait + =kill_on_drop(true)= 关闭了 =spawn_blocking(wait)= 阻塞 shutdown 的问题。
-- native-open path wire contract、fallible app constructor 和私有测试 seam 均已定义完整。
-- 搜索的 sorted BFS、单并发 gate 和 permit 生命周期也已定义清楚。
+1. =encodedPath = element.dataset.nativePathEncoded= 是 row/panel 唯一保存的 action target。
+2. 当前 tab、新 tab、预览、目录 fragment 下钻与下载全部把未 decode 的 encodedPath 交给
+   =actionUrl=；模式参数只由 =URL.searchParams= 添加。
+3. =decodeURIComponent= 只存在于 native-open Form seam；随后为一次
+   =URLSearchParams= form encode、一次 Axum =Form= decode，handler 不再 percent-decode。
+4. 新 fragment target 安装前先清空旧 panel state；缺失、格式非法或 decode 异常时 actions
+   保持 disabled，不发送请求、不复用旧 target。
 
-设计仍不宜进入实施。第三轮发现 1 个 P0 安全阻断项、2 个 P1 安全/正确性问题和 1 个 P2
-浏览器验收缺口：Org 的危险 URL scheme 未被过滤；token-bearing UI 可被跨站页面 clickjack；搜索把
-identity 去重错误地用于所有目录项，会漏掉 hard link 文件名；全量 ServeFile sandbox 未覆盖 PDF/媒体
-回归验收。
-
-建议保持“有条件批准（待复审确认）”。关闭本文末尾 4 项门槛后，可以恢复“已批准（待实施）”。
+对完整设计做回归审查后，本轮未发现新的或回归的 P0/P1，也没有需要阻断实施的 P2。
+终止条件“没有新的 P1”已经满足。建议 Design 状态恢复为“已批准（待实施）”，结束
+本次 design 修正—review 闭环。
 
 * 复审方法与证据
 
-1. 以改名后的 design 文件为唯一规范来源，重新核对 ResponseMode、fragment、CSP、搜索、
-   native-open、渲染和测试契约。
-2. 对照当前 =routes.rs= 、 =org.rs= 、 =highlight.rs= 、 =listing.rs= 、 =main.rs= 与 CSS 实现。
-3. 核对 orgize 0.9.0、Comrak 0.54、Tokio process 和 CSP 规范行为。
-4. 运行浏览器实验验证当前 Org link 行为：
-   - 输入 Org link 的 href 为 =javascript:alert(1)= ；
-   - orgize/当前 =OrgHtmlHandler= 输出活动 =<a href="javascript:alert(1)">= ；
-   - 点击后同步 XHR 成功读取目录页，页面结果为 =SAME_ORIGIN_READABLE= 。
+1. 对照 Design 的 =browser action path contract=、私有路由测试和 Chromium 验收矩阵，逐项追踪：
 
-实验只写入临时目录，完成后已删除；未修改项目源码。
+   #+begin_src text
+   filesystem PathBuf
+     -> server per-segment RFC 3986 encode
+     -> ASCII-only data-native-path-encoded
+     -> actionUrl(encodedPath)                  [URL actions: no decode]
+     -> decodeURIComponent(encodedPath) once    [native-open only]
+     -> URLSearchParams encode once
+     -> Axum Form decode once
+     -> resolve_within_root
+     -> RecordingOpener exact PathBuf
+   #+end_src
 
-* 第二轮门槛复核
+2. 验证以下 adversarial path classes：
+   - CR / LF / CRLF：分别保持 =%0D= / =%0A= / =%0D%0A=；
+   - 字面 =%0D=：保持 =%250D=，不与真实 CR sibling 碰撞；
+   - 字面 =%2e%2e= / =%2F=：保持 =%252e%252e= / =%252F=，URL parser 不折叠
+     dot segment，也不生成额外 path separator；
+   - =?= / =#= / 反斜杠 / =+=：保持 encoded transport，不进入 query/fragment、不变成 slash，
+     不发生 form =+= / space 混淆；
+   - 非 ASCII、Unicode White_Space、Bidi_Control 与 Default_Ignorable：显示 codec 与 action
+     identity 继续分离；
+   - root：encodedPath 是合法空字符串而不是 attribute 缺失； =actionUrl= 生成 =/=，native-open
+     form 的空 path 仍解析为 root；实现按 attribute presence 区分空值与缺失。
+3. 验证 panel fail-closed：合法 target 后安装缺失/非法 replacement 或发生 native-open decode
+   failure，旧 state 已清空，actions disabled，无请求。
+4. 回归审查 =ResponseMode=、fragment/Org 安全、ServeFile origin isolation、anti-framing、搜索
+   确定性与 permit 生命周期、opener 回收、RFC 8187、非 UTF-8 display-only 与私有 app/test seam；
+   未发现新的或回归的 P0/P1。
+5. 复核第九/十轮记录：两轮问题、设计更改和验证证据均保留在 Design 的
+   “Advisor 闭环修订记录”，没有被最终状态更新覆盖。
 
-| 第二轮门槛 | 状态 | 第三轮结论 |
-|------------+------+------------|
-| 1. 主动内容 isolation + Org raw HTML | 部分关闭 | ServeFile CSP 和 ExportBlock/Snippet 转义成立；Org link scheme 仍可执行脚本 |
-| 2. 确定性搜索 + 并发门 | 部分关闭 | sorted BFS 与 Semaphore 正确；identity 去重范围会漏 hard link/别名名称 |
-| 3. 可取消的异步 Child wait | 已关闭 | Tokio Child + async wait + kill-on-drop 生命周期明确，测试覆盖 shutdown |
-| 4. native-open path 单次编码 | 已关闭 | decoded root-relative wire value、唯一 form encode/decode 与特殊字符测试完整 |
-| 5. app 错误返回 + 私有 seam | 已关闭 | =io::Result<Router>= 、私有 =app_with= / trait / fake 的 interface 合理 |
+* 第十轮门槛复核
 
-* 已确认可实施的设计
-
-以下部分不需要因本轮 findings 回退：
-
-1. ResponseMode 总序 =download > raw > fragment > view= ，Download 统一走原始 ServeFile。
-2. fragment 单一出口、失败占位且永不回退裸字节。
-3. =.cb-doc= / =.cb-doc-page= 双作用域 CSS seam。
-4. RFC 8187 独立 attr-char encoder 与 basename-only Content-Disposition。
-5. Host + Origin + token + loopback 校验，以及 ConnectInfo plumbing。
-6. native-open 的 decoded path wire contract。
-7. Tokio Child 异步回收与私有 opener seam。
-8. fallible =routes::app= 与私有测试装配。
-9. sorted BFS、 =Semaphore(1)= 、429 和 blocking permit 生命周期。
-10. 面包屑、键盘、预览、网格和无 JS 渐进增强契约。
+| 第十轮门槛 | 状态 | 第十一轮结论 |
+|------------+------+----------------|
+| Browser URL actions 全程使用 encodedPath | 已关闭 | 五类 URL action 不 decode；native-open 独占单次 decode seam |
+| replacement 失败不得复用旧 panel target | 已关闭 | 先清空后安装；缺失/非法/decode failure 均 fail closed |
+| exact action request matrix | 已关闭 | CR/LF/percent-like/query/fragment/backslash/Unicode/root 均有确定性验收 |
 
 * Findings
 
-** [P0] Org 危险 URL scheme 仍能在可信 origin 执行脚本
+本轮无 P0、P1。没有新增实施前门槛。
 
-*** 问题
+* 已确认可实施的设计
 
-Design =:123-136= 只处理 Markdown raw HTML、Org HTML ExportBlock/Snippet 和代码转义，仍把
-普通 Org link 交给 orgize 默认 handler。
+1. =ResponseMode= 总序与目录/Markdown/Org/Office/code/media/unsupported 的完整 consumer。
+2. fragment 单一安全出口、失败占位、Markdown/Org 危险内容过滤。
+3. ServeFile =sandbox allow-scripts= opaque-origin 隔离与可信 UI anti-framing。
+4. sorted BFS、directory-only identity、500/501 截断、 =Semaphore(1)= 与 blocking job 生命周期。
+5. loopback + Host + Origin + token native-open 校验链。
+6. Tokio Child async wait、kill-on-drop 与私有 =OpenWith= seam。
+7. fallible app assembly、token reader 错误传播与 ConnectInfo plumbing。
+8. exact =PathBuf= identity、非 UTF-8 display-only、安全 display codec 与全可见出口矩阵。
+9. ASCII-only DOM path transport、encodedPath-only browser URL actions 与 native-open Form seam。
+10. RFC 8187 filename、 =.cb-doc= / =.cb-doc-page= 双作用域 CSS、面包屑与渐进增强交互。
 
-当前 =OrgHtmlHandler= 对未定制元素委托 =DefaultHtmlHandler= ：
-=src/org.rs:124-125= 、 =:190= 、 =:202= 。orgize 0.9.0 对 Link 只做 HTML attribute escaping，
-不检查 URL scheme：
+* 最终状态建议
 
-#+begin_src rust
-Element::Link(link) => write!(
-    w,
-    "<a href=\"{}\">{}</a>",
-    HtmlEscape(&link.path),
-    HtmlEscape(link.desc.as_ref().unwrap_or(&link.path)),
-)?
-#+end_src
-
-上游证据：
-[[https://docs.rs/orgize/0.9.0/src/orgize/export/html.rs.html#124-129][orgize 0.9.0 Link renderer]]。
-
-=HtmlEscape= 能阻止 attribute breakout，但不能使 =javascript:= URL 安全。本轮浏览器实验使用：
-
-#+begin_src org
-[[javascript:var x=new XMLHttpRequest();x.open('GET','/',false);x.send();document.body.textContent=x.responseText.includes('Index of')?'SAME_ORIGIN_READABLE':'NO';void 0][run probe]]
-#+end_src
-
-渲染结果保留活动 =javascript:= href；点击后成功读取目录页。完整 Org 页属于 CB 可信 origin，
-不经过 ServeFile sandbox。Org fragment 注入目录页后同样处于可信 origin。因此攻击文档可读取 token，
-随后调用 native-open；macOS =.command= 风险使其成为实施阻断项。
-
-*** 必须修改
-
-- =OrgHtmlHandler= 必须显式处理 =Element::Link= ，不能继续把链接全部交给默认 handler。
-- URL 安全策略应与现有 Comrak 保持一致，复用或等价实现其 =dangerous_url= 语义：至少拒绝
-  大小写/前导控制字符变体的 =javascript:= 、 =vbscript:= 、 =data:= 和 =file:= 。
-- 危险 URL 输出空 href 或纯文本；安全 URL 仍对 href 与 label 使用 =HtmlEscape= 。
-- Full 与 Fragment 必须复用同一 Org renderer；不得只在 fragment 出口清洗 HTML 字符串。
-- AGENTS.md 的安全不变量从“Org ExportBlock/Snippet 转义”扩展为“Org raw HTML 与危险 link
-  scheme 均不可生成活动内容”。
-
-Comrak 已有相同行为：默认 =unsafe=false= 时危险 href 输出为空，见
-[[https://docs.rs/comrak/0.54.0/comrak/options/struct.Render.html#structfield.unsafe][Comrak Render::unsafe]]。
-
-*** 验收
-
-- Org Full/Fragment 分别覆盖 =javascript:= 、混合大小写、前导 ASCII whitespace/control、
-  =vbscript:= 、 =data:= 、 =file:= 。
-- 响应不含可执行 href；点击测试不得改变 DOM、读取目录页或请求 native-open。
-- =https:= 、 =http:= 、 =mailto:= 、相对路径和 =#fragment= 仍按既有语义生成链接。
-- ExportBlock/Snippet 的转义测试继续保留；它们与 link sanitizer 防守不同输入面。
-
-** [P1] token-bearing UI 缺少 anti-framing，Origin 校验不能阻止 clickjacking
-
-*** 问题
-
-Design =:239-271= 正确防住脚本式 CSRF 和 DNS rebinding，但没有禁止第三方页面把目录页/搜索页放入
-iframe。
-
-跨站父页面不能读取 iframe 中的 token，但可以把透明或错位的可信 UI 覆盖在诱导控件上。用户点击
-iframe 内“本机打开”按钮时，请求由真实目录页 JS 发出：peer、Host、Origin 与 token 全部合法，现有
-校验链会接受。Origin 校验验证请求来自可信页面，不能证明用户没有被 clickjack。
-
-native-open 能启动本机默认应用，且 design 自己注明 macOS =.command= 可直接执行，因此 token-bearing
-UI 必须拒绝成为任意站点的 frame descendant。
-
-*** 必须修改
-
-- 目录页和搜索页响应增加 HTTP header：
-  =Content-Security-Policy: frame-ancestors 'none'= 。
-- 可同时增加 =X-Frame-Options: DENY= 作为旧浏览器兼容，但不能只依赖它。
-- =frame-ancestors= 必须通过响应 header 下发；CSP 规范不允许在 =<meta>= 中实现该保护。
-- 建议由可信 UI 的统一 response helper 添加，避免目录页与搜索页形成两个安全出口。
-- 该 header 与 raw ServeFile 的 =sandbox allow-scripts= 是两种不同策略，不应合并或互相替代。
-
-规范：
-[[https://www.w3.org/TR/CSP3/#directive-frame-ancestors][CSP Level 3: frame-ancestors]]。
-
-*** 验收
-
-- 目录页和搜索页均带 =frame-ancestors 'none'= ；fragment、静态资源无需单独携带。
-- 从另一个 origin 加载 =<iframe src="http://127.0.0.1:<port>/">= 时浏览器拒绝呈现页面。
-- 外层页面无法通过合成点击触发 native-open；可信顶层目录页正向路径仍返回 204。
-
-** [P1] 搜索把 identity 去重用于所有目录项，会漏掉合法文件名
-
-*** 问题
-
-Design =:174-177= 规定每个目录项构造 =(dev, ino)= ，只有首次遇到的 identity 才参与匹配和入队，
-后续别名“整项跳过”。这把“防止目录遍历环”的 visited 集合错误地扩展成“搜索结果去重”。
-
-普通文件可以有多个 hard link。例：
-
-#+begin_src text
-root/a             # inode 42
-root/needle.txt    # inode 42，a 的 hard link
-#+end_src
-
-bytewise 排序先遇到 =a= ；identity 被占用但名称不匹配。随后 =needle.txt= 因相同 inode 整项跳过，
-搜索 =needle= 得到空结果。即使两个名称都匹配，文件名搜索也应返回两个独立目录项；它们有不同路径，
-不是重复结果。
-
-目录 symlink 也应区分“名称是否匹配”和“是否再次下钻”：alias 本身是可见目录项，可以作为名称结果；
-其目标子树只需要遍历一次。
-
-*** 必须修改
-
-- visited identity 只控制 **目录下钻**，不控制目录项是否参与文件名匹配。
-- 每个成功读取 metadata 的目录项都独立执行名称匹配并可进入结果。
-- 若条目是目录：匹配完成后再检查 =(dev, ino)= ；只有首次 identity 入队遍历子树。
-- 普通文件不进入 =visited_dirs= ，hard link 路径全部保留。
-- 确定性 alias 规则只决定“通过哪个目录路径展示后代”，不能删除 alias 目录项自身。
-
-*** 验收
-
-- =a= 与 hard link =needle.txt= 共用 inode 时，搜索 =needle= 必须返回 =needle.txt= 。
-- 两个 hard link 名称都匹配时返回两个不同 href。
-- 两个目录 symlink 指向同一目标且名称都匹配时，两条 alias 自身均可返回；目标后代只出现于
-  sorted BFS 选中的首次路径下。
-- self/parent loop 仍终止；500 项截断集合和顺序仍可复现。
-
-** [P2] 全量 ServeFile sandbox 缺少 PDF/媒体行为回归验收
-
-*** 问题
-
-Design =:138-159= 选择对每个 ServeFile 响应添加 CSP sandbox，这是避免 MIME allowlist 漏洞的正确
-安全默认。但它改变了所有顶层 raw document 的 browsing-context flags，而测试 =:408-410= 与浏览器
-验收 =:439-443= 只覆盖 hostile HTML/SVG。
-
-项目行为契约还包括：PDF 浏览器原生打开；图片直开；音视频播放与 Range seek；显式 download。
-“Range 仍为 206”只能证明字节协议，不能证明浏览器 PDF viewer、媒体 controls 和 attachment UX 在
-sandbox header 下仍工作。
-
-*** 必须修改
-
-无需改变 CSP 设计；补齐实施完成时的浏览器验收矩阵：
-
-- 顶层 PDF 仍进入浏览器原生 viewer；
-- 图片顶层查看与预览面板嵌入正常；
-- 音频/视频可播放并 seek，网络请求出现预期 206；
-- =?download=1= 仍触发 attachment 下载；
-- 原始 HTML 脚本在 =allow-scripts= 下仍可运行自身逻辑，但不能读取可信 UI。
-
-若任一浏览器不兼容，应在实施时调整 header 应用策略并重新做安全 review，不能静默删除 sandbox。
-
-* 第三轮实施前门槛
-
-Design 进入“已批准（待实施）”前必须完成：
-
-1. 为 Org links 增加与 Comrak 等价的危险 URL scheme 过滤，并覆盖 Full/Fragment 浏览器路径。
-2. 为 token-bearing 目录页/搜索页增加 =frame-ancestors 'none'= anti-clickjacking 防护。
-3. 将搜索 identity 集合收敛为 =visited_dirs= ：所有名称参与匹配，仅目录下钻去重。
-4. 为全量 ServeFile CSP 增加 PDF、图片、音视频、Range seek 和 attachment 的浏览器验收。
-
-完成以上四项后，本轮没有发现需要推翻 CSP sandbox、ResponseMode、搜索并发门、async opener、
-path wire contract、私有 app seam 或渐进增强方案的问题。
+- Design： =已批准（待实施）=。
+- Review loop：结束；终止原因是第十一轮 Advisor 未发现新的或回归的 P0/P1。
+- 实施阶段必须按 Design 的验收矩阵完成；不得把已关闭的 encoded/decoded/display identity
+  三个 seam 合并回同一个字符串通道。
