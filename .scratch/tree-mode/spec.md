@@ -139,3 +139,17 @@ SPA 导航；浮动按钮在目录模式与树模式间切换（localStorage 记
 - ADR 0001 记录架构决策；CONTEXT.md 术语：树模式 / 目录模式 / 内容区 / TOC 侧栏 / 可信 UI。
 - 深链目录页在树模式有短暂完整页闪现（一次同 URL XHR 后替换，可接受）。
 - 反嵌入头扩展顺带修补既有缺口（文档/代码页此前无这两个头）。
+
+## Final Acceptance (2026-08-25)
+
+Full-design gate (design-advisor + security-reviewer) over the final tree: 4 P1 findings
+(host-dependent shell, deep-link rejection/mutation, spy resize lifecycle, startup selection
+staleness) + 1 P2 (stale native-open evidence) — all fixed (commits afe3e5c, b775496, eb595dc).
+Final Chromium acceptance on the final tree, 6/6 PASS: native-open capability boundary (zero
+POSTs across all tree actions, restored after exit reload), deep-link canonicalization
+(/%41GENTS.md#cli -> /AGENTS.md#cli, replaceState only, hash preserved; trailing-slash dir
+deep links), host-neutral shell geometry (identical tree bounds from directory/doc hosts at
+1920px), breakpoint-aware scroll-spy (observer count and single highlight correct across
+repeated 75rem crossings), startup resync under delayed root JSON, regression sanity
+(delayed-A/fast-B, office-busy placeholder, 500px drawer). cargo test 207 green, clippy 0,
+fmt clean, node --check clean. All 8 tickets complete.
