@@ -456,3 +456,12 @@ body.cb-tree-mode.cb-doc-page {
   padding: 0;
   background-color: transparent;
 }
+
+/* 宿主无关的树壳度量 (设计门 P1): dir 宿主 root 80% 与 doc 宿主 root 16px
+ * 不同 — 树壳几何与字号用固定 px, 两宿主一致 */
+body.cb-tree-mode {
+  grid-template-columns: 218px minmax(0, 1fr);
+}
+body.cb-tree-mode .cb-tree {
+  font-size: 12.8px;
+}

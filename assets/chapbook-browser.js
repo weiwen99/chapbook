@@ -1218,10 +1218,15 @@
       paneShowError('无法加载：响应内容与目标不符');
       return;
     }
-    if (location.href !== canonicalUrl.href) {
-      history.pushState(null, '', canonicalUrl.href); // 初始/back-forward 时 URL 已就位
+    if (location.pathname !== canonicalUrl.pathname) {
+      // 跨文档导航: 旧 hash 不属于新文档, 丢弃
+      if (location.href !== canonicalUrl.href) {
+        history.pushState(null, '', canonicalUrl.href);
+      }
+    } else if (location.href !== canonicalUrl.href + location.hash) {
+      // 同文档 (深链 #heading / 规范化): 保留 hash, 只推规范化 pathname
+      history.pushState(null, '', canonicalUrl.href + location.hash);
     }
-    if (location.pathname !== canonicalUrl.pathname) return; // canonical URL 兜底校验
     teardownPane(); // 旧 observer 拆除 + 媒体卸载
     paneClearError();
     pane.replaceChildren(wrapper); // 移动解析出的 wrapper (替换全部旧内容)
@@ -1272,7 +1277,7 @@
     const encoded = currentPathFromLocation();
     if (encoded === null) return; // 非法路径: 保持完整页 (fail-closed)
     const canonical = actionUrl(encoded, 'full');
-    if (canonical !== null && canonical.href !== location.href) {
+    if (canonical !== null && location.pathname !== canonical.pathname) {
       // 只规范化 pathname (非规范 percent 编码深链), 保留 #heading 目标;
       // 树模式内容区恒为 fragment 视图, query 模式语义 (?raw 等) 不适用, 丢弃.
       const target = canonical.origin + canonical.pathname + location.hash;
@@ -1393,6 +1398,8 @@
     scrollRoot.addEventListener('scroll', compute, { passive: true });
     compute(); // 初始状态 (深链已滚动/短文档直接出结果)
     return function () {
+      // 断开前清除当前高亮: 跨断点重装时旧实例的 .cb-toc-current 不得残留
+      setCurrent(null);
       observer.disconnect();
       scrollRoot.removeEventListener('scroll', compute);
     };
