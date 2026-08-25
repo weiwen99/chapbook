@@ -30,7 +30,9 @@ struct AppState {
     root: PathBuf,
     /// 递归搜索并发门: 容量固定 1, 非空查询同一时刻只允许一个阻塞扫描.
     search_gate: Arc<Semaphore>,
-    /// Office 转换并发门: 容量固定 1, 同一时刻只允许一个阻塞转换 job.
+    /// Office 转换并发门: 容量固定 1. 转换是 CPU/内存密集活 (zip 解压 + 解析,
+    /// 32 MiB 上限), 排队只会让慢转换身后堆积更多慢转换; 与搜索门一致采取
+    /// 忙即失败不排队 (fragment 占位 / 完整页 503 + Retry-After).
     office_gate: Arc<Semaphore>,
     /// 本机打开 (native-open) 随机令牌: 启动时从 /dev/urandom 读取 16 字节的 hex.
     /// 绝不写入日志; 仅嵌入 loopback 可信页面, 且仅 POST 校验链通过时使用.
@@ -298,7 +300,7 @@ async fn serve_search(
     // 归一化一次; listing::search 不再做逐候选归一化
     let normalized = trimmed.to_lowercase();
     let root = state.root.clone();
-    match run_blocking_search(state.search_gate.clone(), move || {
+    match run_blocking_job(state.search_gate.clone(), move || {
         listing::search(&root, &normalized)
     })
     .await
@@ -306,84 +308,52 @@ async fn serve_search(
         Ok(result) => trusted_ui_response(
             render::search_page(&state.root, &trimmed, &result, native_token).into_string(),
         ),
-        Err(BlockingSearchError::Busy) => {
+        Err(BlockingJobError::Busy) => {
             let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
             response
         }
-        Err(BlockingSearchError::Task(e)) => {
+        Err(BlockingJobError::Task(e)) => {
             tracing::warn!(error = %e, "search task panicked or was cancelled");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
 
-/// 搜索并发门错误: Busy (未获取 permit, job 未被调用) / Task (阻塞任务失败).
+/// 阻塞 job 并发门错误: Busy (未获取 permit, job 未被调用) / Task (阻塞任务失败).
 #[derive(Debug)]
-enum BlockingSearchError {
+enum BlockingJobError {
     Busy,
     Task(tokio::task::JoinError),
 }
 
-/// 私有并发/生命周期 seam: 容量 1 的信号量门 + spawn_blocking.
+/// 私有并发/生命周期 seam (搜索与 Office 转换共用, 各自持有独立 gate):
+/// 容量 1 的信号量门 + spawn_blocking.
 ///
 /// - `try_acquire_owned`: 失败即 Busy, **不调用 job**;
 /// - permit 与 job 一起移入 `spawn_blocking` closure: 即使等待中的 handler
 ///   被取消 (客户端断开), 已启动的阻塞任务仍持有 permit 直到真实 job 结束;
 /// - JoinError 显式映射为 Task.
-async fn run_blocking_search<T, F>(
+async fn run_blocking_job<T, F>(
     gate: Arc<tokio::sync::Semaphore>,
     job: F,
-) -> Result<T, BlockingSearchError>
+) -> Result<T, BlockingJobError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
     let Ok(permit) = gate.try_acquire_owned() else {
-        return Err(BlockingSearchError::Busy);
+        return Err(BlockingJobError::Busy);
     };
     let handle = tokio::task::spawn_blocking(move || {
         // permit 由 blocking task 持有到 job 结束 (panic 时随 unwind 释放)
         let _permit = permit;
         job()
     });
-    handle.await.map_err(BlockingSearchError::Task)
+    handle.await.map_err(BlockingJobError::Task)
 }
-
-/// Office 转换并发门错误: Busy (未获取 permit, job 未被调用) / Task (阻塞任务失败).
-#[derive(Debug)]
-enum BlockingOfficeError {
-    Busy,
-    Task(tokio::task::JoinError),
-}
-
-/// Office 转换并发/生命周期 seam (与搜索门同构): 容量 1 信号量 + spawn_blocking.
-/// permit 随 job 移入 blocking closure — 等待中的 handler 被取消 (客户端断开)
-/// 不提前释放容量, 已启动的阻塞任务持有 permit 直到真实 job 结束.
-async fn run_blocking_office<T, F>(
-    gate: Arc<tokio::sync::Semaphore>,
-    job: F,
-) -> Result<T, BlockingOfficeError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let Ok(permit) = gate.try_acquire_owned() else {
-        return Err(BlockingOfficeError::Busy);
-    };
-    match tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        job()
-    })
-    .await
-    {
-        Ok(value) => Ok(value),
-        Err(join) => Err(BlockingOfficeError::Task(join)),
-    }
-}
-
 /// Office 转换结果 (同步 seam, 在阻塞任务内执行): 成功 GFM markdown / anydoc
 /// 转换失败 / 文件读取失败. 32 MiB 上限由调用方先行判定.
 #[derive(Debug)]
@@ -798,7 +768,7 @@ async fn serve_fragment(
             } else {
                 let file_name = file_name_text(path);
                 let path_buf = path.to_path_buf();
-                match run_blocking_office(state.office_gate.clone(), move || {
+                match run_blocking_job(state.office_gate.clone(), move || {
                     convert_office_document(&path_buf, format)
                 })
                 .await
@@ -823,8 +793,8 @@ async fn serve_fragment(
                         );
                         no_preview("无法读取文件")
                     }
-                    Err(BlockingOfficeError::Busy) => no_preview("预览繁忙，请稍后重试"),
-                    Err(BlockingOfficeError::Task(e)) => {
+                    Err(BlockingJobError::Busy) => no_preview("预览繁忙，请稍后重试"),
+                    Err(BlockingJobError::Task(e)) => {
                         tracing::warn!(error = %e, "fragment: office blocking task failed");
                         no_preview("预览繁忙，请稍后重试")
                     }
@@ -1057,7 +1027,7 @@ async fn serve_office(
         return serve_file(path, headers, false).await;
     }
     let path_buf = path.to_path_buf();
-    match run_blocking_office(state.office_gate.clone(), move || {
+    match run_blocking_job(state.office_gate.clone(), move || {
         convert_office_document(&path_buf, format)
     })
     .await
@@ -1071,14 +1041,14 @@ async fn serve_office(
             tracing::warn!(error = %e, path = %path.display(), "failed to read office document");
             StatusCode::NOT_FOUND.into_response()
         }
-        Err(BlockingOfficeError::Busy) => {
+        Err(BlockingJobError::Busy) => {
             let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
             response
         }
-        Err(BlockingOfficeError::Task(e)) => {
+        Err(BlockingJobError::Task(e)) => {
             tracing::warn!(error = %e, "office blocking task failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -1318,15 +1288,15 @@ mod tests {
         let held = gate.clone().try_acquire_owned().expect("preheld permit");
         let called = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&called);
-        let result = run_blocking_search(gate.clone(), move || {
+        let result = run_blocking_job(gate.clone(), move || {
             flag.store(true, Ordering::SeqCst);
             1
         })
         .await;
-        assert!(matches!(result, Err(BlockingSearchError::Busy)));
+        assert!(matches!(result, Err(BlockingJobError::Busy)));
         assert!(!called.load(Ordering::SeqCst), "job must not run on Busy");
         drop(held);
-        let result = run_blocking_search(gate, || 2).await;
+        let result = run_blocking_job(gate, || 2).await;
         assert_eq!(result.expect("after release"), 2);
     }
 
@@ -1343,7 +1313,7 @@ mod tests {
         let first = tokio::spawn({
             let gate = Arc::clone(&gate);
             async move {
-                run_blocking_search(gate, move || {
+                run_blocking_job(gate, move || {
                     let _ = started_tx.send(());
                     // 阻塞直到测试释放; permit 由该 blocking closure 持有
                     let _ = release_rx.blocking_recv();
@@ -1362,9 +1332,9 @@ mod tests {
         assert!(join.is_cancelled(), "abort must cancel the awaiting task");
 
         // 取消后 permit 仍在 blocking closure 中: 第二次调用必须 Busy
-        let second = run_blocking_search(gate.clone(), || "second").await;
+        let second = run_blocking_job(gate.clone(), || "second").await;
         assert!(
-            matches!(second, Err(BlockingSearchError::Busy)),
+            matches!(second, Err(BlockingJobError::Busy)),
             "second must be Busy while first blocking job continues after cancellation"
         );
 
@@ -1379,7 +1349,7 @@ mod tests {
         };
         drop(recovered);
 
-        let third = run_blocking_search(gate, || "third").await;
+        let third = run_blocking_job(gate, || "third").await;
         assert_eq!(third.expect("third ok"), "third");
     }
 
@@ -1387,12 +1357,12 @@ mod tests {
     #[tokio::test]
     async fn panic_maps_to_task_error_and_permit_recovers() {
         let gate = Arc::new(Semaphore::new(1));
-        let result = run_blocking_search(gate.clone(), || -> i32 { panic!("boom") }).await;
+        let result = run_blocking_job(gate.clone(), || -> i32 { panic!("boom") }).await;
         assert!(
-            matches!(result, Err(BlockingSearchError::Task(_))),
+            matches!(result, Err(BlockingJobError::Task(_))),
             "panic must map to Task"
         );
-        let again = run_blocking_search(gate, || 7).await;
+        let again = run_blocking_job(gate, || 7).await;
         assert_eq!(again.expect("permit must recover"), 7);
     }
 
@@ -1576,69 +1546,6 @@ mod tests {
         let body = body_to_string(res).await;
         assert!(body.contains("Alice"), "full page recovery: {body}");
         assert!(body.contains("chapbook-doc"), "full page recovery: {body}");
-    }
-
-    /// permit 生命周期 + handler 取消 (客户端断开): permit 随 job 移入 blocking
-    /// closure, abort 等待中的 async task 不释放容量 -> 第二次调用仍 Busy;
-    /// 释放后轮询信号量同步 real closure 结束 (无 sleep), 第三次成功.
-    #[tokio::test]
-    async fn office_gate_permit_survives_handler_cancellation() {
-        let gate = Arc::new(Semaphore::new(1));
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let first = tokio::spawn({
-            let gate = Arc::clone(&gate);
-            async move {
-                run_blocking_office(gate, move || {
-                    let _ = started_tx.send(());
-                    // 阻塞直到测试释放; permit 由该 blocking closure 持有
-                    let _ = release_rx.blocking_recv();
-                    "first"
-                })
-                .await
-            }
-        });
-
-        started_rx.await.expect("first job must start");
-
-        // 客户端断开: abort 等待中的 handler; spawn_blocking 任务不受影响
-        first.abort();
-        let join = first.await.expect_err("aborted handler must not join");
-        assert!(join.is_cancelled(), "abort must cancel the awaiting task");
-
-        // 取消后 permit 仍在 blocking closure 中: 第二次调用必须 Busy
-        let second = run_blocking_office(gate.clone(), || "second").await;
-        assert!(
-            matches!(second, Err(BlockingOfficeError::Busy)),
-            "second must be Busy while first blocking job continues after cancellation"
-        );
-
-        // 释放阻塞 job; 轮询信号量直到 blocking closure 真实返回 (permit 释放)
-        let _ = release_tx.send(());
-        let recovered = loop {
-            match gate.clone().try_acquire_owned() {
-                Ok(permit) => break permit,
-                Err(_) => tokio::task::yield_now().await,
-            }
-        };
-        drop(recovered);
-
-        let third = run_blocking_office(gate, || "third").await;
-        assert_eq!(third.expect("third ok"), "third");
-    }
-
-    /// job panic -> Task(JoinError), permit 随 unwind 释放, 之后可恢复.
-    #[tokio::test]
-    async fn office_gate_panic_maps_to_task_and_permit_recovers() {
-        let gate = Arc::new(Semaphore::new(1));
-        let result = run_blocking_office(gate.clone(), || -> i32 { panic!("boom") }).await;
-        assert!(
-            matches!(result, Err(BlockingOfficeError::Task(_))),
-            "panic must map to Task"
-        );
-        let again = run_blocking_office(gate, || 7).await;
-        assert_eq!(again.expect("permit must recover"), 7);
     }
 
     /// 阻塞 job 的类型化结果三态: 成功 markdown / 转换失败 / 读取失败.
