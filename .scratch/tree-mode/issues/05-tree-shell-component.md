@@ -19,3 +19,7 @@
 ## Comments
 
 2026-08-25 security addition (DesignGate): directory full pages carry `meta[name=cb-native-open-token]` + native controls, and browser JS reads the token at startup. Entering 树模式 MUST remove/clear the token meta and native controls and gate all native action paths (including `o`) as no-ops — token value may live in a JS-scoped variable read once at startup and restored on returning to 目录模式. Chromium acceptance: zero `/__/native-open` POSTs while in 树模式.
+
+## Comments
+
+2026-08-25 implementation committed (JS shell + CSS); server contracts locked by cargo tests (207 green), JS syntax checked. PENDING: Seam B Chromium acceptance evidence — DOM-injection fixtures, no-JS fallback, mode persistence, keyboard, deep-link highlight, native-open POST absence. Browser tool was unavailable this session; to be produced in the verification pass.
