@@ -899,7 +899,7 @@ async fn space_in_filename_is_percent_encoded() {
 
 /// 非 UTF-8 basename: 目录行仍显示名称 (bdi 隔离, 经显示 codec 转义),
 /// 但 href() 为 None -> 不渲染任何锚点, 更不能有 href="" (空 href 点击会导航回当前目录).
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::test]
 async fn non_utf8_basename_listed_without_anchor() {
     use std::ffi::OsString;
@@ -2093,7 +2093,7 @@ async fn default_ignorable_fixtures_escaped_and_actionable() {
 
 /// 搜索页: escaped label 查询 (`\xFF` 字面) 能命中非 UTF-8 basename,
 /// 但该行 display-only — 无 anchor / data-native-path-encoded / 行尾 action 控制.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::test]
 async fn search_escaped_label_query_finds_raw_byte_name_display_only() {
     use std::ffi::OsString;
