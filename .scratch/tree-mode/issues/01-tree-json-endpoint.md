@@ -13,3 +13,7 @@
 - [ ] JSON 经 `axum::Json` + serde 强类型 `Serialize` 输出；Cargo.toml 显式声明 serde/serde_json 直接依赖；AGENTS.md 依赖表补两行
 - [ ] release 构建体积实测上报（对比改动前）
 - [ ] Seam A：HTTP 级测试覆盖上述契约（仿 tests/router 风格）；`cargo fmt --check` 与 clippy 零警告；既有全部测试保持通过
+
+## Comments
+
+2026-08-25 implemented: commits 5e782f6 (test guards), 93b3d5e (endpoint). Release size 11874912 -> 11924512 B (+49600 B). Full suite green (204 tests). Non-UTF-8 fixture tests run only on non-macOS filesystems (APFS rejects invalid UTF-8, EILSEQ) — pre-existing tests gained the same guard.

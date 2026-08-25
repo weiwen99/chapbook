@@ -15,3 +15,7 @@
 - [ ] 非 UTF-8 名条目 display-only（无 action）；`expandable: false` 目录无展开箭头、仍显示、仍可按 URL 导航
 - [ ] Chromium 证据：DOM 注入文件名（`<img src=x onerror=…>`、引号、bidi/control、字面 `+`/`%`）无元素/脚本注入，可见转义与 action href 与目录模式一致
 - [ ] 既有全部测试通过；`cargo fmt --check` 与 clippy 零警告
+
+## Comments
+
+2026-08-25 security addition (DesignGate): directory full pages carry `meta[name=cb-native-open-token]` + native controls, and browser JS reads the token at startup. Entering 树模式 MUST remove/clear the token meta and native controls and gate all native action paths (including `o`) as no-ops — token value may live in a JS-scoped variable read once at startup and restored on returning to 目录模式. Chromium acceptance: zero `/__/native-open` POSTs while in 树模式.
