@@ -555,7 +555,6 @@ pub fn doc_fragment(body: &str) -> String {
 /// 文档/代码页面骨架: 自组 `<!DOCTYPE>` / head / title / body.
 /// org 路径的页面骨架由这里接管 (pandoc -s 不再参与); body 已由调用方转义,
 /// 以 PreEscaped 原样嵌入, 并经 `doc_fragment` 包装 (恰好一次).
-/// 样式仍由 `inject_doc_style` 在 </head> 前注入.
 pub fn doc_page(title: &str, body: &str) -> String {
     html! {
         (DOCTYPE)
@@ -566,6 +565,8 @@ pub fn doc_page(title: &str, body: &str) -> String {
                 title { (title) }
                 // KaTeX 数学排版 (服务端渲染输出的 .katex 结构依赖此样式表与字体)
                 link rel="stylesheet" href="/__/static/katex/katex.min.css";
+                // 文档/代码/Office 页是树模式外壳宿主 (渐进增强; defer)
+                script src="/__/static/js/chapbook-browser.js" defer {}
             }
             body class="cb-doc-page" {
                 (maud::PreEscaped(doc_fragment(body)))
@@ -813,6 +814,10 @@ mod tests {
         assert!(
             page.contains(r#"href="/__/static/katex/katex.min.css""#),
             "page: {page}"
+        );
+        assert!(
+            page.contains(r#"src="/__/static/js/chapbook-browser.js" defer"#),
+            "doc page must load the browser script (tree shell host): {page}"
         );
         let styled = inject_doc_style(&page);
         assert!(

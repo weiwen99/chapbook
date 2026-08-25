@@ -424,6 +424,7 @@
       : btn.closest(PANEL_SELECTOR)
         ? panelTarget
         : null;
+    if (target === null) return; // 非 actionable: no-op
     event.preventDefault();
     if (action === 'preview') {
       openPreview(target);
@@ -937,32 +938,43 @@
     if (tokenMeta) tokenMeta.remove();
     buildTreeShell().then(function () {
       const current = currentPathFromLocation();
-      if (current !== null) {
-        revealPath(current === '' ? [] : current.split('/'));
-      }
+      const reveal = current !== null
+        ? revealPath(current === '' ? [] : current.split('/'))
+        : Promise.resolve();
+      return reveal.then(function () {
+      // 先完成当前路径展开与持久化展开 (异步逐级加载), 再恢复选中 — 否则
+      // 深层节点尚不存在, 选中恢复必然落空.
       const persisted = treeExpandedPaths.filter(isValidEncodedPath);
-      persisted.forEach(function (path) {
-        // 逐段展开持久化的目录 (懒加载; 失败静默)
-        const segments = path.split('/');
-        const href = '/' + path;
-        (function walk(ul, segs) {
-          if (!ul || segs.length === 0) return;
-          const stepHref = '/' + segs.join('/');
-          const node = $$(':scope > li', ul).find(function (li) {
-            return (
-              isExpandableDir(li) &&
-              nodeHref(li) !== null &&
-              nodeHref(li).pathname === stepHref
-            );
-          });
-          if (!node) return;
-          const nodePathV = nodePath(node);
-          if (nodePathV === null) return;
-          loadTreeChildren(node, nodePathV).then(function () {
-            walk(node.querySelector(':scope > ul.cb-tree-children'), segs.slice(0, -1));
-          });
-        })(treeRootUl, segments);
+      const walks = persisted.map(function (path) {
+          const segments = path.split('/');
+          // 前缀正向遍历: 先在当前层找首个 segment, 展开后携带前缀下钻,
+          // 绝不反向切片 (saved 'a/b' 必须先匹配 /a 再匹配 /a/b).
+          const walk = function (ul, segs, prefix) {
+            if (!ul || segs.length === 0) return Promise.resolve();
+            const stepHref = '/' + prefix.concat([segs[0]]).join('/');
+            const node = $$(':scope > li', ul).find(function (li) {
+              return (
+                isExpandableDir(li) &&
+                nodeHref(li) !== null &&
+                nodeHref(li).pathname === stepHref
+              );
+            });
+            if (!node) return Promise.resolve();
+            const nodePathV = nodePath(node);
+            if (nodePathV === null) return Promise.resolve();
+            return loadTreeChildren(node, nodePathV).then(function () {
+              return walk(
+                node.querySelector(':scope > ul.cb-tree-children'),
+                segs.slice(1),
+                prefix.concat([segs[0]])
+              );
+            });
+          };
+          return walk(treeRootUl, segments, []);
+        });
+        return Promise.all(walks);
       });
+    }).then(function () {
       restoreTreeSelection();
     });
   }
@@ -1080,12 +1092,14 @@
     );
     nativeToken = tokenMeta ? tokenMeta.getAttribute('content') : null;
     injectModeToggle();
-    try {
-      treeMode = localStorage.getItem(MODE_KEY) === 'tree';
-    } catch (err) {
-      treeMode = false;
+    if (isTreeCapablePage()) {
+      try {
+        treeMode = localStorage.getItem(MODE_KEY) === 'tree';
+      } catch (err) {
+        treeMode = false;
+      }
+      applyTreeMode();
     }
-    applyTreeMode();
     applyView();
     setActionsEnabled(false); // 初始无 panel target
     document.addEventListener('click', onDocumentClick);

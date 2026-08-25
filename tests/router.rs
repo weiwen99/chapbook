@@ -734,10 +734,11 @@ async fn org_hostile_html_and_links_are_escaped() {
     let res = get(app(dir.path()), "/hostile.org").await;
     assert_eq!(res.status(), StatusCode::OK);
     let body = body_string(res).await;
-    // 无活动元素标签
-    assert!(!body.contains("<script"), "body: {body}");
-    assert!(!body.contains("<img"), "body: {body}");
-    assert!(!body.contains("<b "), "body: {body}");
+    // 无活动元素标签 (只断言正文区域 — head 内的合法 browser 脚本除外)
+    let body_region = body.split("<body").nth(1).unwrap_or(&body);
+    assert!(!body_region.contains("<script"), "body: {body}");
+    assert!(!body_region.contains("<img"), "body: {body}");
+    assert!(!body_region.contains("<b "), "body: {body}");
     // 转义后的内容完整保留
     assert!(
         body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
@@ -1768,7 +1769,9 @@ async fn org_hostile_fragment_and_scheme_table_escaped() {
         assert_eq!(content_type(&res), "text/html; charset=utf-8", "{uri}");
         let body = body_string(res).await;
 
-        // ExportBlock/Snippet 只输出转义文本: 无任何活动元素标签/危险 href
+        // ExportBlock/Snippet 只输出转义文本: 正文区域无任何活动元素标签/危险 href
+        // (head 内的合法 browser 脚本除外)
+        let body_region = body.split("<body").nth(1).unwrap_or(&body);
         for active in [
             "<script",
             "<img",
@@ -1778,7 +1781,10 @@ async fn org_hostile_fragment_and_scheme_table_escaped() {
             "<a href=\"data:",
             "<a href=\"file:",
         ] {
-            assert!(!body.contains(active), "{uri}: active {active:?}: {body}");
+            assert!(
+                !body_region.contains(active),
+                "{uri}: active {active:?}: {body}"
+            );
         }
         assert!(
             body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
