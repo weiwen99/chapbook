@@ -16,3 +16,7 @@
 ## Comments
 
 2026-08-25 scope expansion (DesignGate): ticket 03's right rail applies only to full pages (.cb-doc-page #TOC); injected .cb-pane fragments still render #TOC as a top card. Ticket 08 MUST also create a pane-local wide-screen right rail (sticky within the pane scroll container, grid/flex with the fragment content; narrow screens keep the top card) in addition to the IntersectionObserver scroll-spy (pane as root). Both pane rail and spy teardown go through registerPaneDisposable.
+
+## Comments (2026-08-25 review fixes)
+
+Two-axis review fixes applied: full-page spy disconnected on entering tree mode (no detached-target observation); pane spy disposer registered via registerPaneDisposable (exactly-one-observer invariant); pane reading line computed in pane-relative coordinates; scroll-end listener guarantees last-heading highlight without IO transition; spies not installed below 75rem (ticket contract); tree mode neutralizes the full-page fixed rail (body margin + inherited fixed-rail props) so the pane rail is isolated; .cb-pane-error styles restored (accidentally deleted). Pane rail mechanism finalized as float + sticky within the pane scroll container (verified in Chromium through full scroll; the earlier "grid/flex" wording is superseded — float+sticky preserves document flow without restructuring).

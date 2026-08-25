@@ -66,6 +66,11 @@ html:has(> body.cb-doc-page) {
 .cb-doc #TOC li, .cb-doc #table-of-contents li { margin: 0.28em 0; }
 .cb-doc #TOC a, .cb-doc #table-of-contents a { color: var(--cb-text); }
 .cb-doc #TOC a:hover, .cb-doc #table-of-contents a:hover { color: var(--cb-accent); text-decoration: none; }
+/* TOC 当前标题高亮 (scroll-spy, ticket 08): 完整页与 pane 共用 */
+.cb-doc #TOC a.cb-toc-current, .cb-doc #table-of-contents a.cb-toc-current {
+  color: var(--cb-accent);
+  font-weight: 600;
+}
 .cb-doc code {
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   font-size: 0.88em;
@@ -224,14 +229,30 @@ body.cb-tree-mode .cb-pane {
   min-width: 0;
   min-height: 0;
 }
-body.cb-tree-mode .cb-pane .cb-pane-error {
-  margin: 1rem 1.5rem 0;
-  padding: 0.6em 1em;
-  border: 1px solid var(--cb-border);
-  border-left: 4px solid #cf222e;
-  border-radius: 0 6px 6px 0;
-  background: var(--cb-soft-bg);
-  color: var(--cb-muted);
+/* ---------- 树模式 pane 内 TOC 侧栏 (ticket 08) ----------
+ * 文档 fragment 在 .cb-pane 内宽屏 (≥ 75rem) 时 #TOC 浮到右侧并 sticky 在
+ * pane 滚动容器内: float + sticky 使正文正常流环绕侧栏, 不改变块级间距
+ * (margin 折叠保留); 纯 CSS 布局, 无 JS disposer — 窄屏/无 TOC 时规则
+ * 不命中, 保持顶部卡片. max-height 以 pane 可视高度为上限, 长 TOC 内部滚动. */
+@media screen and (min-width: 75rem) {
+  body.cb-tree-mode .cb-pane .cb-doc #TOC,
+  body.cb-tree-mode .cb-pane .cb-doc #table-of-contents {
+    float: right;
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    width: 19rem;
+    max-height: calc(100vh - 6.5rem);
+    margin: 0 0 1em 2rem;
+    overflow-y: auto;
+    overflow-wrap: break-word;
+  }
+  /* 标题块同样左浮到正文栏: 块盒不环绕 float, 否则标题独占整行, rail 起点
+   * 落在标题下方; 两者同行后 rail 与完整页 (ticket 03) 一致从 pane 顶部开始 */
+  body.cb-tree-mode .cb-pane .cb-doc > header#title-block-header {
+    float: left;
+    width: calc(100% - 21rem);
+  }
 }
 
 .cb-tree ul {
@@ -378,4 +399,29 @@ body.cb-tree-mode [data-cb-action="native"] {
   body.cb-tree-mode .cb-tree-scrim {
     transition: none;
   }
+}
+
+/* ---------- ticket 08 review fixes ---------- */
+/* 树模式下完整页 fixed rail 规则不得作用于 pane (ticket 03 rail 仅完整页):
+ * 取消 body 双栏预留; pane 内 TOC 只服从 pane rail 规则. */
+body.cb-tree-mode.cb-doc-page:has(#TOC),
+body.cb-tree-mode.cb-doc-page:has(#table-of-contents) {
+  margin-right: 0;
+}
+body.cb-tree-mode .cb-pane .cb-doc #TOC,
+body.cb-tree-mode .cb-pane .cb-doc #table-of-contents {
+  right: auto;
+  bottom: auto;
+  border: none;
+  padding: 0.9em 1.4em;
+}
+/* 恢复 pane 错误横幅样式 (ticket 06, 实现 08 时误删) */
+body.cb-tree-mode .cb-pane .cb-pane-error {
+  margin: 1rem 1.5rem 0;
+  padding: 0.6em 1em;
+  border: 1px solid var(--cb-border);
+  border-left: 4px solid #cf222e;
+  border-radius: 0 6px 6px 0;
+  background: var(--cb-soft-bg);
+  color: var(--cb-muted);
 }

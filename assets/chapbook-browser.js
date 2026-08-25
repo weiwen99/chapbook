@@ -1219,6 +1219,7 @@
       document.title = titleEl.textContent.trim();
     }
     pane.scrollTop = 0;
+    installPaneTocSpy(wrapper); // 新内容就位后重建 pane TOC spy (无 TOC 则 no-op)
     paneCommittedPath = encodedPath;
     syncTreeToPath(gen, selectTree);
     closeTreeDrawer(); // 导航提交成功: 窄屏抽屉收起 (宽屏 no-op)
@@ -1281,8 +1282,138 @@
     paneNavigate(encoded, { pop: true });
   }
 
+  /* ---------- TOC scroll-spy (ticket 08) ---------- */
+
+  // TOC 容器: markdown/org 自渲染为 #TOC; #table-of-contents 为 pandoc 兼容形态.
+  function tocNavIn(root) {
+    return root.querySelector('#TOC, #table-of-contents');
+  }
+
+  // 通用 scroll-spy: 观察被 TOC 收录的标题锚点 (hN > a[id] 且 id 出现在 TOC
+  // href 中); 当前标题 = 阅读线 (root 顶部 20%) 之上且 top 最大 (文档序最靠后)
+  // 的已收录标题. IntersectionObserver 只在任一标题越过阅读线时唤醒重算, 重算
+  // 为廉价的 rect 全量扫描. rootEl 传 null 以视口为根 (完整页), 传元素以该
+  // 滚动容器为根 (pane). 返回 disposer (observer disconnect + scroll 监听移除),
+  // 调用方决定注册进哪个生命周期; 窄屏 (无 rail) / 无收录标题返回 null.
+  function installTocSpy(docEl, tocNav, rootEl) {
+    // 窄屏 (无 rail) 不启动 spy (ticket 08 契约)
+    if (!window.matchMedia('(min-width: 75rem)').matches) return null;
+    const links = Object.create(null);
+    $$('a[href^="#"]', tocNav).forEach(function (a) {
+      const slug = a.getAttribute('href').slice(1);
+      if (slug !== '') links[slug] = a;
+    });
+    const targets = [];
+    $$('h1, h2, h3, h4, h5, h6', docEl).forEach(function (h) {
+      const anchor = h.querySelector(':scope > a[id]');
+      if (anchor && links[anchor.id]) targets.push(anchor);
+    });
+    if (targets.length === 0) return null; // 无收录标题: 不启用 spy
+    let currentLink = null;
+    function setCurrent(link) {
+      if (link === currentLink) return;
+      if (currentLink) currentLink.classList.remove('cb-toc-current');
+      currentLink = link;
+      if (link) link.classList.add('cb-toc-current');
+    }
+    function rootAtMaxScroll() {
+      if (!rootEl) {
+        return (
+          window.scrollY + window.innerHeight >=
+          document.documentElement.scrollHeight - 1
+        );
+      }
+      return rootEl.scrollTop + rootEl.clientHeight >= rootEl.scrollHeight - 1;
+    }
+    function rootScrollable() {
+      if (!rootEl) {
+        return document.documentElement.scrollHeight > window.innerHeight + 1;
+      }
+      return rootEl.scrollHeight > rootEl.clientHeight + 1;
+    }
+    function compute() {
+      const rootTop = rootEl ? rootEl.getBoundingClientRect().top : 0;
+      const rootHeight = rootEl
+        ? rootEl.getBoundingClientRect().height
+        : window.innerHeight;
+      // 阅读线为 root 相对坐标 (与标题 top 同一坐标系, 不混视口绝对坐标)
+      const line = rootHeight * 0.2;
+      const last = targets[targets.length - 1];
+      if (!rootScrollable()) {
+        // 短文档一屏放得下: 高亮首个标题 (阅读起点).
+        setCurrent(links[targets[0].id] || null);
+        return;
+      }
+      if (rootAtMaxScroll()) {
+        // 滚动到底: 末节即当前节 (末标题无法越过阅读线的底边场景).
+        setCurrent(links[last.id] || null);
+        return;
+      }
+      let best = null; // { anchor, top }
+      targets.forEach(function (a) {
+        const top = a.getBoundingClientRect().top - rootTop;
+        if (top <= line && (best === null || top > best.top)) {
+          best = { anchor: a, top: top };
+        }
+      });
+      if (
+        best === null &&
+        last.getBoundingClientRect().bottom - rootTop <= rootHeight
+      ) {
+        // 可滚动但未到底, 且全部标题都在可视区内 (标题集中在文档开头):
+        // 高亮首个标题; 长文档未滚动到首个标题则无高亮.
+        best = { anchor: targets[0], top: -1 };
+      }
+      setCurrent(best === null ? null : links[best.anchor.id] || null);
+    }
+    const observer = new IntersectionObserver(compute, {
+      root: rootEl || null,
+      rootMargin: '0px 0px -80% 0px', // 观察带 = root 顶部 20%
+      threshold: 0,
+    });
+    targets.forEach(function (a) {
+      observer.observe(a);
+    });
+    // 滚动到底监听: 末标题不越过观察带时 (无 IO 过渡) 也能高亮末节
+    const scrollRoot = rootEl || window;
+    scrollRoot.addEventListener('scroll', compute, { passive: true });
+    compute(); // 初始状态 (深链已滚动/短文档直接出结果)
+    return function () {
+      observer.disconnect();
+      scrollRoot.removeEventListener('scroll', compute);
+    };
+  }
+
+  // 完整页 spy (目录模式文档页): root = 视口, 页面生命周期. disposer 存入模块
+  // 变量, 进入树模式时断开 (原正文被 pane fragment 替换, 观察目标脱离 DOM).
+  let fullPageSpyDisposer = null;
+  function initFullPageTocSpy() {
+    if (!document.body.classList.contains('cb-doc-page')) return;
+    const tocNav = tocNavIn(document);
+    if (!tocNav) return; // 无 TOC 页面 (代码/无标题文档): 不启用 spy
+    fullPageSpyDisposer = installTocSpy(
+      document.querySelector('.cb-doc') || document.body,
+      tocNav,
+      null
+    );
+  }
+
+  // pane spy: root = pane 滚动容器; disposer 经 registerPaneDisposable 注册,
+  // SPA 替换/退出树模式时由 teardownPane 统一 disconnect — 旧 observer 绝不
+  // 触碰新内容, 快速连续导航时恒至多一个活跃 observer.
+  function installPaneTocSpy(wrapper) {
+    if (!pane) return;
+    const tocNav = tocNavIn(wrapper);
+    if (!tocNav) return; // 无 TOC fragment (代码/目录/媒体/占位): 不启用 spy
+    const disposer = installTocSpy(wrapper, tocNav, pane);
+    if (disposer) registerPaneDisposable(disposer);
+  }
   function enterTreeMode() {
-    treeGen += 1; // 新壳 generation: 使退出/重进前的在途响应失效 (镜像 previewGuard)
+    // 完整页 spy 观察原正文: pane fragment 替换后目标脱离 DOM — 先断开
+    if (fullPageSpyDisposer) {
+      fullPageSpyDisposer();
+      fullPageSpyDisposer = null;
+    }
     closeTreeDrawer(); // 新壳抽屉默认收起 (宽屏 no-op)
     document.body.classList.add('cb-tree-mode');
     // 目录模式预览面板在树模式不存在: 关闭并作废在途预览 (媒体/迟到响应不得残留)
@@ -1493,6 +1624,9 @@
     );
     nativeToken = tokenMeta ? tokenMeta.getAttribute('content') : null;
     injectModeToggle();
+    // 完整页 spy 先于 applyTreeMode: 树模式启动时 enterTreeMode 立即断开它
+    // (原正文将被 pane fragment 替换), 避免残留观察已脱离 DOM 的标题.
+    initFullPageTocSpy();
     if (isTreeCapablePage()) {
       try {
         treeMode = localStorage.getItem(MODE_KEY) === 'tree';
