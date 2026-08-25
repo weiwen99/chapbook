@@ -11,3 +11,7 @@
 - [ ] fragment 转换忙 → 200 安全占位 HTML（绝不回退 ServeFile/裸字节）；完整页转换忙 → 503 + `Retry-After: 1`
 - [ ] 空闲路径行为不变：转换成功/失败/超限的既有响应契约保持（既有测试锁定）
 - [ ] 既有全部测试通过；`cargo fmt --check` 与 clippy 零警告
+
+## Comments
+
+2026-08-25 implemented: commits 9600b72 + seam merge follow-up. Deterministic private gate tests (preheld-permit busy mapping, cancellation permit lifetime, panic recovery, fragment/full-page recovery); FIFO/mkfifo HTTP tests rejected per zero-external-dependency test contract. Fragment busy -> 200 placeholder, full page busy -> 503 + Retry-After: 1. Two-axis review findings (capacity rationale, seam merge) fixed.

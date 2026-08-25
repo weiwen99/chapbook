@@ -11,3 +11,7 @@
 - [ ] 无 TOC 页面（如代码页）不产生 rail 占位
 - [ ] 目录页预览面板（fragment 嵌入）布局不受影响
 - [ ] 既有全部测试通过；`cargo fmt --check` 与 clippy 零警告
+
+## Comments
+
+2026-08-25 implemented: commit d40d982. Evidence: real Chromium harness (wide viewport — TOC fixed right:0, content margin-right, no overlap; narrow — static top card; no-TOC — full width) + end-to-end curl (doc page serves TOC + katex link). Reviewed (two-axis, no findings against ticket).
