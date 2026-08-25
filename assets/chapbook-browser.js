@@ -91,10 +91,10 @@
     return selectedEncoded === null ? null : currentTarget;
   }
 
-  // 并发预览的 generation 守卫 (DOM 无关 seam): begin() 使旧 generation 过期;
+  // 通用单调 generation 守卫 (预览/内容区共用) (DOM 无关 seam): begin() 使旧 generation 过期;
   // isCurrent(gen) 判定在途响应/错误是否仍属于最新请求; invalidate() 使一切
   // 在途响应/错误失效 (面板关闭时调用, 迟到的响应/错误不得安装任何状态)。
-  function createPreviewGuard() {
+  function createGenerationGuard() {
     let gen = 0;
     return {
       begin: function () {
@@ -109,6 +109,15 @@
     };
   }
 
+  // fragment 响应严格读取 (预览面板与内容区共用): ok + text/html 校验后返回文本.
+  function readFragmentResponse(res) {
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const ct = res.headers.get('Content-Type') || '';
+    if (!/text\/html/i.test(ct)) throw new Error('响应不是 HTML');
+    return res.text();
+  }
+
+
   /* ---------- DOM 状态与渲染 ---------- */
 
   const ENTRY_SELECTOR = '[data-browser-entry]';
@@ -121,7 +130,7 @@
   let selectedIndex = -1;
   let panelTarget = null; // 合法 encodedPath 或 null (fail-closed)
   let nativeToken = null;
-  const previewGuard = createPreviewGuard(); // 并发预览 generation 守卫
+  const previewGuard = createGenerationGuard(); // 并发预览 generation 守卫
 
   let view = 'list';
   try {
@@ -351,10 +360,7 @@
     fetch(url, { headers: { Accept: 'text/html' } })
       .then(function (res) {
         if (!previewGuard.isCurrent(gen)) return; // 过期响应: 丢弃
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const ct = res.headers.get('Content-Type') || '';
-        if (!/text\/html/i.test(ct)) throw new Error('响应不是 HTML');
-        return res.text();
+        return readFragmentResponse(res);
       })
       .then(function (html) {
         if (!previewGuard.isCurrent(gen)) return; // 过期响应: 丢弃
@@ -455,13 +461,19 @@
       }
       return;
     }
-    // 面板内目录迷你列表: 拦截可操作 anchor 做面板内下钻
+    // 面板/内容区内目录迷你列表: 拦截可操作 anchor — 树模式 SPA 下钻,
+    // 目录模式保持面板内下钻
     const miniLink = event.target.closest(
       '.cb-dir-mini a[data-native-path-encoded]'
     );
     if (miniLink) {
       event.preventDefault();
-      openPreview(encodedPathOf(miniLink));
+      const target = encodedPathOf(miniLink);
+      if (treeMode) {
+        if (target !== null) paneNavigate(target);
+      } else {
+        openPreview(target);
+      }
       return;
     }
     // 非链接点击: 选中行 (文件名 anchor 保持原生行为)
@@ -653,7 +665,9 @@
   function currentPathFromLocation() {
     const pathname = location.pathname;
     if (pathname === '/') return '';
-    return isValidEncodedPath(pathname.slice(1)) ? pathname.slice(1) : null;
+    // 目录深链可能带尾斜杠 (/subdir/): 剥掉后校验 (canonical 形式无尾斜杠)
+    const rel = pathname.slice(1).replace(/\/+$/, '');
+    return isValidEncodedPath(rel) ? rel : null;
   }
 
   function treeSearchForm() {
@@ -847,6 +861,21 @@
     return result;
   }
 
+  // 恢复持久化选中路径 (visible 节点内查找; 深层未展开则不可见, 跳过).
+  function restoreTreeSelection() {
+    let saved = null;
+    try {
+      saved = localStorage.getItem(TREE_SELECTED_KEY);
+    } catch (err) {
+      return;
+    }
+    if (saved === null || !isValidEncodedPath(saved)) return;
+    const node = visibleTreeNodes().find(function (li) {
+      return encodedPathOf(li) === saved;
+    });
+    if (node) selectTreeNode(node);
+  }
+
   function moveTreeSelection(delta) {
     const nodes = visibleTreeNodes();
     if (nodes.length === 0) return;
@@ -898,13 +927,15 @@
 
   // 展开并定位当前 URL 路径: 逐段匹配节点 (按 href, 不分目录/文件), 匹配即标
   // current; 可展开目录继续下钻, 环/非 UTF-8 目录或文件处终止. 解析为最深节点.
-  function revealPath(segments) {
+  function revealPath(segments, gen) {
     let parentUl = treeRootUl;
     let lastNode = null;
     let promise = Promise.resolve();
     segments.forEach(function (seg, i) {
       const href = '/' + segments.slice(0, i + 1).join('/');
       promise = promise.then(function () {
+        // 陈旧导航的链路不得继续标记 (single-active-navigation)
+        if (gen !== undefined && !paneNavGuard.isCurrent(gen)) return;
         if (!parentUl) return;
         const node = findTreeNode(parentUl, href);
         if (!node) {
@@ -927,6 +958,7 @@
     });
     return promise.then(function () {
       // 只有最深匹配节点标 current (祖先只展开, 不高亮)
+      if (gen !== undefined && !paneNavGuard.isCurrent(gen)) return lastNode;
       if (lastNode) lastNode.classList.add('cb-current');
       return lastNode;
     });
@@ -934,12 +966,14 @@
 
   function buildTreeShell() {
     const gen = treeGen;
+    treeNav = document.createElement('nav');
     treeNav.className = 'cb-tree';
     treeNav.setAttribute('aria-label', '目录树');
     treeNav.append(treeSearchForm());
     treeRootUl = document.createElement('ul');
     treeRootUl.className = 'cb-tree-root';
     treeNav.append(treeRootUl);
+    document.body.prepend(treeNav);
     return fetchTreeEntries('').then(function (entries) {
       if (gen !== treeGen) return;
       const nodes = entries.map(buildTreeNode);
@@ -959,7 +993,7 @@
   let paneCommittedPath = null; // 最近一次提交的 encoded path (hash 导航防重取)
   // 单一活跃导航不变量: 单调 nav id (generation 守卫) — 仅当 id 最新且
   // location.pathname 等于导航 canonical URL 时提交 DOM/history/树状态.
-  const paneNavGuard = createPreviewGuard();
+  const paneNavGuard = createGenerationGuard();
   // pane 生命周期 registry: SPA 替换/退出树模式时统一拆除. ticket 08 的 TOC
   // observer 经 registerPaneDisposable 注册, 替换时自动 disconnect, 高亮不串台.
   const paneDisposables = [];
@@ -1052,10 +1086,7 @@
     })
       .then(function (res) {
         if (!paneNavGuard.isCurrent(gen)) return null; // 过期: 丢弃
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const ct = res.headers.get('Content-Type') || '';
-        if (!/text\/html/i.test(ct)) throw new Error('响应不是 HTML');
-        return res.text();
+        return readFragmentResponse(res);
       })
       .then(function (html) {
         if (html === null || !paneNavGuard.isCurrent(gen)) return;
@@ -1064,11 +1095,14 @@
       .catch(function (err) {
         if (!paneNavGuard.isCurrent(gen)) return; // 过期错误: 丢弃
         if (err && err.name === 'AbortError') return; // 被新导航中止: 不报错
+        if (opts && opts.pop) {
+          // popstate: URL 已被浏览器改走, 旧内容与新 URL 不一致 — 清空 pane
+          pane.replaceChildren();
+        }
         paneShowError(
           '无法加载：' + (err && err.message ? err.message : String(err))
         );
       });
-    return true;
   }
 
   // 提交守卫: id 最新 && wrapper identity 匹配 (fail-closed) && pushState 后
@@ -1113,11 +1147,18 @@
     if (encoded === null || !treeRootUl) return;
     const segments = encoded === '' ? [] : encoded.split('/');
     clearTreeCurrent();
-    revealPath(segments).then(function () {
+    if (!paneNavGuard.isCurrent(gen)) return; // 陈旧导航: 树状态不跟进
+    revealPath(segments, gen).then(function () {
       if (!paneNavGuard.isCurrent(gen)) return; // 过期: 树状态不跟进
       clearTreeCurrent(); // reveal 期间可能被更早链路标记: 重标记当前链
       const node = markTreePath(segments);
-      if (selectTree && node) selectTreeNode(node);
+      if (selectTree) {
+        if (node) {
+          selectTreeNode(node);
+        } else {
+          clearTreeSelection(); // 选中跟随 URL: 无匹配节点则清空, 不残留旧选中
+        }
+      }
     });
   }
 
@@ -1126,13 +1167,35 @@
   function paneInitialLoad() {
     const encoded = currentPathFromLocation();
     if (encoded === null) return; // 非法路径: 保持完整页 (fail-closed)
+    const canonical = actionUrl(encoded, 'full');
+    if (canonical !== null && canonical.href !== location.href) {
+      // 目录深链尾斜杠等形态差异: replaceState 规范化 (不新增历史条目)
+      history.replaceState(null, '', canonical.href);
+    }
     paneNavigate(encoded, { select: false });
+  }
+
+  // back/forward (popstate): URL 已由浏览器同步, 直接按当前 location 导航;
+  // 与最近提交路径相同 (hash 导航等) 不重取.
+  function onPopState() {
+    if (!treeMode || !pane) return;
+    // popstate 一律先作废在途导航 (含 abort): 任何历史回退都取代当前 pending;
+    // 目标已是最近提交内容时只作废不重取, 杜绝迟到 A 借 pushState 反提交.
+    paneNavGuard.invalidate();
+    if (paneAbort) {
+      paneAbort.abort();
+      paneAbort = null;
+    }
+    const encoded = currentPathFromLocation();
+    if (encoded === null || encoded === paneCommittedPath) return;
+    paneNavigate(encoded, { pop: true });
   }
 
   function enterTreeMode() {
     treeGen += 1; // 新壳 generation: 使退出/重进前的在途响应失效
     document.body.classList.add('cb-tree-mode');
-    // 树模式无 native-open (Q17/advisory): token meta 移除, native 路径全部 no-op.
+    // 目录模式预览面板在树模式不存在: 关闭并作废在途预览 (媒体/迟到响应不得残留)
+    closePanel();
     const tokenMeta = document.querySelector('meta[name="cb-native-open-token"]');
     if (tokenMeta) tokenMeta.remove();
     // 内容区: 包装当前完整页内容进 .cb-pane, 再 fetch 当前 URL 的 fragment
@@ -1265,7 +1328,7 @@
         break;
       case 'ArrowRight':
         // → 只展开 (契约: → 展开 / ← 收起); 已展开则 no-op
-        if (treeSelectedEl && isDirNode(treeSelectedEl)) {
+        if (treeSelectedEl && isExpandableDir(treeSelectedEl)) {
           const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
           if (!ul || ul.hidden) {
             const path = encodedPathOf(treeSelectedEl);
@@ -1299,7 +1362,11 @@
         if (current !== null && current !== '') {
           const segments = current.split('/');
           const parent = segments.slice(0, -1).join('/');
-          location.href = '/' + parent;
+          if (pane) {
+            paneNavigate(parent);
+          } else {
+            location.href = '/' + parent;
+          }
         }
         event.preventDefault();
         break;
@@ -1334,6 +1401,7 @@
     document.addEventListener('click', onDocumentClick);
     document.addEventListener('dblclick', onDocumentDblclick);
     document.addEventListener('keydown', onKeydown);
+    window.addEventListener('popstate', onPopState);
     $$('[data-cb-view]').forEach(function (btn) {
       btn.addEventListener('click', function () {
         view = btn.getAttribute('data-cb-view');
@@ -1358,7 +1426,7 @@
       nativeOpenParams: nativeOpenParams,
       escapeAction: escapeAction,
       panelTargetForSelection: panelTargetForSelection,
-      createPreviewGuard: createPreviewGuard,
+      createGenerationGuard: createGenerationGuard,
     };
   }
 })();

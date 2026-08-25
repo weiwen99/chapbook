@@ -218,9 +218,20 @@ body.cb-tree-mode .cb-breadcrumb,
 body.cb-tree-mode #cb-preview {
   display: none;
 }
-body.cb-tree-mode main.cb-main,
-body.cb-tree-mode .cb-doc {
+/* 内容区 (SPA 导航容器): 树模式下唯一滚动容器 (原 main/.cb-doc 独立滚动让位) */
+body.cb-tree-mode .cb-pane {
   overflow-y: auto;
+  min-width: 0;
+  min-height: 0;
+}
+body.cb-tree-mode .cb-pane .cb-pane-error {
+  margin: 1rem 1.5rem 0;
+  padding: 0.6em 1em;
+  border: 1px solid var(--cb-border);
+  border-left: 4px solid #cf222e;
+  border-radius: 0 6px 6px 0;
+  background: var(--cb-soft-bg);
+  color: var(--cb-muted);
 }
 
 .cb-tree ul {

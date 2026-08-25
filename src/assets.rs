@@ -188,7 +188,7 @@ mod tests {
         for seam in [
             "escapeAction",
             "panelTargetForSelection",
-            "createPreviewGuard",
+            "createGenerationGuard",
         ] {
             assert!(js.contains(seam), "seam 缺失: {seam}");
         }
