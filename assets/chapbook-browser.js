@@ -1010,6 +1010,9 @@
 
   function openTreeDrawer() {
     document.body.classList.add('cb-drawer-open');
+    if (treeOpenBtn) {
+      treeOpenBtn.setAttribute('aria-expanded', 'true');
+    }
     // 焦点移入抽屉 (nav 非 tab 序, 仅程序化聚焦), 键盘导航立即可用
     if (treeNav) {
       try {
@@ -1021,16 +1024,24 @@
   }
 
   function closeTreeDrawer() {
+    const wasOpen = document.body.classList.contains('cb-drawer-open');
     document.body.classList.remove('cb-drawer-open');
-    // 收起后焦点若仍在抽屉内则归还 body, 键盘输入不落在隐藏区域
-    if (treeNav && treeNav.contains(document.activeElement)) {
-      document.activeElement.blur();
+    if (treeOpenBtn) {
+      treeOpenBtn.setAttribute('aria-expanded', 'false');
+    }
+    // 只有窄屏抽屉真实打开时才有焦点归还逻辑 (宽屏常驻侧栏不受影响)
+    if (wasOpen && treeNav && treeNav.contains(document.activeElement)) {
+      if (treeOpenBtn) {
+        treeOpenBtn.focus({ preventScroll: true });
+      } else {
+        document.activeElement.blur();
+      }
     }
   }
 
   // 窄屏 media query 监听: 跨回宽屏时清理打开态, 防止再次收窄时抽屉残留打开
   function installDrawerMql() {
-    drawerMql = window.matchMedia('(max-width: 63.99rem)');
+    drawerMql = window.matchMedia('(width < 64rem)');
     drawerMqlHandler = function (e) {
       if (!e.matches) closeTreeDrawer();
     };

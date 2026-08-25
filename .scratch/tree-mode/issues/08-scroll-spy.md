@@ -12,3 +12,7 @@
 - [ ] 窄屏（无 rail）与无 TOC 文档不启动 spy
 - [ ] Chromium 证据：两种模式滚动高亮 + 导航后正确性
 - [ ] 既有全部测试通过；`cargo fmt --check` 与 clippy 零警告
+
+## Comments
+
+2026-08-25 scope expansion (DesignGate): ticket 03's right rail applies only to full pages (.cb-doc-page #TOC); injected .cb-pane fragments still render #TOC as a top card. Ticket 08 MUST also create a pane-local wide-screen right rail (sticky within the pane scroll container, grid/flex with the fragment content; narrow screens keep the top card) in addition to the IntersectionObserver scroll-spy (pane as root). Both pane rail and spy teardown go through registerPaneDisposable.

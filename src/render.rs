@@ -929,15 +929,23 @@ mod tests {
         assert!(css.contains(".cb-doc pre code span.keyword"), "css: {css}");
         assert!(css.contains(".cb-doc #TOC a:hover"), "css: {css}");
         assert!(css.contains(".cb-doc .katex-display"), "css: {css}");
-        // 无 transform/filter/perspective 的约束只作用于文档内容区: 树模式外壳
-        // (右侧侧栏标记之后) 的窄屏抽屉合法使用 transform, 不在约束范围.
-        let doc_part = css
-            .split("/* ---------- 树模式外壳")
-            .next()
-            .expect("doc-content section");
+        // filter/perspective 全局禁止 (树壳也不使用). transform 仅允许树模式外壳
+        // 区内窄屏抽屉的 .cb-tree 位移规则; 文档内容区恒禁止.
+        assert!(!css.contains("filter"), "css: {css}");
+        assert!(!css.contains("perspective"), "css: {css}");
+        let (doc_part, shell_part) = css
+            .split_once("/* ---------- 树模式外壳")
+            .expect("tree shell section marker");
         assert!(!doc_part.contains("transform"), "doc part: {doc_part}");
-        assert!(!doc_part.contains("filter"), "doc part: {doc_part}");
-        assert!(!doc_part.contains("perspective"), "doc part: {doc_part}");
+        for line in shell_part.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.contains("transform") && !trimmed.starts_with('*') {
+                assert!(
+                    trimmed.contains("translateX") || trimmed.contains("transition: transform"),
+                    "unexpected transform: {line}"
+                );
+            }
+        }
     }
 
     use crate::listing::SearchResult;

@@ -307,7 +307,7 @@ body.cb-tree-mode [data-cb-action="native"] {
   display: none; /* 仅窄屏树模式可见 */
 }
 
-@media (max-width: 63.99rem) {
+@media (width < 64rem) {
   /* 内容独占整宽 */
   body.cb-tree-mode {
     grid-template-columns: minmax(0, 1fr);
