@@ -1418,8 +1418,15 @@
     document.body.classList.add('cb-tree-mode');
     // 目录模式预览面板在树模式不存在: 关闭并作废在途预览 (媒体/迟到响应不得残留)
     closePanel();
+    // Q17 能力边界: 树模式不仅门禁事件路径, 更清空 JS 内存中的 token 并移除
+    // 全部 native 控制 — 任何遗漏路径都无法再 POST (退出树模式经整页重载
+    // 获得全新 token, 目录模式契约不受影响).
+    nativeToken = null;
     const tokenMeta = document.querySelector('meta[name="cb-native-open-token"]');
     if (tokenMeta) tokenMeta.remove();
+    $$('[data-cb-action="native"]').forEach(function (el) {
+      el.remove();
+    });
     // 内容区: 包装当前完整页内容进 .cb-pane, 再 fetch 当前 URL 的 fragment
     // 替换为统一 fragment 视图 (深链目录页显示迷你列表; 与外壳构建并行).
     createPane();

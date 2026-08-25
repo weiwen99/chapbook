@@ -105,6 +105,10 @@ tests/
    渲染为文档页（与 .md 同一 comrak 管线，TOC/锚点/高亮一致）；否则 → 原文。
    `?raw=1` / `?view=1` 显式覆盖。转换失败（ConvertError：加密/损坏/超限）与 >32 MiB
    （`office::MAX_RENDER_BYTES`）文件不渲染，ServeFile 裸字节透传。
+   转换经有界并发门（容量 1 的 `spawn_blocking` + Semaphore，与搜索门同构、共用
+   `run_blocking_job` seam）：忙即失败不排队——fragment 返回 200 安全占位 HTML
+   （绝不回退裸字节），完整页返回 503 + `Retry-After: 1`；permit 由阻塞 job 持有到
+   真实转换结束，handler 取消不提前释放容量。
    判定顺序：目录 → .md → .org → Office/CSV → 代码 → ServeFile。
 9. 所有文件请求先统一解析 `ResponseMode`，优先级固定为
    `download > raw > fragment > view > 类型默认协商`。`download` 一律返回原始字节并附
@@ -197,3 +201,17 @@ Materialize 前端资源来自 [materializecss/materialize](https://github.com/m
 5. 全局字号约为浏览器默认的 80%，org/md 正文栏宽 100rem（与字号等比，保持每行字数）。
 6. 代码块为方角（无圆角）；语法高亮用 GitHub prettylights（亮）/ GitHub Dark（暗）双模式色板，
    选择器基于 syntect 输出的 scope atom 类名（`pre code span.keyword` 等），代码块背景色不变。
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked as local Markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Triage roles use the default canonical label strings. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Domain documentation uses the single-context layout. See `docs/agents/domain.md`.
