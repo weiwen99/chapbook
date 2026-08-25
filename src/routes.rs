@@ -493,9 +493,13 @@ async fn serve_tree(State(state): State<AppState>, path: Option<AxumPath<String>
     let root = state.root.clone();
     match tokio::task::spawn_blocking(move || build_tree_entries(&root, &fs_path)).await {
         Ok(Ok(entries)) => Json(TreeResponse { entries }).into_response(),
-        Ok(Err(reason)) => {
-            (StatusCode::NOT_FOUND, Json(TreeError { error: reason })).into_response()
-        }
+        Ok(Err(reason)) => (
+            StatusCode::NOT_FOUND,
+            Json(TreeError {
+                error: reason.as_str(),
+            }),
+        )
+            .into_response(),
         Err(err) => {
             tracing::error!(error = %err, "tree endpoint: blocking task failed");
             (
@@ -510,27 +514,27 @@ async fn serve_tree(State(state): State<AppState>, path: Option<AxumPath<String>
 }
 
 /// 树列表的同步核心 (在 spawn_blocking 内执行): metadata 判定、祖先 identity
-/// 集合与环检测、子项收集与排序. Err 为 404 理由文案 ("not found" / "not a
-/// directory"). 任一祖先 identity 不可得 (非 Unix canonicalize 失败) 时 complete
+/// 集合与环检测、子项收集与排序. Err 为 404 理由 (见 TreeBuildError). 任一祖先
+/// identity 不可得 (非 Unix canonicalize 失败) 时 ancestor_identities_complete
 /// 置 false — 此后所有子目录一律终止展开, fail-closed, 绝不拿不完整集合做环判定.
-fn build_tree_entries(root: &Path, fs_path: &Path) -> Result<Vec<TreeEntry>, &'static str> {
+fn build_tree_entries(root: &Path, fs_path: &Path) -> Result<Vec<TreeEntry>, TreeBuildError> {
     let Ok(meta) = std::fs::metadata(fs_path) else {
-        return Err("not found");
+        return Err(TreeBuildError::NotFound);
     };
     if !meta.is_dir() {
-        return Err("not a directory");
+        return Err(TreeBuildError::NotDirectory);
     }
     let mut ancestors: HashSet<listing::DirIdentity> = HashSet::new();
-    let mut complete = true;
+    let mut ancestor_identities_complete = true;
     let mut cursor = root.to_path_buf();
     match std::fs::metadata(&cursor) {
         Ok(root_meta) => match listing::dir_identity(&cursor, &root_meta) {
             Some(id) => {
                 ancestors.insert(id);
             }
-            None => complete = false,
+            None => ancestor_identities_complete = false,
         },
-        Err(_) => complete = false,
+        Err(_) => ancestor_identities_complete = false,
     }
     let rel = fs_path.strip_prefix(root).unwrap_or(Path::new(""));
     for comp in rel.components() {
@@ -543,9 +547,9 @@ fn build_tree_entries(root: &Path, fs_path: &Path) -> Result<Vec<TreeEntry>, &'s
                 Some(id) => {
                     ancestors.insert(id);
                 }
-                None => complete = false,
+                None => ancestor_identities_complete = false,
             },
-            Err(_) => complete = false,
+            Err(_) => ancestor_identities_complete = false,
         }
     }
     let mut files = listing::list_dir(fs_path, root, SortBy::default());
@@ -567,7 +571,7 @@ fn build_tree_entries(root: &Path, fs_path: &Path) -> Result<Vec<TreeEntry>, &'s
                     // identity 不可得: fail-closed 终止展开, 仍可按 URL 导航
                     Err(_) => false,
                 };
-                Some(complete && href.is_some() && not_cyclic)
+                Some(ancestor_identities_complete && href.is_some() && not_cyclic)
             } else {
                 None
             };
@@ -579,6 +583,20 @@ fn build_tree_entries(root: &Path, fs_path: &Path) -> Result<Vec<TreeEntry>, &'s
             }
         })
         .collect())
+}
+/// 树列表构建失败: 404 理由 (类型化, 响应文案不充当控制数据).
+enum TreeBuildError {
+    NotFound,
+    NotDirectory,
+}
+
+impl TreeBuildError {
+    fn as_str(&self) -> &'static str {
+        match self {
+            TreeBuildError::NotFound => "not found",
+            TreeBuildError::NotDirectory => "not a directory",
+        }
+    }
 }
 
 /// 树端点 JSON 条目: name 为显示 codec 纯文本; href 为 root-relative RFC 3986
@@ -857,8 +875,8 @@ fn file_name_text(path: &Path) -> String {
     path.file_name().map(escape_os_name).unwrap_or_default()
 }
 
-/// 可信 UI (目录页/搜索页) 统一出口: 添加 anti-framing 头.
-/// 绝不添加 sandbox (可信 UI 需要同源能力).
+/// 可信 UI 统一出口 (所有 CB 生成的完整页: 目录/搜索/文档/代码/Office 渲染页):
+/// 添加 anti-framing 头.
 fn trusted_ui_response(markup: String) -> Response {
     let mut response = Html(markup).into_response();
     let headers = response.headers_mut();

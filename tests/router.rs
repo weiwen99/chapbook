@@ -2445,8 +2445,8 @@ async fn txt_log_raw_returns_original_bytes() {
     assert_eq!(bytes.as_ref(), gbk);
 }
 
-/// fragment 与静态资源响应明确不带 frame-ancestors / X-Frame-Options;
-/// 目录页与搜索页保留这两个 anti-framing 头.
+/// fragment / 静态资源 / JSON 端点响应明确不带 frame-ancestors / X-Frame-Options,
+/// 也不携带 native-open token; 目录页与搜索页保留这两个 anti-framing 头.
 #[tokio::test]
 async fn fragment_and_static_assets_lack_anti_frame_headers() {
     let dir = fixture();
@@ -2466,17 +2466,27 @@ async fn fragment_and_static_assets_lack_anti_frame_headers() {
         "/__/static/js/chapbook-browser.js",
         "/__/static/katex/katex.min.css",
         "/__/static/katex/fonts/KaTeX_Main-Regular.woff2",
+        "/__/tree",
+        "/__/tree/subdir",
     ] {
         let res = get(app(dir.path()), uri).await;
         assert_eq!(res.status(), StatusCode::OK, "{uri}");
         assert!(
             res.headers().get(header::CONTENT_SECURITY_POLICY).is_none(),
-            "{uri}: fragment/static must not carry CSP"
+            "{uri}: fragment/static/JSON must not carry CSP"
         );
         assert!(
             res.headers().get(header::X_FRAME_OPTIONS).is_none(),
-            "{uri}: fragment/static must not carry X-Frame-Options"
+            "{uri}: fragment/static/JSON must not carry X-Frame-Options"
         );
+        // token 断言只对文本响应 (二进制字体直接跳过)
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        if let Ok(body) = String::from_utf8(bytes.to_vec()) {
+            assert!(
+                !body.contains(r#"<meta name="cb-native-open-token""#),
+                "{uri}: must not carry the native-open token"
+            );
+        }
     }
 
     // 目录/搜索页保留 anti-framing 头
