@@ -1,18 +1,18 @@
 //! HTTP 路由.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use axum::Router;
 use axum::body::Body;
 use axum::extract::rejection::ExtensionRejection;
 use axum::extract::{ConnectInfo, Form, FromRequest, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use maud::html;
 use tokio::sync::Semaphore;
 use tower::ServiceExt;
@@ -58,6 +58,8 @@ fn app_with(root: PathBuf, token: String, opener: Arc<dyn OpenWith>) -> Router {
         .route("/__/search", get(serve_search))
         .route("/__/native-open", post(native_open))
         .route("/__/static/{*path}", get(static_asset))
+        .route("/__/tree", get(serve_tree))
+        .route("/__/tree/{*path}", get(serve_tree))
         .route("/", get(serve_path))
         .route("/{*path}", get(serve_path))
         .with_state(state)
@@ -468,6 +470,124 @@ async fn serve_path(
             }
         }
     }
+}
+
+/// 树模式 JSON 端点: `GET /__/tree` (根) 与 `GET /__/tree/{*path}` (Option 提取器,
+/// 与 serve_path 同模式). 请求路径逐分量复用 resolve_within_root (与文件服务同一
+/// 防线); 越界 403, 不存在/非目录 404 (小 JSON 错误体). 子项固定排序: 目录在前,
+/// 组内名字升序. 目录携带 expandable: 非 UTF-8 (href None) 或 identity 与任一祖先
+/// 相同 (符号链接环) 时为 false — 树内联展开终止, 但条目仍显示、仍可按 URL 导航.
+async fn serve_tree(State(state): State<AppState>, path: Option<AxumPath<String>>) -> Response {
+    let decoded = path.map(|p| p.0).unwrap_or_default();
+    let Some(fs_path) = resolve_within_root(&state.root, &decoded) else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(TreeError {
+                error: "path escapes root",
+            }),
+        )
+            .into_response();
+    };
+    let Ok(meta) = std::fs::metadata(&fs_path) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(TreeError { error: "not found" }),
+        )
+            .into_response();
+    };
+    if !meta.is_dir() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(TreeError {
+                error: "not a directory",
+            }),
+        )
+            .into_response();
+    }
+    // 祖先 identity 集合: 根 + 请求路径每一级 (跟随符号链接后的 identity).
+    // 任一祖先 identity 不可得 (非 Unix canonicalize 失败) 时 complete 置 false —
+    // 此后所有子目录一律终止展开, fail-closed, 绝不拿不完整集合做环判定.
+    let mut ancestors: HashSet<listing::DirIdentity> = HashSet::new();
+    let mut complete = true;
+    let mut cursor = state.root.clone();
+    match std::fs::metadata(&cursor) {
+        Ok(root_meta) => match listing::dir_identity(&cursor, &root_meta) {
+            Some(id) => {
+                ancestors.insert(id);
+            }
+            None => complete = false,
+        },
+        Err(_) => complete = false,
+    }
+    let rel = fs_path.strip_prefix(&state.root).unwrap_or(Path::new(""));
+    for comp in rel.components() {
+        let Component::Normal(segment) = comp else {
+            continue;
+        };
+        cursor.push(segment);
+        match std::fs::metadata(&cursor) {
+            Ok(anc_meta) => match listing::dir_identity(&cursor, &anc_meta) {
+                Some(id) => {
+                    ancestors.insert(id);
+                }
+                None => complete = false,
+            },
+            Err(_) => complete = false,
+        }
+    }
+    let mut files = listing::list_dir(&fs_path, &state.root, SortBy::default());
+    files.sort_by(|a, b| {
+        b.is_directory
+            .cmp(&a.is_directory)
+            .then_with(|| a.display_name.cmp(&b.display_name))
+    });
+    let entries = files
+        .into_iter()
+        .map(|f| {
+            let href = f.href();
+            let expandable = if f.is_directory {
+                let child = state.root.join(&f.relative_to_root);
+                let not_cyclic = match std::fs::metadata(&child) {
+                    Ok(m) => {
+                        listing::dir_identity(&child, &m).is_some_and(|id| !ancestors.contains(&id))
+                    }
+                    // identity 不可得: fail-closed 终止展开, 仍可按 URL 导航
+                    Err(_) => false,
+                };
+                Some(complete && href.is_some() && not_cyclic)
+            } else {
+                None
+            };
+            TreeEntry {
+                name: f.display_name,
+                href,
+                dir: f.is_directory,
+                expandable,
+            }
+        })
+        .collect();
+    Json(TreeResponse { entries }).into_response()
+}
+
+/// 树端点 JSON 条目: name 为显示 codec 纯文本; href 为 root-relative RFC 3986
+/// 编码 (非 UTF-8 为显式 null, 键恒存在); expandable 仅目录携带.
+#[derive(serde::Serialize)]
+struct TreeEntry {
+    name: String,
+    href: Option<String>,
+    dir: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expandable: Option<bool>,
+}
+#[derive(serde::Serialize)]
+struct TreeResponse {
+    entries: Vec<TreeEntry>,
+}
+
+/// 树端点错误体: 强类型序列化, 与成功体同一 serde 管线.
+#[derive(serde::Serialize)]
+struct TreeError {
+    error: &'static str,
 }
 
 /// 响应模式: 在 serve_path 内集中解析一次, 先于类型分派.

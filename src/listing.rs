@@ -133,21 +133,32 @@ pub fn search(root: &Path, normalized_query: &str) -> SearchResult {
     }
 }
 
-/// 目录 identity seam: 统一返回 `Option`. 失败 (非 Unix 的 canonicalize) 时调用方
-/// 必须拒绝入队该子树, 使循环终止 fail-closed; 绝不退回字面路径 (否则两个拼写可同时
-/// 入队并无限循环). Unix 用跟随 metadata 的 `(dev, ino)`, 恒为 `Some` (infallible
-/// 语义保持, 不引入失败路径).
-#[cfg(unix)]
-fn dir_identity(_path: &Path, meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    Some((meta.dev(), meta.ino()))
+/// 目录 identity (seam): 搜索遍历去重与树端点环检测共用.
+/// Unix 为跟随 metadata 的 `(dev, ino)`; 其他平台为规范化路径.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum DirIdentity {
+    #[cfg(unix)]
+    DevIno(u64, u64),
+    #[cfg(not(unix))]
+    Canonical(PathBuf),
 }
 
-/// 非 Unix: 用规范化路径作为确定性目录 identity (无需新 crate). canonicalize 失败
-/// (不存在、权限不足、符号链接环等) 时返回 `None`, 由调用方拒绝入队该子树.
-#[cfg(not(unix))]
-fn dir_identity(path: &Path, _meta: &std::fs::Metadata) -> Option<PathBuf> {
-    std::fs::canonicalize(path).ok()
+/// 目录 identity seam: 统一返回 `Option`. 失败 (非 Unix 的 canonicalize) 时调用方
+/// 必须 fail-closed (拒绝入队该子树 / 标记不可展开); 绝不退回字面路径 (否则两个拼写
+/// 可同时入队并无限循环). Unix 用跟随 metadata 的 `(dev, ino)`, 恒为 `Some`
+/// (infallible 语义保持, 不引入失败路径).
+pub(crate) fn dir_identity(path: &Path, meta: &std::fs::Metadata) -> Option<DirIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        Some(DirIdentity::DevIno(meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        std::fs::canonicalize(path).ok().map(DirIdentity::Canonical)
+    }
 }
 
 #[cfg(test)]

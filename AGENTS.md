@@ -175,6 +175,8 @@ tests/
 | clap (derive) | CLI | `disable_help_flag`，`-h` 让给 `--host` |
 | chrono | 时间格式化 | `yyyy-MM-dd HH:mm:ss` 本地时区 |
 | percent-encoding | href 编码 | 见安全不变量 |
+| serde | 树 JSON 端点序列化 | 本就在依赖树中（传递），显式声明为直接依赖；`derive` feature 供强类型 `Serialize` |
+| serde_json | 树 JSON 端点序列化 | `axum::Json` 强类型输出成功体与错误体，不手写 JSON 编码器；release 体积实测 +~48KB |
 | tracing + tracing-subscriber | 日志 | `RUST_LOG` 环境变量控制级别 |
 
 Materialize 前端资源来自 [materializecss/materialize](https://github.com/materializecss/materialize)

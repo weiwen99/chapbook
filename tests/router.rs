@@ -2481,3 +2481,190 @@ async fn fragment_and_static_assets_lack_anti_frame_headers() {
         );
     }
 }
+// ============ 树模式 JSON 端点 (/__/tree) ============
+
+/// 解析响应体并返回 entries 数组.
+async fn tree_entries(res: Response<Body>) -> Vec<serde_json::Value> {
+    let body: serde_json::Value = serde_json::from_str(&body_string(res).await).unwrap();
+    body["entries"].as_array().unwrap().clone()
+}
+
+/// /__/tree 根路由: 200 application/json, 子项含 name/href/dir/expandable (仅目录).
+/// 树固定排序: 目录在前, 组内名字升序.
+#[tokio::test]
+async fn tree_endpoint_lists_root_entries() {
+    let dir = fixture();
+    let res = get(app(dir.path()), "/__/tree").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "application/json");
+    let entries = tree_entries(res).await;
+    assert_eq!(entries.len(), 2);
+    // 目录在前 (subdir), 文件在后 (1.txt)
+    assert_eq!(entries[0]["name"], "subdir");
+    assert_eq!(entries[0]["href"], "/subdir");
+    assert_eq!(entries[0]["dir"], true);
+    assert_eq!(entries[0]["expandable"], true);
+    assert_eq!(entries[1]["name"], "1.txt");
+    assert_eq!(entries[1]["href"], "/1.txt");
+    assert_eq!(entries[1]["dir"], false);
+    // 文件不携带 expandable
+    assert!(entries[1].get("expandable").is_none());
+}
+
+/// /__/tree/{*path}: 嵌套目录子项, href 为 root-relative 编码路径.
+#[tokio::test]
+async fn tree_endpoint_lists_nested_dir() {
+    let dir = fixture();
+    let res = get(app(dir.path()), "/__/tree/subdir").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let entries = tree_entries(res).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "2.json");
+    assert_eq!(entries[0]["href"], "/subdir/2.json");
+    assert_eq!(entries[0]["dir"], false);
+}
+
+/// href 逐 segment RFC 3986: 空格 -> %20, `+` -> %2B (字面加号, 绝不表单语义), `#`/`%` 编码.
+#[tokio::test]
+async fn tree_endpoint_href_uses_rfc3986_segment_encoding() {
+    let dir = fixture();
+    std::fs::write(dir.path().join("a b+c#d%.txt"), "x").unwrap();
+
+    let res = get(app(dir.path()), "/__/tree").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let entries = tree_entries(res).await;
+    let entry = entries
+        .iter()
+        .find(|e| e["name"] == "a b+c#d%.txt")
+        .unwrap();
+    assert_eq!(entry["href"], "/a%20b%2Bc%23d%25.txt");
+}
+
+/// 越界路径 403: 与文件服务共用同一 root 边界 (逐分量解析, 溢出即 403); 错误体为 JSON.
+#[tokio::test]
+async fn tree_endpoint_forbids_escape() {
+    let dir = fixture();
+    for uri in [
+        "/__/tree/%2e%2e/%2e%2e/%2e%2e/etc/passwd",
+        "/__/tree/subdir/../../../../../etc/passwd",
+    ] {
+        let res = get(app(dir.path()), uri).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "uri: {uri}");
+        assert_eq!(content_type(&res), "application/json", "uri: {uri}");
+        let body: serde_json::Value = serde_json::from_str(&body_string(res).await).unwrap();
+        assert_eq!(body["error"], "path escapes root", "uri: {uri}");
+    }
+}
+
+/// 不存在路径与文件路径: 404 (非目录), 错误体为 JSON.
+#[tokio::test]
+async fn tree_endpoint_missing_or_file_returns_404() {
+    let dir = fixture();
+    for uri in ["/__/tree/nope", "/__/tree/1.txt"] {
+        let res = get(app(dir.path()), uri).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "uri: {uri}");
+        assert_eq!(content_type(&res), "application/json", "uri: {uri}");
+        let body: serde_json::Value = serde_json::from_str(&body_string(res).await).unwrap();
+        assert!(body["error"].is_string(), "uri: {uri}");
+    }
+}
+
+/// 树固定排序: 目录在前, 组内名字升序 (byte 序).
+#[tokio::test]
+async fn tree_endpoint_sorts_dirs_first() {
+    let dir = fixture();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("zdir")).unwrap();
+
+    let res = get(app(dir.path()), "/__/tree").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let entries = tree_entries(res).await;
+    let names: Vec<String> = entries
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["subdir", "zdir", "1.txt", "a.txt"]);
+}
+
+/// 树不吃 ?sort= 查询参数 (目录模式的排序契约不影响树).
+#[tokio::test]
+async fn tree_endpoint_ignores_sort_param() {
+    let dir = fixture();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    std::fs::create_dir(dir.path().join("zdir")).unwrap();
+
+    let res = get(app(dir.path()), "/__/tree?sort=Name:Desc").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let entries = tree_entries(res).await;
+    let names: Vec<String> = entries
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["subdir", "zdir", "1.txt", "a.txt"]);
+}
+
+/// 非 UTF-8 basename: display-only — href 键恒存在且为 null, 目录不可展开; 显示 codec 转义可见.
+// APFS (macOS) 拒绝非法 UTF-8 文件名 (EILSEQ), 无法构造 fixture; 该测试在支持
+// 任意字节文件名的文件系统 (Linux CI) 上运行. 仓库既有的同名 fixture 测试同样
+// 受此平台限制.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test]
+async fn tree_endpoint_non_utf8_entry_display_only() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(OsString::from_vec(b"\xFFbad.txt".to_vec())),
+        b"x",
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join(OsString::from_vec(b"\xFEbadir".to_vec()))).unwrap();
+
+    let res = get(app(dir.path()), "/__/tree").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let entries = tree_entries(res).await;
+    let file = entries.iter().find(|e| e["dir"] == false).unwrap();
+    assert!(file.as_object().unwrap().contains_key("href"));
+    assert!(file["href"].is_null());
+    assert!(file["name"].as_str().unwrap().contains("\\xFF"));
+    let bad_dir = entries.iter().find(|e| e["dir"] == true).unwrap();
+    assert!(bad_dir.as_object().unwrap().contains_key("href"));
+    assert!(bad_dir["href"].is_null());
+    assert_eq!(bad_dir["expandable"], false);
+}
+
+/// symlink-to-root 子目录: 环检测终止展开 — 仍显示、仍可导航 (href 存在), expandable false.
+#[cfg(unix)]
+#[tokio::test]
+async fn tree_endpoint_marks_cycle_symlink_terminal() {
+    let dir = fixture();
+    std::os::unix::fs::symlink(dir.path(), dir.path().join("subdir/loop")).unwrap();
+
+    let res = get(app(dir.path()), "/__/tree/subdir").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let entries = tree_entries(res).await;
+    let loop_entry = entries.iter().find(|e| e["name"] == "loop").unwrap();
+    assert_eq!(loop_entry["dir"], true);
+    assert_eq!(loop_entry["href"], "/subdir/loop");
+    assert_eq!(loop_entry["expandable"], false);
+    // 同目录其他条目不受影响
+    let json_entry = entries.iter().find(|e| e["name"] == "2.json").unwrap();
+    assert_eq!(json_entry["href"], "/subdir/2.json");
+}
+
+/// 非环 symlink 子目录: 可展开.
+#[cfg(unix)]
+#[tokio::test]
+async fn tree_endpoint_allows_non_cyclic_symlink_expansion() {
+    let dir = fixture();
+    std::os::unix::fs::symlink(dir.path().join("subdir"), dir.path().join("link")).unwrap();
+
+    let res = get(app(dir.path()), "/__/tree").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let entries = tree_entries(res).await;
+    let link_entry = entries.iter().find(|e| e["name"] == "link").unwrap();
+    assert_eq!(link_entry["dir"], true);
+    assert_eq!(link_entry["href"], "/link");
+    assert_eq!(link_entry["expandable"], true);
+}

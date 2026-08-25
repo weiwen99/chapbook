@@ -25,6 +25,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"]
 anydoc = "=0.1.8"
 chrono = "0.4"
 percent-encoding = "2"
+# 树 JSON 端点序列化: serde 已在依赖树中 (传递), 此处显式声明为直接依赖.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 maud = "0.27"
 orgize = { version = "0.9", default-features = false }
 comrak = { version = "0.54", default-features = false }
