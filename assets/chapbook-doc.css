@@ -283,3 +283,8 @@ body.cb-tree-mode .cb-doc {
   background: var(--cb-bg);
   color: var(--cb-text);
 }
+
+/* 树模式下原生打开控制全部移除 (Q17/advisory: 控制移除 + 路径 gating 双保险) */
+body.cb-tree-mode [data-cb-action="native"] {
+  display: none;
+}

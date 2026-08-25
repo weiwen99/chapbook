@@ -609,8 +609,8 @@
   // 已加载子项缓存: encoded dir path (无前导斜杠) -> 子节点 <li> 数组
   const treeCache = new Map();
   let treeSelectedEl = null;
-  let treeSelectedPath = null; // 选中条目的 encoded path (无前导斜杠) 或 null
-
+  // 树壳生命周期 generation: 退出树模式递增使全部在途响应失效 (镜像 previewGuard)
+  let treeGen = 0;
   function loadJsonArray(key, fallback) {
     try {
       const value = JSON.parse(localStorage.getItem(key) || 'null');
@@ -687,7 +687,7 @@
     li.dataset.treeDir = isDir ? '1' : '0';
     li.dataset.treeExpandable = expandable ? '1' : '0';
     if (relPath !== null) {
-      li.dataset.treePath = relPath;
+      li.dataset.nativePathEncoded = relPath;
     }
 
     const row = document.createElement('div');
@@ -739,14 +739,8 @@
     return li.dataset.treeDir === '1' && li.dataset.treeExpandable === '1';
   }
 
-  function nodePath(li) {
-    const value = li.dataset.treePath;
-    if (value === undefined || !isValidEncodedPath(value)) return null;
-    return value;
-  }
-
   function nodeHref(li) {
-    const path = nodePath(li);
+    const path = encodedPathOf(li);
     return path === null ? null : actionUrl(path, 'full');
   }
 
@@ -759,7 +753,7 @@
     const ul = li.querySelector(':scope > ul.cb-tree-children');
     if (ul) ul.hidden = !expanded;
     if (isExpandableDir(li)) setTwist(li, expanded);
-    const path = nodePath(li);
+    const path = encodedPathOf(li);
     if (path === null) return;
     const idx = treeExpandedPaths.indexOf(path);
     if (expanded && idx < 0) {
@@ -785,6 +779,7 @@
 
   // 懒加载目录子项; 失败静默 (网络/服务端错误不留半展开态).
   function loadTreeChildren(li, path) {
+    const gen = treeGen;
     if (treeCache.has(path)) {
       const ul = childrenUlFor(li);
       ul.replaceChildren(...treeCache.get(path));
@@ -793,6 +788,7 @@
     }
     return fetchTreeEntries(path)
       .then(function (entries) {
+        if (gen !== treeGen) return; // 旧壳在途响应: 不得触碰新壳 DOM/缓存
         const nodes = entries.map(buildTreeNode);
         treeCache.set(path, nodes);
         const ul = childrenUlFor(li);
@@ -812,7 +808,7 @@
       setTreeNodeExpanded(li, false);
       return;
     }
-    const path = nodePath(li);
+    const path = encodedPathOf(li);
     if (path === null) return;
     loadTreeChildren(li, path);
   }
@@ -821,12 +817,12 @@
     if (treeSelectedEl) treeSelectedEl.classList.remove('cb-selected');
     treeSelectedEl = li;
     li.classList.add('cb-selected');
-    treeSelectedPath = nodePath(li);
+    const path = encodedPathOf(li);
     try {
-      if (treeSelectedPath === null) {
+      if (path === null) {
         localStorage.removeItem(TREE_SELECTED_KEY);
       } else {
-        localStorage.setItem(TREE_SELECTED_KEY, treeSelectedPath);
+        localStorage.setItem(TREE_SELECTED_KEY, path);
       }
     } catch (err) {
       /* 持久化失败忽略 */
@@ -836,7 +832,6 @@
   function clearTreeSelection() {
     if (treeSelectedEl) treeSelectedEl.classList.remove('cb-selected');
     treeSelectedEl = null;
-    treeSelectedPath = null;
   }
 
   function visibleTreeNodes() {
@@ -864,28 +859,61 @@
 
   function navigateTreeNode(li) {
     const url = nodeHref(li);
-    if (url !== null) location.href = url.href;
+    if (url === null) return;
+    const path = encodedPathOf(li);
+    // 树内导航: SPA (fragment 注入 + pushState); 无 pane (异常) 时兜底整页导航.
+    if (pane && path !== null) {
+      paneNavigate(path);
+      return;
+    }
+    location.href = url.href;
+  }
+
+  // 在当前层查找 href 匹配的树节点 (pathname 比较, 不 decode).
+  function findTreeNode(parentUl, href) {
+    return $$(':scope > li', parentUl).find(function (li) {
+      return nodeHref(li) !== null && nodeHref(li).pathname === href;
+    });
+  }
+
+  // 同步标记当前 URL 路径链 (全部祖先 + 最深节点), 返回最深节点.
+  function markTreePath(segments) {
+    let parentUl = treeRootUl;
+    let lastNode = null;
+    segments.forEach(function (seg, i) {
+      const href = '/' + segments.slice(0, i + 1).join('/');
+      const node = parentUl ? findTreeNode(parentUl, href) : null;
+      if (!node) {
+        parentUl = null;
+        return;
+      }
+      lastNode = node;
+      const children = node.querySelector(':scope > ul.cb-tree-children');
+      parentUl = isDirNode(node) && children && !children.hidden ? children : null;
+    });
+    // 只有最深匹配节点标 current (祖先只展开, 不高亮)
+    if (lastNode) lastNode.classList.add('cb-current');
+    return lastNode;
   }
 
   // 展开并定位当前 URL 路径: 逐段匹配节点 (按 href, 不分目录/文件), 匹配即标
-  // current; 可展开目录继续下钻, 环/非 UTF-8 目录或文件处终止.
+  // current; 可展开目录继续下钻, 环/非 UTF-8 目录或文件处终止. 解析为最深节点.
   function revealPath(segments) {
     let parentUl = treeRootUl;
+    let lastNode = null;
     let promise = Promise.resolve();
     segments.forEach(function (seg, i) {
       const href = '/' + segments.slice(0, i + 1).join('/');
       promise = promise.then(function () {
         if (!parentUl) return;
-        const node = $$(':scope > li', parentUl).find(function (li) {
-          return nodeHref(li) !== null && nodeHref(li).pathname === href;
-        });
+        const node = findTreeNode(parentUl, href);
         if (!node) {
           parentUl = null;
           return;
         }
-        node.classList.add('cb-current');
+        lastNode = node;
         if (isExpandableDir(node)) {
-          const path = nodePath(node);
+          const path = encodedPathOf(node);
           if (path === null) {
             parentUl = null;
             return;
@@ -897,45 +925,220 @@
         parentUl = null;
       });
     });
-    return promise;
+    return promise.then(function () {
+      // 只有最深匹配节点标 current (祖先只展开, 不高亮)
+      if (lastNode) lastNode.classList.add('cb-current');
+      return lastNode;
+    });
   }
 
   function buildTreeShell() {
-    treeNav = document.createElement('nav');
+    const gen = treeGen;
     treeNav.className = 'cb-tree';
     treeNav.setAttribute('aria-label', '目录树');
     treeNav.append(treeSearchForm());
     treeRootUl = document.createElement('ul');
     treeRootUl.className = 'cb-tree-root';
     treeNav.append(treeRootUl);
-    document.body.prepend(treeNav);
     return fetchTreeEntries('').then(function (entries) {
+      if (gen !== treeGen) return;
       const nodes = entries.map(buildTreeNode);
       treeCache.set('', nodes);
       treeRootUl.replaceChildren(...nodes);
     });
   }
 
-  function restoreTreeSelection() {
-    let saved = null;
-    try {
-      saved = localStorage.getItem(TREE_SELECTED_KEY);
-    } catch (err) {
+  /* ---------- SPA 内容区导航 (树模式) ---------- */
+
+  // 内容区: 树模式右侧滚动容器. 进入树模式时把当前完整页内容 (目录页 main.cb-main
+  // / 文档页 .cb-doc) 包装进 .cb-pane, 再 fetch 当前 URL 的 fragment 替换为统一
+  // fragment 视图 (深链目录页显示迷你列表). 树内导航全部 SPA: fragment 注入 +
+  // history.pushState/popstate, 无整页刷新; URL 恒为 actionUrl(path, 'full').
+  let pane = null;
+  let paneAbort = null; // 在途 fragment fetch 的 AbortController
+  let paneCommittedPath = null; // 最近一次提交的 encoded path (hash 导航防重取)
+  // 单一活跃导航不变量: 单调 nav id (generation 守卫) — 仅当 id 最新且
+  // location.pathname 等于导航 canonical URL 时提交 DOM/history/树状态.
+  const paneNavGuard = createPreviewGuard();
+  // pane 生命周期 registry: SPA 替换/退出树模式时统一拆除. ticket 08 的 TOC
+  // observer 经 registerPaneDisposable 注册, 替换时自动 disconnect, 高亮不串台.
+  const paneDisposables = [];
+
+  function registerPaneDisposable(fn) {
+    if (typeof fn === 'function') paneDisposables.push(fn);
+  }
+
+  // 卸载 pane 内媒体: 音视频暂停并移除 (停止播放与资源加载).
+  function unloadPaneMedia() {
+    if (!pane) return;
+    pane.querySelectorAll('audio, video').forEach(function (el) {
+      try {
+        el.pause();
+      } catch (err) {
+        /* 已分离等场景忽略 */
+      }
+      el.remove();
+    });
+  }
+
+  // 统一 teardown: 先断开注册的 observer/媒体, 供替换与退出复用.
+  function teardownPane() {
+    paneDisposables.splice(0).forEach(function (fn) {
+      try {
+        fn();
+      } catch (err) {
+        /* 单个 teardown 失败不阻断其余 */
+      }
+    });
+    unloadPaneMedia();
+  }
+
+  // 被包装的完整页内容宿主: 目录页 main.cb-main, 文档页 .cb-doc.
+  function paneHostForPage() {
+    return (
+      document.querySelector('main.cb-main') ||
+      document.querySelector('.cb-doc')
+    );
+  }
+
+  function createPane() {
+    const host = paneHostForPage();
+    if (!host || pane) return null;
+    const wrap = document.createElement('div');
+    wrap.className = 'cb-pane';
+    wrap.setAttribute('role', 'region');
+    wrap.setAttribute('aria-label', '内容区');
+    host.before(wrap);
+    wrap.append(host);
+    pane = wrap;
+    return wrap;
+  }
+
+  function paneClearError() {
+    if (!pane) return;
+    const errEl = pane.querySelector(':scope > .cb-pane-error');
+    if (errEl) errEl.remove();
+  }
+
+  // 错误只经 textContent (绝不 innerHTML): 保留现有 pane 内容, URL 不变.
+  function paneShowError(message) {
+    if (!pane) return;
+    let errEl = pane.querySelector(':scope > .cb-pane-error');
+    if (!errEl) {
+      errEl = document.createElement('div');
+      errEl.className = 'cb-pane-error';
+      errEl.setAttribute('role', 'alert');
+      pane.prepend(errEl);
+    }
+    errEl.textContent = message;
+  }
+
+  // 树内 SPA 导航: fetch fragment -> 校验 (ok + text/html + wrapper identity)
+  // -> 提交 (teardown 旧 pane 状态, 安装新内容, pushState, 树状态同步).
+  // 失败 fail-closed: 保留 pane 内容, 不 pushState (URL 不变), 文本错误.
+  function paneNavigate(encodedPath, opts) {
+    if (!isValidEncodedPath(encodedPath) || !pane) return false;
+    const url = actionUrl(encodedPath, 'full');
+    if (url === null) return false;
+    const selectTree = !opts || opts.select !== false;
+    const gen = paneNavGuard.begin(); // 新导航作废所有在途导航
+    if (paneAbort) paneAbort.abort();
+    const ac = new AbortController();
+    paneAbort = ac;
+    paneClearError();
+    fetch(actionUrl(encodedPath, 'fragment'), {
+      headers: { Accept: 'text/html' },
+      signal: ac.signal,
+    })
+      .then(function (res) {
+        if (!paneNavGuard.isCurrent(gen)) return null; // 过期: 丢弃
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const ct = res.headers.get('Content-Type') || '';
+        if (!/text\/html/i.test(ct)) throw new Error('响应不是 HTML');
+        return res.text();
+      })
+      .then(function (html) {
+        if (html === null || !paneNavGuard.isCurrent(gen)) return;
+        commitPane(html, url, encodedPath, gen, selectTree);
+      })
+      .catch(function (err) {
+        if (!paneNavGuard.isCurrent(gen)) return; // 过期错误: 丢弃
+        if (err && err.name === 'AbortError') return; // 被新导航中止: 不报错
+        paneShowError(
+          '无法加载：' + (err && err.message ? err.message : String(err))
+        );
+      });
+    return true;
+  }
+
+  // 提交守卫: id 最新 && wrapper identity 匹配 (fail-closed) && pushState 后
+  // location.pathname 等于导航 canonical URL — 三者满足才动 DOM/history/树.
+  function commitPane(html, url, encodedPath, gen, selectTree) {
+    if (!paneNavGuard.isCurrent(gen)) return;
+    const host = document.createElement('div');
+    host.innerHTML = html; // 服务端 fragment (与预览面板同一信任契约)
+    const wrapper = host.firstElementChild;
+    if (!wrapper || wrapper.dataset.nativePathEncoded !== encodedPath) {
+      // fail-closed: wrapper 缺失或 identity 与目标不符 — 不推 URL, 保留 pane
+      paneShowError('无法加载：响应内容与目标不符');
       return;
     }
-    if (saved === null || !isValidEncodedPath(saved)) return;
-    const nodes = visibleTreeNodes();
-    const node = nodes.find(function (li) {
-      return nodePath(li) === saved;
+    if (location.href !== url.href) {
+      history.pushState(null, '', url.href); // 初始/back-forward 时 URL 已就位
+    }
+    if (location.pathname !== url.pathname) return; // canonical URL 兜底校验
+    teardownPane(); // 旧 observer 拆除 + 媒体卸载
+    paneClearError();
+    pane.replaceChildren(wrapper); // 移动解析出的 wrapper (替换全部旧内容)
+    const titleEl = wrapper.querySelector('.cb-frag-title');
+    if (titleEl && titleEl.textContent) {
+      document.title = titleEl.textContent.trim();
+    }
+    pane.scrollTop = 0;
+    paneCommittedPath = encodedPath;
+    syncTreeToPath(gen, selectTree);
+  }
+
+  function clearTreeCurrent() {
+    if (!treeRootUl) return;
+    $$('.cb-current', treeRootUl).forEach(function (el) {
+      el.classList.remove('cb-current');
     });
-    if (node) selectTreeNode(node);
+  }
+
+  // 同步树状态到当前 URL: 清除陈旧 cb-current, revealPath 展开祖先链, 完成后
+  // 以当前链为准重标记; 用户导航 (selectTree) 时选中跟随 URL.
+  function syncTreeToPath(gen, selectTree) {
+    const encoded = currentPathFromLocation();
+    if (encoded === null || !treeRootUl) return;
+    const segments = encoded === '' ? [] : encoded.split('/');
+    clearTreeCurrent();
+    revealPath(segments).then(function () {
+      if (!paneNavGuard.isCurrent(gen)) return; // 过期: 树状态不跟进
+      clearTreeCurrent(); // reveal 期间可能被更早链路标记: 重标记当前链
+      const node = markTreePath(segments);
+      if (selectTree && node) selectTreeNode(node);
+    });
+  }
+
+  // 进入树模式时的初始加载: fetch 当前 URL 的 fragment (URL 已就位, 不 pushState);
+  // 初始提交不动树选中 (恢复持久化选中, ticket 05 契约), 仅标记 current.
+  function paneInitialLoad() {
+    const encoded = currentPathFromLocation();
+    if (encoded === null) return; // 非法路径: 保持完整页 (fail-closed)
+    paneNavigate(encoded, { select: false });
   }
 
   function enterTreeMode() {
+    treeGen += 1; // 新壳 generation: 使退出/重进前的在途响应失效
     document.body.classList.add('cb-tree-mode');
     // 树模式无 native-open (Q17/advisory): token meta 移除, native 路径全部 no-op.
     const tokenMeta = document.querySelector('meta[name="cb-native-open-token"]');
     if (tokenMeta) tokenMeta.remove();
+    // 内容区: 包装当前完整页内容进 .cb-pane, 再 fetch 当前 URL 的 fragment
+    // 替换为统一 fragment 视图 (深链目录页显示迷你列表; 与外壳构建并行).
+    createPane();
+    paneInitialLoad();
     buildTreeShell().then(function () {
       const current = currentPathFromLocation();
       const reveal = current !== null
@@ -960,7 +1163,7 @@
               );
             });
             if (!node) return Promise.resolve();
-            const nodePathV = nodePath(node);
+            const nodePathV = encodedPathOf(node);
             if (nodePathV === null) return Promise.resolve();
             return loadTreeChildren(node, nodePathV).then(function () {
               return walk(
@@ -980,12 +1183,26 @@
   }
 
   function exitTreeMode() {
+    const hadPane = pane !== null;
+    treeGen += 1; // 使全部在途树响应失效 (旧壳 continuation 不得触碰新壳)
     document.body.classList.remove('cb-tree-mode');
+    if (hadPane) {
+      paneNavGuard.invalidate(); // 在途 fragment 响应/错误不得安装状态
+      if (paneAbort) paneAbort.abort();
+      teardownPane(); // observer 拆除 + 媒体卸载
+      pane.remove();
+      pane = null;
+      paneAbort = null;
+      paneCommittedPath = null;
+    }
     if (treeNav) treeNav.remove();
     treeNav = null;
     treeRootUl = null;
     treeCache.clear();
     clearTreeSelection();
+    // SPA 期间 pane 内容已被 fragment 替换: 离开树模式重载当前 URL 恢复完整页.
+    // 仅在真实离开树模式时 (init 时 treeMode 为 false 则 pane 不存在, 不重载).
+    if (hadPane) location.reload();
   }
 
   function applyTreeMode() {
@@ -1025,6 +1242,17 @@
 
   function onTreeKeydown(event) {
     if (event.ctrlKey || event.metaKey || event.altKey) return;
+    // Escape 先于 editable 守卫 (镜像目录模式): 聚焦树搜索框时先失焦, 否则清除选中
+    if (event.key === 'Escape') {
+      const input = $('#cb-tree-search-q');
+      if (document.activeElement === input) {
+        input.blur();
+      } else {
+        clearTreeSelection();
+      }
+      event.preventDefault();
+      return;
+    }
     if (isEditableTarget(event.target)) return;
     switch (event.key) {
       case 'ArrowDown':
@@ -1036,8 +1264,13 @@
         event.preventDefault();
         break;
       case 'ArrowRight':
+        // → 只展开 (契约: → 展开 / ← 收起); 已展开则 no-op
         if (treeSelectedEl && isDirNode(treeSelectedEl)) {
-          toggleTreeNode(treeSelectedEl);
+          const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
+          if (!ul || ul.hidden) {
+            const path = encodedPathOf(treeSelectedEl);
+            if (path !== null) loadTreeChildren(treeSelectedEl, path);
+          }
           event.preventDefault();
         }
         break;
@@ -1077,10 +1310,6 @@
         event.preventDefault();
         break;
       }
-      case 'Escape':
-        clearTreeSelection();
-        event.preventDefault();
-        break;
       default:
         break;
     }
