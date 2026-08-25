@@ -913,7 +913,7 @@ async fn render_markdown_response(source: &str, path: &Path) -> Response {
     let file_name = file_name_text(path);
     let (title, body) = markdown::render(source, &file_name);
     let page = render::doc_page(&title, &body);
-    Html(render::inject_doc_style(&page)).into_response()
+    trusted_ui_response(render::inject_doc_style(&page))
 }
 
 /// Full 模式的源代码渲染 (syntect, 纯 Rust; 提案 docs/2026-08-05-proposal-syntax-highlight-code-files.org, 方案 A).
@@ -937,7 +937,7 @@ async fn serve_code(
                 let title = file_name_text(path);
                 let body = highlight::code_block(&source, Some(lang));
                 let page = render::doc_page(&title, &body);
-                Html(render::inject_doc_style(&page)).into_response()
+                trusted_ui_response(render::inject_doc_style(&page))
             }
             // 非 UTF-8: 不做编码猜测, 裸字节透传
             Err(_) => serve_file(path, headers, false).await,
@@ -1005,7 +1005,7 @@ async fn serve_org(path: &Path, headers: HeaderMap) -> Response {
                 let file_name = file_name_text(path);
                 let (title, body) = org::render(&source, &file_name);
                 let page = render::doc_page(&title, &body);
-                Html(render::inject_doc_style(&page)).into_response()
+                trusted_ui_response(render::inject_doc_style(&page))
             }
             Err(_) => serve_file(path, headers, false).await,
         },

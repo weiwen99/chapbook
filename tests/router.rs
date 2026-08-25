@@ -1351,15 +1351,30 @@ async fn playable_media_omits_sandbox_and_requires_nosniff() {
     assert!(res.headers().contains_key(header::CONTENT_DISPOSITION));
 }
 
-/// 可信 UI (目录/搜索页): 精确 anti-framing 头, 无 sandbox; 完整文档页两者皆无.
+/// 可信 UI: 目录/搜索/文档/代码/Office 渲染完整页统一 anti-framing 头, 无 sandbox.
+/// (Q21 / ADR 0001: 文档页托管树壳后升级为可信 UI; 既有 "无 token 不需 anti-frame" 已废弃.)
 #[tokio::test]
 async fn trusted_pages_have_anti_frame_and_no_sandbox() {
     let dir = fixture();
     std::fs::write(dir.path().join("test.md"), "# T\nbody\n").unwrap();
     std::fs::write(dir.path().join("test.org"), "* T\nbody\n").unwrap();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        dir.path().join("report.docx"),
+        docx_bytes("Hello from docx"),
+    )
+    .unwrap();
 
-    for uri in ["/", "/__/search?q=1.txt", "/__/search"] {
-        let res = get(app(dir.path()), uri).await;
+    for uri in [
+        "/",
+        "/__/search?q=1.txt",
+        "/__/search",
+        "/test.md",
+        "/test.org",
+        "/main.rs",
+        "/report.docx",
+    ] {
+        let res = get_with_accept(app(dir.path()), uri, "text/html").await;
         assert_eq!(res.status(), StatusCode::OK, "{uri}");
         let csp = res
             .headers()
@@ -1375,20 +1390,19 @@ async fn trusted_pages_have_anti_frame_and_no_sandbox() {
             "{uri}"
         );
     }
+}
 
-    // 完整生成文档页: 不 sandbox 也不需要 anti-frame (无 token)
-    for uri in ["/test.md", "/test.org"] {
-        let res = get(app(dir.path()), uri).await;
-        assert_eq!(res.status(), StatusCode::OK, "{uri}");
-        assert!(
-            res.headers().get(header::CONTENT_SECURITY_POLICY).is_none(),
-            "{uri}: trusted doc page must not be sandboxed"
-        );
-        assert!(
-            res.headers().get(header::X_FRAME_OPTIONS).is_none(),
-            "{uri}"
-        );
-    }
+/// 目录/搜索页骨架预加载 katex.min.css (树模式内容区宿主; 顺带修复预览面板公式缺口).
+#[tokio::test]
+async fn dir_page_preloads_katex_css() {
+    let dir = fixture();
+    let res = get(app(dir.path()), "/").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(
+        body.contains(r#"href="/__/static/katex/katex.min.css""#),
+        "dir page must preload KaTeX CSS"
+    );
 }
 
 /// 目录忽略 download/raw/view (恒完整可信目录页); fragment 模式返回迷你列表.

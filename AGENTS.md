@@ -149,9 +149,9 @@ tests/
   非 200/206 响应永不例外。Chromium 会拒绝加载带 document sandbox 的媒体，因此只有非 download
   的 200/206 `audio/*`、`video/*` 响应省略 sandbox，并强制
   `X-Content-Type-Options: nosniff`。CB 生成的完整页/fragment/静态资源不经过 raw 出口。
-- **trusted UI anti-framing**：目录页与搜索页统一带
+- **trusted UI anti-framing**：所有 CB 生成的完整页（目录/搜索/文档/代码/Office 渲染页）统一带
   `Content-Security-Policy: frame-ancestors 'none'` 和 `X-Frame-Options: DENY`；策略必须是
-  HTTP header，不能降级为 meta。fragment 与静态资源不携带 token，不复用该 header。
+  HTTP header，不能降级为 meta。fragment/JSON/静态资源不携带 token，不复用该 header。
 - **Org 主动内容**：HTML ExportBlock/Snippet 必须以 `HtmlEscape` 输出；Org link 在首个冒号前
   去除 ASCII whitespace/control 并小写后，拒绝 `javascript`/`vbscript`/`data`/`file` scheme。
   Full 与 Fragment 必须复用同一 `OrgHtmlHandler`，禁止 fragment 出口另做字符串清洗。

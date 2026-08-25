@@ -152,6 +152,9 @@ fn page_shell(
                 link rel="stylesheet" href="/__/static/css/materialize.min.css";
                 link rel="stylesheet" href="/__/static/css/chapbook-theme.css";
                 link rel="stylesheet" href="/__/static/css/chapbook-doc.css";
+                // KaTeX: 目录页预览面板与树模式内容区是文档片段的宿主,
+                // 预加载样式表 (字体按需加载); 与 doc_page 同一资产.
+                link rel="stylesheet" href="/__/static/katex/katex.min.css";
                 script src="/__/static/js/chapbook-browser.js" defer {}
                 @if let Some(token) = native_token {
                     meta name="cb-native-open-token" content=(token);
@@ -958,6 +961,10 @@ mod tests {
         );
         assert!(
             with.contains(r#"<link rel="stylesheet" href="/__/static/css/chapbook-theme.css">"#),
+            "with: {with}"
+        );
+        assert!(
+            with.contains(r#"<link rel="stylesheet" href="/__/static/katex/katex.min.css">"#),
             "with: {with}"
         );
         assert!(
