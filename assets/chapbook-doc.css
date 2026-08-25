@@ -146,17 +146,17 @@ html:has(> body.cb-doc-page) {
   .cb-doc pre code span.constant { color: #79c0ff; }
   .cb-doc pre code span.type, .cb-doc pre code span.variable { color: #ffa657; }
 }
-/* 宽屏: TOC 固定为左侧边栏, 正文右移并在剩余空间中居中; 窄屏/打印: 保持顶部卡片.
- * margin-left 仅在页面确实有 TOC 时生效 — 代码文件页无 TOC, 否则会留出空侧栏位.
+/* 宽屏: TOC 固定为右侧边栏, 正文左移并在剩余空间中居中; 窄屏/打印: 保持顶部卡片.
+ * margin-right 仅在页面确实有 TOC 时生效 — 代码文件页无 TOC, 否则会留出空侧栏位.
  * 固定定位属页面级行为, 挂在 .cb-doc-page (片段嵌入宿主时不搬走宿主布局) */
 @media screen and (min-width: 75rem) {
   .cb-doc-page:has(#TOC), .cb-doc-page:has(#table-of-contents) {
-    margin-left: max(19rem, calc((100% - 100rem) / 2 + 9.5rem));
+    margin-right: max(19rem, calc((100% - 100rem) / 2 + 9.5rem));
   }
   .cb-doc-page #TOC, .cb-doc-page #table-of-contents {
     position: fixed;
     top: 0;
-    left: 0;
+    right: 0;
     bottom: 0;
     z-index: 10;
     width: 19rem;
@@ -165,7 +165,7 @@ html:has(> body.cb-doc-page) {
     overflow-y: auto;
     overflow-wrap: break-word;
     border: none;
-    border-right: 1px solid var(--cb-border);
+    border-left: 1px solid var(--cb-border);
     border-radius: 0;
     font-size: 0.9em;
   }
