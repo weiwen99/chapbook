@@ -465,3 +465,10 @@ body.cb-tree-mode {
 body.cb-tree-mode .cb-tree {
   font-size: 12.8px;
 }
+
+/* 宿主无关的树模式 body 几何 (设计门 P1 复验): dir 宿主的 Materialize body
+ * margin 会偏移 grid; 树模式统一 body 边距, 两宿主 shell bounds 一致 */
+body.cb-tree-mode {
+  margin: 0;
+  padding: 0;
+}

@@ -1218,14 +1218,17 @@
       paneShowError('无法加载：响应内容与目标不符');
       return;
     }
-    if (location.pathname !== canonicalUrl.pathname) {
-      // 跨文档导航: 旧 hash 不属于新文档, 丢弃
-      if (location.href !== canonicalUrl.href) {
-        history.pushState(null, '', canonicalUrl.href);
+    // 初始加载 (gen === paneInitialGen) 恒 replaceState (规范化不新增历史);
+    // 后续导航 pushState. hash 保留规则: 初始加载恒保留 (hash 属于所请求
+    // 文档), 后续导航仅同文档 (同 pathname) 保留.
+    const keepHash = gen === paneInitialGen || location.pathname === canonicalUrl.pathname;
+    const target = canonicalUrl.href + (keepHash ? location.hash : '');
+    if (location.href !== target) {
+      if (gen === paneInitialGen) {
+        history.replaceState(null, '', target);
+      } else {
+        history.pushState(null, '', target);
       }
-    } else if (location.href !== canonicalUrl.href + location.hash) {
-      // 同文档 (深链 #heading / 规范化): 保留 hash, 只推规范化 pathname
-      history.pushState(null, '', canonicalUrl.href + location.hash);
     }
     teardownPane(); // 旧 observer 拆除 + 媒体卸载
     paneClearError();
@@ -1270,19 +1273,11 @@
       }
     });
   }
-
-  // 进入树模式时的初始加载: fetch 当前 URL 的 fragment (URL 已就位, 不 pushState);
-  // 初始提交不动树选中 (恢复持久化选中, ticket 05 契约), 仅标记 current.
   function paneInitialLoad() {
     const encoded = currentPathFromLocation();
     if (encoded === null) return; // 非法路径: 保持完整页 (fail-closed)
-    const canonical = actionUrl(encoded, 'full');
-    if (canonical !== null && location.pathname !== canonical.pathname) {
-      // 只规范化 pathname (非规范 percent 编码深链), 保留 #heading 目标;
-      // 树模式内容区恒为 fragment 视图, query 模式语义 (?raw 等) 不适用, 丢弃.
-      const target = canonical.origin + canonical.pathname + location.hash;
-      history.replaceState(null, '', target);
-    }
+    // 规范化由 commitPane 的初始 generation replaceState 完成 (wrapper
+    // identity 为权威 canonical 形态, 含 hash 保留) — 此处不再自行 replaceState.
     paneInitialGen = paneNavigate(encoded, { select: false });
   }
   // back/forward (popstate): URL 已由浏览器同步, 直接按当前 location 导航;
