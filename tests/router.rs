@@ -2652,6 +2652,7 @@ async fn tree_endpoint_non_utf8_entry_display_only() {
     assert!(file.as_object().unwrap().contains_key("href"));
     assert!(file["href"].is_null());
     assert!(file["name"].as_str().unwrap().contains("\\xFF"));
+    assert!(file.get("expandable").is_none());
     let bad_dir = entries.iter().find(|e| e["dir"] == true).unwrap();
     assert!(bad_dir.as_object().unwrap().contains_key("href"));
     assert!(bad_dir["href"].is_null());
