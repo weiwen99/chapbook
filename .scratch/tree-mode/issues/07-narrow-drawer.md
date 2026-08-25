@@ -10,3 +10,7 @@
 - [ ] 宽视口（≥64rem）：树常驻左侧，无抽屉行为
 - [ ] Chromium 窄视口证据（截图 + 交互记录）
 - [ ] 既有全部测试通过；`cargo fmt --check` 与 clippy 零警告
+
+## Comments (2026-08-25 complete)
+
+Implemented commits 06fee87 + fd08516 (review fixes: drawer focus gating on open state, range breakpoint, aria-expanded). Chromium acceptance 10 scenarios PASS at 1400x900 and 500x800. Ticket complete.

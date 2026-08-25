@@ -14,3 +14,7 @@
 - [ ] Office 转换忙时内容区显示占位片段（04 行为贯通到 SPA 路径）
 - [ ] 树模式无预览面板；目录模式预览面板行为原样
 - [ ] 既有全部测试通过；`cargo fmt --check` 与 clippy 零警告
+
+## Comments (2026-08-25 complete)
+
+Implemented commits 6bc1050 (implementation) + 06fee87/d74c343 (review fixes). Chromium acceptance 9/9 + 1 probe PASS; deterministic reruns: delayed-A/fast-B with AbortSignal-ignoring mock (generation guard alone discards late A) PASS, office-busy placeholder via pane path PASS (explicit, non-optional). Two-axis review (full range 9a34965..6bc1050) findings fixed. Ticket complete.
