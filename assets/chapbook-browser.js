@@ -1072,7 +1072,8 @@
   // history.pushState/popstate, 无整页刷新; URL 恒为 actionUrl(path, 'full').
   let pane = null;
   let paneAbort = null; // 在途 fragment fetch 的 AbortController
-  let paneCommittedPath = null; // 最近一次提交的 encoded path (hash 导航防重取)
+  let paneCommittedPath = null; // 最近一次提交的 canonical encoded path (hash 导航防重取)
+  let paneCommittedGen = null; // 最近一次提交的导航 generation (启动重同步用)
   let paneInitialGen = null; // 初始加载导航的 generation (启动链守卫用)
   // 单一活跃导航不变量: 单调 nav id (generation 守卫) — 仅当 id 最新且
   const paneNavGuard = createGenerationGuard();
@@ -1197,8 +1198,18 @@
     const host = document.createElement('div');
     host.innerHTML = html; // 服务端 fragment (与预览面板同一信任契约)
     const wrapper = findFragmentWrapper(host);
-    if (!wrapper || wrapper.dataset.nativePathEncoded !== encodedPath) {
-      // fail-closed: wrapper 缺失或 identity 与目标不符 — 不推 URL
+    // 服务端 wrapper identity 是权威 canonical 形态 (深链非规范 percent 编码
+    // 会被服务端规范化, 字节比较会误拒); 合法性仍 fail-closed 校验.
+    const wrapperPath =
+      wrapper && typeof wrapper.dataset.nativePathEncoded === 'string'
+        ? wrapper.dataset.nativePathEncoded
+        : null;
+    const canonicalUrl =
+      wrapperPath !== null && isValidEncodedPath(wrapperPath)
+        ? actionUrl(wrapperPath, 'full')
+        : null;
+    if (canonicalUrl === null) {
+      // fail-closed: wrapper 缺失或 identity 非法 — 不推 URL
       if (isPop) {
         // popstate: URL 已被浏览器改走 — 统一 teardown 后清空, 内容不残留
         teardownPane();
@@ -1207,10 +1218,10 @@
       paneShowError('无法加载：响应内容与目标不符');
       return;
     }
-    if (location.href !== url.href) {
-      history.pushState(null, '', url.href); // 初始/back-forward 时 URL 已就位
+    if (location.href !== canonicalUrl.href) {
+      history.pushState(null, '', canonicalUrl.href); // 初始/back-forward 时 URL 已就位
     }
-    if (location.pathname !== url.pathname) return; // canonical URL 兜底校验
+    if (location.pathname !== canonicalUrl.pathname) return; // canonical URL 兜底校验
     teardownPane(); // 旧 observer 拆除 + 媒体卸载
     paneClearError();
     pane.replaceChildren(wrapper); // 移动解析出的 wrapper (替换全部旧内容)
@@ -1220,7 +1231,8 @@
     }
     pane.scrollTop = 0;
     installPaneTocSpy(wrapper); // 新内容就位后重建 pane TOC spy (无 TOC 则 no-op)
-    paneCommittedPath = encodedPath;
+    paneCommittedPath = wrapperPath;
+    paneCommittedGen = gen;
     syncTreeToPath(gen, selectTree);
     closeTreeDrawer(); // 导航提交成功: 窄屏抽屉收起 (宽屏 no-op)
   }
@@ -1261,8 +1273,10 @@
     if (encoded === null) return; // 非法路径: 保持完整页 (fail-closed)
     const canonical = actionUrl(encoded, 'full');
     if (canonical !== null && canonical.href !== location.href) {
-      // 目录深链尾斜杠等形态差异: replaceState 规范化 (不新增历史条目)
-      history.replaceState(null, '', canonical.href);
+      // 只规范化 pathname (非规范 percent 编码深链), 保留 #heading 目标;
+      // 树模式内容区恒为 fragment 视图, query 模式语义 (?raw 等) 不适用, 丢弃.
+      const target = canonical.origin + canonical.pathname + location.hash;
+      history.replaceState(null, '', target);
     }
     paneInitialGen = paneNavigate(encoded, { select: false });
   }
@@ -1384,6 +1398,37 @@
     };
   }
 
+  let paneSpyDisposer = null;
+  // 断点感知 spy 控制器: 跨 75rem 时按当前模式重装正确根的 spy (设计门 P1);
+  // 窄屏恒无 spy (installTocSpy 的 matchMedia 门), 宽屏按模式各装各的.
+  function reinstallCurrentSpy() {
+    if (treeMode && pane) {
+      if (paneSpyDisposer) {
+        paneSpyDisposer();
+        paneSpyDisposer = null;
+      }
+      const wrapper = pane.querySelector('.cb-doc');
+      if (wrapper) installPaneTocSpy(wrapper);
+    } else if (document.body.classList.contains('cb-doc-page')) {
+      if (fullPageSpyDisposer) {
+        fullPageSpyDisposer();
+        fullPageSpyDisposer = null;
+      }
+      initFullPageTocSpy();
+    }
+  }
+  function installTocSpyMql() {
+    const mql = window.matchMedia('(min-width: 75rem)');
+    const handler = function () {
+      reinstallCurrentSpy();
+    };
+    if (mql.addEventListener) {
+      mql.addEventListener('change', handler);
+    } else if (mql.addListener) {
+      mql.addListener(handler);
+    }
+  }
+
   // 完整页 spy (目录模式文档页): root = 视口, 页面生命周期. disposer 存入模块
   // 变量, 进入树模式时断开 (原正文被 pane fragment 替换, 观察目标脱离 DOM).
   let fullPageSpyDisposer = null;
@@ -1398,15 +1443,18 @@
     );
   }
 
-  // pane spy: root = pane 滚动容器; disposer 经 registerPaneDisposable 注册,
-  // SPA 替换/退出树模式时由 teardownPane 统一 disconnect — 旧 observer 绝不
-  // 触碰新内容, 快速连续导航时恒至多一个活跃 observer.
   function installPaneTocSpy(wrapper) {
     if (!pane) return;
     const tocNav = tocNavIn(wrapper);
     if (!tocNav) return; // 无 TOC fragment (代码/目录/媒体/占位): 不启用 spy
     const disposer = installTocSpy(wrapper, tocNav, pane);
-    if (disposer) registerPaneDisposable(disposer);
+    if (disposer) {
+      paneSpyDisposer = disposer;
+      registerPaneDisposable(function () {
+        paneSpyDisposer = null;
+        disposer();
+      });
+    }
   }
   function enterTreeMode() {
     // 完整页 spy 观察原正文: pane fragment 替换后目标脱离 DOM — 先断开
@@ -1419,8 +1467,9 @@
     // 目录模式预览面板在树模式不存在: 关闭并作废在途预览 (媒体/迟到响应不得残留)
     closePanel();
     // Q17 能力边界: 树模式不仅门禁事件路径, 更清空 JS 内存中的 token 并移除
-    // 全部 native 控制 — 任何遗漏路径都无法再 POST (退出树模式经整页重载
-    // 获得全新 token, 目录模式契约不受影响).
+    // 全部 native 控制 — 任何遗漏路径都无法再 POST. 退出树模式整页重载后
+    // 重新从服务端读取 token (进程级同一 token, 重载只是重新获得能力);
+    // 树模式的安全边界是清内存 + 删控制 + 事件门禁三重, 而非 token 轮换.
     nativeToken = null;
     const tokenMeta = document.querySelector('meta[name="cb-native-open-token"]');
     if (tokenMeta) tokenMeta.remove();
@@ -1432,6 +1481,16 @@
     createPane();
     paneInitialLoad();
     buildTreeShell().then(function () {
+      // 启动期根 JSON 延迟时, 用户可能已通过 pane 迷你列表完成导航: 以最新
+      // 已提交导航为准重同步树状态 (启动链的旧 generation 标记/选中不覆盖).
+      if (
+        paneCommittedGen !== null &&
+        paneInitialGen !== null &&
+        paneCommittedGen !== paneInitialGen
+      ) {
+        syncTreeToPath(paneCommittedGen, true);
+        return;
+      }
       const current = currentPathFromLocation();
       const reveal = current !== null
         ? revealPath(
@@ -1491,8 +1550,8 @@
       pane.remove();
       pane = null;
       paneCommittedPath = null;
+      paneCommittedGen = null;
       paneInitialGen = null;
-      paneAbort = null;
     }
     closeTreeDrawer();
     uninstallDrawerMql();
@@ -1634,6 +1693,7 @@
     // 完整页 spy 先于 applyTreeMode: 树模式启动时 enterTreeMode 立即断开它
     // (原正文将被 pane fragment 替换), 避免残留观察已脱离 DOM 的标题.
     initFullPageTocSpy();
+    installTocSpyMql(); // 断点感知 spy 控制器 (跨 75rem 重装, 页面生命周期)
     if (isTreeCapablePage()) {
       try {
         treeMode = localStorage.getItem(MODE_KEY) === 'tree';

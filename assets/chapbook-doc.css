@@ -425,3 +425,34 @@ body.cb-tree-mode .cb-pane .cb-pane-error {
   background: var(--cb-soft-bg);
   color: var(--cb-muted);
 }
+
+/* ---------- 宿主无关的 fragment 样式 (设计门 P1) ----------
+ * 目录迷你列表原在 theme.css (仅目录页宿主加载); 文档页宿主的树模式 pane
+ * 同样注入 .cb-dir-mini, 故样式必须进所有宿主都加载的 doc.css. */
+.cb-dir-mini {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.cb-dir-mini li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.3rem 0;
+  border-bottom: 1px solid var(--cb-border);
+}
+.cb-dir-mini .cb-dir-size {
+  color: var(--cb-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* 树模式外壳几何体宿主无关: 文档页宿主的 .cb-doc-page 栏宽/边距让位给
+ * pane 布局 (目录页宿主无 .cb-doc-page, 本规则不命中) */
+body.cb-tree-mode.cb-doc-page {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  background-color: transparent;
+}
