@@ -23,3 +23,7 @@
 ## Comments
 
 2026-08-25 implementation committed (JS shell + CSS); server contracts locked by cargo tests (207 green), JS syntax checked. PENDING: Seam B Chromium acceptance evidence — DOM-injection fixtures, no-JS fallback, mode persistence, keyboard, deep-link highlight, native-open POST absence. Browser tool was unavailable this session; to be produced in the verification pass.
+
+## Comments (2026-08-25 acceptance)
+
+Seam B Chromium acceptance PASS 11/11 (headless Chromium via CDP; screenshots /tmp/cb05-shots/): toggle presence/absence (dir+doc yes, search no), mode persistence + reload restore, dirs-first root order with badges, lazy load on expand (single GET /__/tree/subdir), cycle node loop unexpandable (no twist, zero fetches), Enter/dblclick full-page navigation, deep-link highlight with ancestor expansion + cb-tree-expanded persistence, hostile filename `<img src=x onerror=alert(1)>.md` rendered as escaped text (zero injected elements, no alert), native-open fully gated in tree mode (token meta absent, zero /__/native-open POSTs, directory-mode contract intact after toggle back), no-JS server-side listing intact, full keyboard matrix (↑↓→←/Enter/Backspace/Esc//). Ticket 05 complete.
