@@ -474,9 +474,11 @@ async fn serve_path(
 
 /// 树模式 JSON 端点: `GET /__/tree` (根) 与 `GET /__/tree/{*path}` (Option 提取器,
 /// 与 serve_path 同模式). 请求路径逐分量复用 resolve_within_root (与文件服务同一
-/// 防线); 越界 403, 不存在/非目录 404 (小 JSON 错误体). 子项固定排序: 目录在前,
-/// 组内名字升序. 目录携带 expandable: 非 UTF-8 (href None) 或 identity 与任一祖先
-/// 相同 (符号链接环) 时为 false — 树内联展开终止, 但条目仍显示、仍可按 URL 导航.
+/// 防线); 越界 403, 不存在/非目录 404 (小 JSON 错误体). 全部文件系统活
+/// (metadata/read_dir/identity) 在单个 spawn_blocking job 内执行, 不阻塞 Tokio
+/// worker. 子项固定排序: 目录在前, 组内名字升序. 目录携带 expandable: 非 UTF-8
+/// (href None) 或 identity 与任一祖先相同 (符号链接环) 时为 false — 树内联展开
+/// 终止, 但条目仍显示、仍可按 URL 导航.
 async fn serve_tree(State(state): State<AppState>, path: Option<AxumPath<String>>) -> Response {
     let decoded = path.map(|p| p.0).unwrap_or_default();
     let Some(fs_path) = resolve_within_root(&state.root, &decoded) else {
@@ -488,28 +490,39 @@ async fn serve_tree(State(state): State<AppState>, path: Option<AxumPath<String>
         )
             .into_response();
     };
-    let Ok(meta) = std::fs::metadata(&fs_path) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(TreeError { error: "not found" }),
-        )
-            .into_response();
+    let root = state.root.clone();
+    match tokio::task::spawn_blocking(move || build_tree_entries(&root, &fs_path)).await {
+        Ok(Ok(entries)) => Json(TreeResponse { entries }).into_response(),
+        Ok(Err(reason)) => {
+            (StatusCode::NOT_FOUND, Json(TreeError { error: reason })).into_response()
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "tree endpoint: blocking task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(TreeError {
+                    error: "internal error",
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// 树列表的同步核心 (在 spawn_blocking 内执行): metadata 判定、祖先 identity
+/// 集合与环检测、子项收集与排序. Err 为 404 理由文案 ("not found" / "not a
+/// directory"). 任一祖先 identity 不可得 (非 Unix canonicalize 失败) 时 complete
+/// 置 false — 此后所有子目录一律终止展开, fail-closed, 绝不拿不完整集合做环判定.
+fn build_tree_entries(root: &Path, fs_path: &Path) -> Result<Vec<TreeEntry>, &'static str> {
+    let Ok(meta) = std::fs::metadata(fs_path) else {
+        return Err("not found");
     };
     if !meta.is_dir() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(TreeError {
-                error: "not a directory",
-            }),
-        )
-            .into_response();
+        return Err("not a directory");
     }
-    // 祖先 identity 集合: 根 + 请求路径每一级 (跟随符号链接后的 identity).
-    // 任一祖先 identity 不可得 (非 Unix canonicalize 失败) 时 complete 置 false —
-    // 此后所有子目录一律终止展开, fail-closed, 绝不拿不完整集合做环判定.
     let mut ancestors: HashSet<listing::DirIdentity> = HashSet::new();
     let mut complete = true;
-    let mut cursor = state.root.clone();
+    let mut cursor = root.to_path_buf();
     match std::fs::metadata(&cursor) {
         Ok(root_meta) => match listing::dir_identity(&cursor, &root_meta) {
             Some(id) => {
@@ -519,7 +532,7 @@ async fn serve_tree(State(state): State<AppState>, path: Option<AxumPath<String>
         },
         Err(_) => complete = false,
     }
-    let rel = fs_path.strip_prefix(&state.root).unwrap_or(Path::new(""));
+    let rel = fs_path.strip_prefix(root).unwrap_or(Path::new(""));
     for comp in rel.components() {
         let Component::Normal(segment) = comp else {
             continue;
@@ -535,18 +548,18 @@ async fn serve_tree(State(state): State<AppState>, path: Option<AxumPath<String>
             Err(_) => complete = false,
         }
     }
-    let mut files = listing::list_dir(&fs_path, &state.root, SortBy::default());
+    let mut files = listing::list_dir(fs_path, root, SortBy::default());
     files.sort_by(|a, b| {
         b.is_directory
             .cmp(&a.is_directory)
             .then_with(|| a.display_name.cmp(&b.display_name))
     });
-    let entries = files
+    Ok(files
         .into_iter()
         .map(|f| {
             let href = f.href();
             let expandable = if f.is_directory {
-                let child = state.root.join(&f.relative_to_root);
+                let child = root.join(&f.relative_to_root);
                 let not_cyclic = match std::fs::metadata(&child) {
                     Ok(m) => {
                         listing::dir_identity(&child, &m).is_some_and(|id| !ancestors.contains(&id))
@@ -565,8 +578,7 @@ async fn serve_tree(State(state): State<AppState>, path: Option<AxumPath<String>
                 expandable,
             }
         })
-        .collect();
-    Json(TreeResponse { entries }).into_response()
+        .collect())
 }
 
 /// 树端点 JSON 条目: name 为显示 codec 纯文本; href 为 root-relative RFC 3986
