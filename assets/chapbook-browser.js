@@ -408,8 +408,11 @@
       });
   }
 
+
   function handleAction(event, btn) {
     const action = btn.getAttribute('data-cb-action');
+    // 树模式无 native-open (Q17): native action 一律 no-op
+    if (action === 'native' && treeMode) return;
     if (action === 'close') {
       event.preventDefault();
       closePanel();
@@ -421,7 +424,6 @@
       : btn.closest(PANEL_SELECTOR)
         ? panelTarget
         : null;
-    if (target === null) return; // 非 actionable: no-op
     event.preventDefault();
     if (action === 'preview') {
       openPreview(target);
@@ -440,6 +442,16 @@
     const actionBtn = event.target.closest(ACTION_SELECTOR);
     if (actionBtn) {
       handleAction(event, actionBtn);
+      return;
+    }
+    // 树节点: 单击选中; 目录同时展开/收起 (不导航)
+    const treeRow = event.target.closest('.cb-tree-row');
+    if (treeRow) {
+      const li = treeRow.closest('li.cb-tree-node');
+      if (li) {
+        selectTreeNode(li);
+        if (isDirNode(li)) toggleTreeNode(li);
+      }
       return;
     }
     // 面板内目录迷你列表: 拦截可操作 anchor 做面板内下钻
@@ -466,6 +478,13 @@
         'a, button, input, select, textarea, [data-cb-action]'
       )
     ) {
+      return;
+    }
+    // 树节点双击: 整页导航 (与 Enter 一致)
+    const treeRow = event.target.closest('.cb-tree-row');
+    if (treeRow) {
+      const li = treeRow.closest('li.cb-tree-node');
+      if (li) navigateTreeNode(li);
       return;
     }
     const entry = event.target.closest(ENTRY_SELECTOR);
@@ -499,7 +518,10 @@
 
   function onKeydown(event) {
     if (event.ctrlKey || event.metaKey || event.altKey) return;
-    // P2#2: Escape 先于通用 editable-target 守卫处理 — 聚焦在搜索框时先失焦,
+    if (treeMode) {
+      onTreeKeydown(event);
+      return;
+    }
     // 面板打开时关闭; handled 时在返回前恰好一次 preventDefault, 未处理不取消;
     // 其余快捷键在可编辑元素内仍被忽略。
     if (event.key === 'Escape') {
@@ -573,11 +595,497 @@
     }
   }
 
+  /* ---------- 树模式 (编辑器式浏览外壳) ---------- */
+
+  // 模式/树状态持久化键. 默认目录模式 (无键即目录模式).
+  const MODE_KEY = 'cb-mode';
+  const TREE_EXPANDED_KEY = 'cb-tree-expanded';
+  const TREE_SELECTED_KEY = 'cb-tree-selected';
+
+  let treeMode = false;
+  let treeNav = null; // nav.cb-tree 外壳
+  let treeRootUl = null; // 根 <ul>
+  // 已加载子项缓存: encoded dir path (无前导斜杠) -> 子节点 <li> 数组
+  const treeCache = new Map();
+  let treeSelectedEl = null;
+  let treeSelectedPath = null; // 选中条目的 encoded path (无前导斜杠) 或 null
+
+  function loadJsonArray(key, fallback) {
+    try {
+      const value = JSON.parse(localStorage.getItem(key) || 'null');
+      return Array.isArray(value) ? value : fallback;
+    } catch (err) {
+      return fallback;
+    }
+  }
+
+  function saveJsonArray(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (err) {
+      /* 隐私模式等场景忽略持久化失败 */
+    }
+  }
+
+  let treeExpandedPaths = loadJsonArray(TREE_EXPANDED_KEY, []);
+
+  // 搜索页 (page_shell 带 data-cb-parent) 不挂树壳、无切换按钮.
+  function isSearchPage() {
+    return !!document.querySelector('main[data-cb-parent]');
+  }
+
+  // 可挂树壳的完整页: 目录页 (.cb-browser-page 且非搜索页) 与文档/代码/Office 页.
+  function isTreeCapablePage() {
+    return (
+      !!document.querySelector('.cb-doc-page') ||
+      (!!document.querySelector('.cb-browser-page') && !isSearchPage())
+    );
+  }
+
+  function treePathFromHref(href) {
+    // '/a%20b/c.md' -> 'a%20b/c.md'; 必须过合法 encodedPath 校验 (fail-closed)
+    if (typeof href !== 'string' || href[0] !== '/') return null;
+    const rel = href.slice(1);
+    return isValidEncodedPath(rel) ? rel : null;
+  }
+
+  function currentPathFromLocation() {
+    const pathname = location.pathname;
+    if (pathname === '/') return '';
+    return isValidEncodedPath(pathname.slice(1)) ? pathname.slice(1) : null;
+  }
+
+  function treeSearchForm() {
+    const form = document.createElement('form');
+    form.className = 'cb-tree-search';
+    form.action = '/__/search';
+    form.method = 'get';
+    form.setAttribute('role', 'search');
+    const input = document.createElement('input');
+    input.type = 'search';
+    input.name = 'q';
+    input.id = 'cb-tree-search-q';
+    input.placeholder = '搜索文件';
+    input.setAttribute('aria-label', '搜索文件');
+    input.autocomplete = 'off';
+    form.append(input);
+    return form;
+  }
+
+  // JSON -> DOM 节点: 文件名只经 createElement + textContent (外层 bdi),
+  // 绝不插值进 innerHTML/HTML 模板. href 过合法 encodedPath 校验后进 dataset.
+  function buildTreeNode(entry) {
+    const li = document.createElement('li');
+    li.className = 'cb-tree-node';
+    const name = typeof entry.name === 'string' ? entry.name : '';
+    const isDir = entry.dir === true;
+    const href = typeof entry.href === 'string' ? entry.href : null;
+    const relPath = treePathFromHref(href);
+    // 可展开 = 目录 && 服务端 expandable && 有合法 href (环/非 UTF-8 目录恒不可展开)
+    const expandable = isDir && entry.expandable === true && relPath !== null;
+    li.dataset.treeDir = isDir ? '1' : '0';
+    li.dataset.treeExpandable = expandable ? '1' : '0';
+    if (relPath !== null) {
+      li.dataset.treePath = relPath;
+    }
+
+    const row = document.createElement('div');
+    row.className = 'cb-tree-row';
+
+    const twist = document.createElement('span');
+    twist.className = 'cb-tree-twist';
+    if (expandable) twist.textContent = '▸';
+    row.append(twist);
+
+    const icon = document.createElement('span');
+    icon.className = 'cb-tree-icon';
+    icon.textContent = isDir ? '📁' : '📄';
+    row.append(icon);
+
+    if (!isDir) {
+      const badge = document.createElement('span');
+      badge.className = 'cb-tree-badge';
+      const dot = name.lastIndexOf('.');
+      const ext = dot > 0 ? name.slice(dot + 1) : '';
+      badge.textContent = ext ? ext.slice(0, 5).toUpperCase() : 'FILE';
+      row.append(badge);
+    }
+
+    const bdi = document.createElement('bdi');
+    bdi.dir = 'auto';
+    bdi.textContent = name;
+    row.append(bdi);
+
+    li.append(row);
+    return li;
+  }
+
+  function childrenUlFor(li) {
+    let ul = li.querySelector(':scope > ul.cb-tree-children');
+    if (!ul) {
+      ul = document.createElement('ul');
+      ul.className = 'cb-tree-children';
+      li.append(ul);
+    }
+    return ul;
+  }
+
+  function isDirNode(li) {
+    return li.dataset.treeDir === '1';
+  }
+
+  function isExpandableDir(li) {
+    return li.dataset.treeDir === '1' && li.dataset.treeExpandable === '1';
+  }
+
+  function nodePath(li) {
+    const value = li.dataset.treePath;
+    if (value === undefined || !isValidEncodedPath(value)) return null;
+    return value;
+  }
+
+  function nodeHref(li) {
+    const path = nodePath(li);
+    return path === null ? null : actionUrl(path, 'full');
+  }
+
+  function setTwist(li, expanded) {
+    const twist = li.querySelector(':scope > .cb-tree-row .cb-tree-twist');
+    if (twist) twist.textContent = expanded ? '▾' : '▸';
+  }
+
+  function setTreeNodeExpanded(li, expanded) {
+    const ul = li.querySelector(':scope > ul.cb-tree-children');
+    if (ul) ul.hidden = !expanded;
+    if (isExpandableDir(li)) setTwist(li, expanded);
+    const path = nodePath(li);
+    if (path === null) return;
+    const idx = treeExpandedPaths.indexOf(path);
+    if (expanded && idx < 0) {
+      treeExpandedPaths.push(path);
+    } else if (!expanded && idx >= 0) {
+      treeExpandedPaths.splice(idx, 1);
+    }
+    saveJsonArray(TREE_EXPANDED_KEY, treeExpandedPaths);
+  }
+
+  // 拉取目录子项 JSON: path 为空串时命中显式根路由 /__/tree (绝不拼尾斜杠).
+  function fetchTreeEntries(path) {
+    const url = path === '' ? '/__/tree' : '/__/tree/' + path;
+    return fetch(url, { headers: { Accept: 'application/json' } })
+      .then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function (data) {
+        return data && Array.isArray(data.entries) ? data.entries : [];
+      });
+  }
+
+  // 懒加载目录子项; 失败静默 (网络/服务端错误不留半展开态).
+  function loadTreeChildren(li, path) {
+    if (treeCache.has(path)) {
+      const ul = childrenUlFor(li);
+      ul.replaceChildren(...treeCache.get(path));
+      setTreeNodeExpanded(li, true);
+      return Promise.resolve();
+    }
+    return fetchTreeEntries(path)
+      .then(function (entries) {
+        const nodes = entries.map(buildTreeNode);
+        treeCache.set(path, nodes);
+        const ul = childrenUlFor(li);
+        ul.replaceChildren(...nodes);
+        setTreeNodeExpanded(li, true);
+      })
+      .catch(function () {
+        /* 加载失败: 不标记展开, 下次点击重试 */
+      });
+  }
+
+  function toggleTreeNode(li) {
+    if (!isExpandableDir(li)) return;
+    const ul = li.querySelector(':scope > ul.cb-tree-children');
+    const expanded = !!ul && !ul.hidden;
+    if (expanded) {
+      setTreeNodeExpanded(li, false);
+      return;
+    }
+    const path = nodePath(li);
+    if (path === null) return;
+    loadTreeChildren(li, path);
+  }
+
+  function selectTreeNode(li) {
+    if (treeSelectedEl) treeSelectedEl.classList.remove('cb-selected');
+    treeSelectedEl = li;
+    li.classList.add('cb-selected');
+    treeSelectedPath = nodePath(li);
+    try {
+      if (treeSelectedPath === null) {
+        localStorage.removeItem(TREE_SELECTED_KEY);
+      } else {
+        localStorage.setItem(TREE_SELECTED_KEY, treeSelectedPath);
+      }
+    } catch (err) {
+      /* 持久化失败忽略 */
+    }
+  }
+
+  function clearTreeSelection() {
+    if (treeSelectedEl) treeSelectedEl.classList.remove('cb-selected');
+    treeSelectedEl = null;
+    treeSelectedPath = null;
+  }
+
+  function visibleTreeNodes() {
+    const result = [];
+    function walk(ul) {
+      $$(':scope > li', ul).forEach(function (li) {
+        result.push(li);
+        const children = li.querySelector(':scope > ul.cb-tree-children');
+        if (children && !children.hidden) walk(children);
+      });
+    }
+    if (treeRootUl) walk(treeRootUl);
+    return result;
+  }
+
+  function moveTreeSelection(delta) {
+    const nodes = visibleTreeNodes();
+    if (nodes.length === 0) return;
+    const idx = nodes.indexOf(treeSelectedEl);
+    const base = idx < 0 ? (delta > 0 ? -1 : 0) : idx;
+    const next = Math.max(0, Math.min(base + delta, nodes.length - 1));
+    selectTreeNode(nodes[next]);
+    nodes[next].scrollIntoView({ block: 'nearest' });
+  }
+
+  function navigateTreeNode(li) {
+    const url = nodeHref(li);
+    if (url !== null) location.href = url.href;
+  }
+
+  // 展开并定位当前 URL 路径: 逐段匹配节点 (按 href, 不分目录/文件), 匹配即标
+  // current; 可展开目录继续下钻, 环/非 UTF-8 目录或文件处终止.
+  function revealPath(segments) {
+    let parentUl = treeRootUl;
+    let promise = Promise.resolve();
+    segments.forEach(function (seg, i) {
+      const href = '/' + segments.slice(0, i + 1).join('/');
+      promise = promise.then(function () {
+        if (!parentUl) return;
+        const node = $$(':scope > li', parentUl).find(function (li) {
+          return nodeHref(li) !== null && nodeHref(li).pathname === href;
+        });
+        if (!node) {
+          parentUl = null;
+          return;
+        }
+        node.classList.add('cb-current');
+        if (isExpandableDir(node)) {
+          const path = nodePath(node);
+          if (path === null) {
+            parentUl = null;
+            return;
+          }
+          return loadTreeChildren(node, path).then(function () {
+            parentUl = node.querySelector(':scope > ul.cb-tree-children');
+          });
+        }
+        parentUl = null;
+      });
+    });
+    return promise;
+  }
+
+  function buildTreeShell() {
+    treeNav = document.createElement('nav');
+    treeNav.className = 'cb-tree';
+    treeNav.setAttribute('aria-label', '目录树');
+    treeNav.append(treeSearchForm());
+    treeRootUl = document.createElement('ul');
+    treeRootUl.className = 'cb-tree-root';
+    treeNav.append(treeRootUl);
+    document.body.prepend(treeNav);
+    return fetchTreeEntries('').then(function (entries) {
+      const nodes = entries.map(buildTreeNode);
+      treeCache.set('', nodes);
+      treeRootUl.replaceChildren(...nodes);
+    });
+  }
+
+  function restoreTreeSelection() {
+    let saved = null;
+    try {
+      saved = localStorage.getItem(TREE_SELECTED_KEY);
+    } catch (err) {
+      return;
+    }
+    if (saved === null || !isValidEncodedPath(saved)) return;
+    const nodes = visibleTreeNodes();
+    const node = nodes.find(function (li) {
+      return nodePath(li) === saved;
+    });
+    if (node) selectTreeNode(node);
+  }
+
+  function enterTreeMode() {
+    document.body.classList.add('cb-tree-mode');
+    // 树模式无 native-open (Q17/advisory): token meta 移除, native 路径全部 no-op.
+    const tokenMeta = document.querySelector('meta[name="cb-native-open-token"]');
+    if (tokenMeta) tokenMeta.remove();
+    buildTreeShell().then(function () {
+      const current = currentPathFromLocation();
+      if (current !== null) {
+        revealPath(current === '' ? [] : current.split('/'));
+      }
+      const persisted = treeExpandedPaths.filter(isValidEncodedPath);
+      persisted.forEach(function (path) {
+        // 逐段展开持久化的目录 (懒加载; 失败静默)
+        const segments = path.split('/');
+        const href = '/' + path;
+        (function walk(ul, segs) {
+          if (!ul || segs.length === 0) return;
+          const stepHref = '/' + segs.join('/');
+          const node = $$(':scope > li', ul).find(function (li) {
+            return (
+              isExpandableDir(li) &&
+              nodeHref(li) !== null &&
+              nodeHref(li).pathname === stepHref
+            );
+          });
+          if (!node) return;
+          const nodePathV = nodePath(node);
+          if (nodePathV === null) return;
+          loadTreeChildren(node, nodePathV).then(function () {
+            walk(node.querySelector(':scope > ul.cb-tree-children'), segs.slice(0, -1));
+          });
+        })(treeRootUl, segments);
+      });
+      restoreTreeSelection();
+    });
+  }
+
+  function exitTreeMode() {
+    document.body.classList.remove('cb-tree-mode');
+    if (treeNav) treeNav.remove();
+    treeNav = null;
+    treeRootUl = null;
+    treeCache.clear();
+    clearTreeSelection();
+  }
+
+  function applyTreeMode() {
+    const btn = $('.cb-mode-toggle');
+    if (btn) {
+      btn.textContent = treeMode ? '目录' : '树';
+      btn.setAttribute('aria-pressed', treeMode ? 'true' : 'false');
+      btn.title = treeMode ? '切换到目录模式' : '切换到树模式';
+    }
+    if (treeMode) {
+      enterTreeMode();
+    } else {
+      exitTreeMode();
+    }
+  }
+
+  function injectModeToggle() {
+    if (!isTreeCapablePage() || $('.cb-mode-toggle')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'cb-mode-toggle';
+    btn.addEventListener('click', function () {
+      treeMode = !treeMode;
+      try {
+        if (treeMode) {
+          localStorage.setItem(MODE_KEY, 'tree');
+        } else {
+          localStorage.removeItem(MODE_KEY);
+        }
+      } catch (err) {
+        /* 持久化失败忽略 */
+      }
+      applyTreeMode();
+    });
+    document.body.append(btn);
+  }
+
+  function onTreeKeydown(event) {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (isEditableTarget(event.target)) return;
+    switch (event.key) {
+      case 'ArrowDown':
+        moveTreeSelection(1);
+        event.preventDefault();
+        break;
+      case 'ArrowUp':
+        moveTreeSelection(-1);
+        event.preventDefault();
+        break;
+      case 'ArrowRight':
+        if (treeSelectedEl && isDirNode(treeSelectedEl)) {
+          toggleTreeNode(treeSelectedEl);
+          event.preventDefault();
+        }
+        break;
+      case 'ArrowLeft': {
+        if (treeSelectedEl) {
+          const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
+          if (isDirNode(treeSelectedEl) && ul && !ul.hidden) {
+            setTreeNodeExpanded(treeSelectedEl, false);
+          } else {
+            const row = treeSelectedEl.closest('ul');
+            const parentLi = row ? row.closest('li') : null;
+            if (parentLi) selectTreeNode(parentLi);
+          }
+          event.preventDefault();
+        }
+        break;
+      }
+      case 'Enter':
+        if (treeSelectedEl) {
+          navigateTreeNode(treeSelectedEl);
+          event.preventDefault();
+        }
+        break;
+      case 'Backspace': {
+        const current = currentPathFromLocation();
+        if (current !== null && current !== '') {
+          const segments = current.split('/');
+          const parent = segments.slice(0, -1).join('/');
+          location.href = '/' + parent;
+        }
+        event.preventDefault();
+        break;
+      }
+      case '/': {
+        const input = $('#cb-tree-search-q');
+        if (input) input.focus();
+        event.preventDefault();
+        break;
+      }
+      case 'Escape':
+        clearTreeSelection();
+        event.preventDefault();
+        break;
+      default:
+        break;
+    }
+  }
+
   function init() {
     const tokenMeta = document.querySelector(
       'meta[name="cb-native-open-token"]'
     );
     nativeToken = tokenMeta ? tokenMeta.getAttribute('content') : null;
+    injectModeToggle();
+    try {
+      treeMode = localStorage.getItem(MODE_KEY) === 'tree';
+    } catch (err) {
+      treeMode = false;
+    }
+    applyTreeMode();
     applyView();
     setActionsEnabled(false); // 初始无 panel target
     document.addEventListener('click', onDocumentClick);

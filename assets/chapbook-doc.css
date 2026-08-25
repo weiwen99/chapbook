@@ -170,3 +170,116 @@ html:has(> body.cb-doc-page) {
     font-size: 0.9em;
   }
 }
+
+/* ---------- 树模式外壳 (chapbook-browser.js) ---------- */
+
+/* 浮动模式切换按钮: 两种模式、所有可挂树壳页面统一位置 */
+.cb-mode-toggle {
+  position: fixed;
+  top: 0.75rem;
+  right: 0.75rem;
+  z-index: 30;
+  padding: 0.35em 0.8em;
+  font-size: 0.85em;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.4em;
+  background: var(--cb-soft-bg);
+  color: var(--cb-text);
+  cursor: pointer;
+}
+.cb-mode-toggle:hover {
+  border-color: var(--cb-accent);
+  color: var(--cb-accent);
+}
+
+/* 树模式布局: 左树右内容, 各自独立滚动 */
+body.cb-tree-mode {
+  display: grid;
+  grid-template-columns: 17rem minmax(0, 1fr);
+  height: 100vh;
+  overflow: hidden;
+}
+body.cb-tree-mode > *:not(.cb-tree):not(.cb-mode-toggle) {
+  grid-column: 2;
+  min-width: 0;
+}
+body.cb-tree-mode .cb-tree {
+  grid-column: 1;
+  grid-row: 1 / -1;
+  overflow-y: auto;
+  border-right: 1px solid var(--cb-border);
+  background: var(--cb-soft-bg);
+  font-size: 0.85em;
+  padding: 0.4rem 0.25rem;
+}
+/* 树模式下目录模式的顶栏/面包屑/预览面板隐藏 (树自身提供搜索与定位) */
+body.cb-tree-mode .cb-topbar,
+body.cb-tree-mode .cb-breadcrumb,
+body.cb-tree-mode #cb-preview {
+  display: none;
+}
+body.cb-tree-mode main.cb-main,
+body.cb-tree-mode .cb-doc {
+  overflow-y: auto;
+}
+
+.cb-tree ul {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 1.1em;
+}
+.cb-tree-root {
+  padding-left: 0.25em;
+}
+.cb-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.16em 0.4em;
+  border-radius: 0.3em;
+  cursor: pointer;
+}
+.cb-tree-row:hover {
+  background: var(--cb-border);
+}
+.cb-tree-node.cb-selected > .cb-tree-row {
+  background: var(--cb-accent);
+  color: var(--cb-bg);
+}
+.cb-tree-node.cb-current > .cb-tree-row {
+  font-weight: bold;
+}
+.cb-tree-twist {
+  flex: none;
+  width: 1em;
+  text-align: center;
+  font-size: 0.8em;
+}
+.cb-tree-icon {
+  flex: none;
+}
+.cb-tree-badge {
+  flex: none;
+  font-size: 0.68em;
+  padding: 0 0.35em;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.3em;
+  color: var(--cb-muted);
+}
+.cb-tree-node bdi {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cb-tree-search {
+  padding: 0 0.4em 0.6em;
+}
+.cb-tree-search input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.35em 0.5em;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.3em;
+  background: var(--cb-bg);
+  color: var(--cb-text);
+}
