@@ -458,6 +458,7 @@
       if (li) {
         selectTreeNode(li);
         if (isDirNode(li)) toggleTreeNode(li);
+        closeTreeDrawer(); // 窄屏抽屉: 选择条目后收起 (宽屏 no-op)
       }
       return;
     }
@@ -623,6 +624,12 @@
   let treeSelectedEl = null;
   // 树壳生命周期 generation: 退出树模式递增使全部在途响应失效 (镜像 previewGuard)
   let treeGen = 0;
+  // 窄屏抽屉 (<64rem, off-canvas transform + 遮罩): 随树壳创建/销毁.
+  // 开合态挂 body.cb-drawer-open (宽屏无对应 CSS, 恒 no-op).
+  let treeScrim = null; // 遮罩: 点击收起抽屉
+  let treeOpenBtn = null; // 唤起按钮 (仅窄屏可见)
+  let drawerMql = null; // 窄屏 media query (跨回宽屏时清理打开态)
+  let drawerMqlHandler = null;
   function loadJsonArray(key, fallback) {
     try {
       const value = JSON.parse(localStorage.getItem(key) || 'null');
@@ -969,17 +976,81 @@
     treeNav = document.createElement('nav');
     treeNav.className = 'cb-tree';
     treeNav.setAttribute('aria-label', '目录树');
+    treeNav.tabIndex = -1; // 窄屏抽屉打开时程序化聚焦 (非 tab 序)
     treeNav.append(treeSearchForm());
     treeRootUl = document.createElement('ul');
     treeRootUl.className = 'cb-tree-root';
     treeNav.append(treeRootUl);
     document.body.prepend(treeNav);
+    // 窄屏抽屉配套: 遮罩 + 唤起按钮 (宽屏 display:none, 无行为).
+    // 遮罩点击收起; 按钮点击唤起 — 都走独立监听, 不干扰目录模式全局 handler.
+    treeScrim = document.createElement('div');
+    treeScrim.className = 'cb-tree-scrim';
+    treeScrim.setAttribute('aria-hidden', 'true');
+    treeScrim.addEventListener('click', closeTreeDrawer);
+    document.body.append(treeScrim);
+    treeOpenBtn = document.createElement('button');
+    treeOpenBtn.type = 'button';
+    treeOpenBtn.className = 'cb-tree-open';
+    treeOpenBtn.setAttribute('aria-label', '打开目录树');
+    treeOpenBtn.title = '打开目录树';
+    treeOpenBtn.textContent = '☰ 目录';
+    treeOpenBtn.addEventListener('click', openTreeDrawer);
+    document.body.append(treeOpenBtn);
+    installDrawerMql();
     return fetchTreeEntries('').then(function (entries) {
       if (gen !== treeGen) return;
       const nodes = entries.map(buildTreeNode);
       treeCache.set('', nodes);
       treeRootUl.replaceChildren(...nodes);
     });
+  }
+
+  /* ---------- 窄屏抽屉 (<64rem): off-canvas transform + 遮罩; 宽屏恒 no-op ---------- */
+
+  function openTreeDrawer() {
+    document.body.classList.add('cb-drawer-open');
+    // 焦点移入抽屉 (nav 非 tab 序, 仅程序化聚焦), 键盘导航立即可用
+    if (treeNav) {
+      try {
+        treeNav.focus({ preventScroll: true });
+      } catch (err) {
+        /* 老环境不支持 focus options: 忽略 */
+      }
+    }
+  }
+
+  function closeTreeDrawer() {
+    document.body.classList.remove('cb-drawer-open');
+    // 收起后焦点若仍在抽屉内则归还 body, 键盘输入不落在隐藏区域
+    if (treeNav && treeNav.contains(document.activeElement)) {
+      document.activeElement.blur();
+    }
+  }
+
+  // 窄屏 media query 监听: 跨回宽屏时清理打开态, 防止再次收窄时抽屉残留打开
+  function installDrawerMql() {
+    drawerMql = window.matchMedia('(max-width: 63.99rem)');
+    drawerMqlHandler = function (e) {
+      if (!e.matches) closeTreeDrawer();
+    };
+    if (drawerMql.addEventListener) {
+      drawerMql.addEventListener('change', drawerMqlHandler);
+    } else if (drawerMql.addListener) {
+      drawerMql.addListener(drawerMqlHandler);
+    }
+  }
+
+  function uninstallDrawerMql() {
+    if (drawerMql && drawerMqlHandler) {
+      if (drawerMql.removeEventListener) {
+        drawerMql.removeEventListener('change', drawerMqlHandler);
+      } else if (drawerMql.removeListener) {
+        drawerMql.removeListener(drawerMqlHandler);
+      }
+    }
+    drawerMql = null;
+    drawerMqlHandler = null;
   }
 
   /* ---------- SPA 内容区导航 (树模式) ---------- */
@@ -991,8 +1062,8 @@
   let pane = null;
   let paneAbort = null; // 在途 fragment fetch 的 AbortController
   let paneCommittedPath = null; // 最近一次提交的 encoded path (hash 导航防重取)
+  let paneInitialGen = null; // 初始加载导航的 generation (启动链守卫用)
   // 单一活跃导航不变量: 单调 nav id (generation 守卫) — 仅当 id 最新且
-  // location.pathname 等于导航 canonical URL 时提交 DOM/history/树状态.
   const paneNavGuard = createGenerationGuard();
   // pane 生命周期 registry: SPA 替换/退出树模式时统一拆除. ticket 08 的 TOC
   // observer 经 registerPaneDisposable 注册, 替换时自动 disconnect, 高亮不串台.
@@ -1071,9 +1142,9 @@
   // -> 提交 (teardown 旧 pane 状态, 安装新内容, pushState, 树状态同步).
   // 失败 fail-closed: 保留 pane 内容, 不 pushState (URL 不变), 文本错误.
   function paneNavigate(encodedPath, opts) {
-    if (!isValidEncodedPath(encodedPath) || !pane) return false;
+    if (!isValidEncodedPath(encodedPath) || !pane) return null;
     const url = actionUrl(encodedPath, 'full');
-    if (url === null) return false;
+    if (url === null) return null;
     const selectTree = !opts || opts.select !== false;
     const gen = paneNavGuard.begin(); // 新导航作废所有在途导航
     if (paneAbort) paneAbort.abort();
@@ -1090,30 +1161,38 @@
       })
       .then(function (html) {
         if (html === null || !paneNavGuard.isCurrent(gen)) return;
-        commitPane(html, url, encodedPath, gen, selectTree);
+        commitPane(html, url, encodedPath, gen, selectTree, !!(opts && opts.pop));
       })
       .catch(function (err) {
         if (!paneNavGuard.isCurrent(gen)) return; // 过期错误: 丢弃
         if (err && err.name === 'AbortError') return; // 被新导航中止: 不报错
         if (opts && opts.pop) {
-          // popstate: URL 已被浏览器改走, 旧内容与新 URL 不一致 — 清空 pane
+          // popstate: URL 已被浏览器改走, 旧内容与新 URL 不一致 — 统一 teardown
+          // 后清空 pane (observer 断开 + 媒体暂停移除), 不绕过生命周期.
+          teardownPane();
           pane.replaceChildren();
         }
         paneShowError(
           '无法加载：' + (err && err.message ? err.message : String(err))
         );
       });
+    return gen;
   }
 
   // 提交守卫: id 最新 && wrapper identity 匹配 (fail-closed) && pushState 后
   // location.pathname 等于导航 canonical URL — 三者满足才动 DOM/history/树.
-  function commitPane(html, url, encodedPath, gen, selectTree) {
+  function commitPane(html, url, encodedPath, gen, selectTree, isPop) {
     if (!paneNavGuard.isCurrent(gen)) return;
     const host = document.createElement('div');
     host.innerHTML = html; // 服务端 fragment (与预览面板同一信任契约)
-    const wrapper = host.firstElementChild;
+    const wrapper = findFragmentWrapper(host);
     if (!wrapper || wrapper.dataset.nativePathEncoded !== encodedPath) {
-      // fail-closed: wrapper 缺失或 identity 与目标不符 — 不推 URL, 保留 pane
+      // fail-closed: wrapper 缺失或 identity 与目标不符 — 不推 URL
+      if (isPop) {
+        // popstate: URL 已被浏览器改走 — 统一 teardown 后清空, 内容不残留
+        teardownPane();
+        pane.replaceChildren();
+      }
       paneShowError('无法加载：响应内容与目标不符');
       return;
     }
@@ -1131,6 +1210,7 @@
     pane.scrollTop = 0;
     paneCommittedPath = encodedPath;
     syncTreeToPath(gen, selectTree);
+    closeTreeDrawer(); // 导航提交成功: 窄屏抽屉收起 (宽屏 no-op)
   }
 
   function clearTreeCurrent() {
@@ -1172,9 +1252,8 @@
       // 目录深链尾斜杠等形态差异: replaceState 规范化 (不新增历史条目)
       history.replaceState(null, '', canonical.href);
     }
-    paneNavigate(encoded, { select: false });
+    paneInitialGen = paneNavigate(encoded, { select: false });
   }
-
   // back/forward (popstate): URL 已由浏览器同步, 直接按当前 location 导航;
   // 与最近提交路径相同 (hash 导航等) 不重取.
   function onPopState() {
@@ -1192,7 +1271,8 @@
   }
 
   function enterTreeMode() {
-    treeGen += 1; // 新壳 generation: 使退出/重进前的在途响应失效
+    treeGen += 1; // 新壳 generation: 使退出/重进前的在途响应失效 (镜像 previewGuard)
+    closeTreeDrawer(); // 新壳抽屉默认收起 (宽屏 no-op)
     document.body.classList.add('cb-tree-mode');
     // 目录模式预览面板在树模式不存在: 关闭并作废在途预览 (媒体/迟到响应不得残留)
     closePanel();
@@ -1205,7 +1285,10 @@
     buildTreeShell().then(function () {
       const current = currentPathFromLocation();
       const reveal = current !== null
-        ? revealPath(current === '' ? [] : current.split('/'))
+        ? revealPath(
+            current === '' ? [] : current.split('/'),
+            paneInitialGen
+          )
         : Promise.resolve();
       return reveal.then(function () {
       // 先完成当前路径展开与持久化展开 (异步逐级加载), 再恢复选中 — 否则
@@ -1241,7 +1324,10 @@
         return Promise.all(walks);
       });
     }).then(function () {
-      restoreTreeSelection();
+      // 启动链的选中恢复只属于初始导航 generation: 用户已导航走则不覆盖
+      if (paneInitialGen === null || paneNavGuard.isCurrent(paneInitialGen)) {
+        restoreTreeSelection();
+      }
     });
   }
 
@@ -1255,9 +1341,16 @@
       teardownPane(); // observer 拆除 + 媒体卸载
       pane.remove();
       pane = null;
-      paneAbort = null;
       paneCommittedPath = null;
+      paneInitialGen = null;
+      paneAbort = null;
     }
+    closeTreeDrawer();
+    uninstallDrawerMql();
+    if (treeScrim) treeScrim.remove();
+    treeScrim = null;
+    if (treeOpenBtn) treeOpenBtn.remove();
+    treeOpenBtn = null;
     if (treeNav) treeNav.remove();
     treeNav = null;
     treeRootUl = null;
@@ -1313,6 +1406,7 @@
       } else {
         clearTreeSelection();
       }
+      closeTreeDrawer(); // 窄屏抽屉: Esc 收起 (宽屏 no-op)
       event.preventDefault();
       return;
     }

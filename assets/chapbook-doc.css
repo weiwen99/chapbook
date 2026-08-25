@@ -299,3 +299,83 @@ body.cb-tree-mode .cb-pane .cb-pane-error {
 body.cb-tree-mode [data-cb-action="native"] {
   display: none;
 }
+/* ---------- 窄屏抽屉 (Q15): <64rem 树变 off-canvas 抽屉 ----------
+ * 零依赖 CSS transform + 遮罩, 两种壳共用; 开合类挂 body.cb-drawer-open
+ * (JS 随树壳创建/销毁配套元素; 宽屏无对应规则, 恒为常驻左树). */
+.cb-tree-scrim,
+.cb-tree-open {
+  display: none; /* 仅窄屏树模式可见 */
+}
+
+@media (max-width: 63.99rem) {
+  /* 内容独占整宽 */
+  body.cb-tree-mode {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  body.cb-tree-mode > *:not(.cb-tree):not(.cb-mode-toggle) {
+    grid-column: 1;
+  }
+  /* 树: off-canvas, 默认移出左缘; 打开时滑入 */
+  body.cb-tree-mode .cb-tree {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 40;
+    width: min(17rem, 85vw);
+    grid-column: auto;
+    grid-row: auto;
+    border-right: 1px solid var(--cb-border);
+    box-shadow: 0 0 1.25rem rgba(0, 0, 0, 0.35);
+    transform: translateX(-100%);
+    visibility: hidden;
+    transition: transform 0.25s ease, visibility 0s linear 0.25s;
+  }
+  body.cb-tree-mode.cb-drawer-open .cb-tree {
+    transform: translateX(0);
+    visibility: visible;
+    transition: transform 0.25s ease, visibility 0s;
+  }
+  /* 遮罩: 盖住内容区, 点击收起 (visibility 延迟到滑出结束后再隐藏) */
+  body.cb-tree-mode .cb-tree-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 25;
+    background: rgba(0, 0, 0, 0.45);
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.25s ease, visibility 0s linear 0.25s;
+  }
+  body.cb-tree-mode.cb-drawer-open .cb-tree-scrim {
+    opacity: 1;
+    visibility: visible;
+    transition: opacity 0.25s ease, visibility 0s;
+  }
+  /* 唤起按钮: 左上角悬浮 (模式切换按钮在右上角, 互不重叠) */
+  body.cb-tree-mode .cb-tree-open {
+    display: block;
+    position: fixed;
+    top: 0.75rem;
+    left: 0.75rem;
+    z-index: 20;
+    padding: 0.35em 0.8em;
+    font-size: 0.85em;
+    border: 1px solid var(--cb-border);
+    border-radius: 0.4em;
+    background: var(--cb-soft-bg);
+    color: var(--cb-text);
+    cursor: pointer;
+  }
+  body.cb-tree-mode .cb-tree-open:hover {
+    border-color: var(--cb-accent);
+    color: var(--cb-accent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body.cb-tree-mode .cb-tree,
+  body.cb-tree-mode .cb-tree-scrim {
+    transition: none;
+  }
+}

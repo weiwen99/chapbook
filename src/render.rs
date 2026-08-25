@@ -929,9 +929,15 @@ mod tests {
         assert!(css.contains(".cb-doc pre code span.keyword"), "css: {css}");
         assert!(css.contains(".cb-doc #TOC a:hover"), "css: {css}");
         assert!(css.contains(".cb-doc .katex-display"), "css: {css}");
-        assert!(!css.contains("transform"), "css: {css}");
-        assert!(!css.contains("filter"), "css: {css}");
-        assert!(!css.contains("perspective"), "css: {css}");
+        // 无 transform/filter/perspective 的约束只作用于文档内容区: 树模式外壳
+        // (右侧侧栏标记之后) 的窄屏抽屉合法使用 transform, 不在约束范围.
+        let doc_part = css
+            .split("/* ---------- 树模式外壳")
+            .next()
+            .expect("doc-content section");
+        assert!(!doc_part.contains("transform"), "doc part: {doc_part}");
+        assert!(!doc_part.contains("filter"), "doc part: {doc_part}");
+        assert!(!doc_part.contains("perspective"), "doc part: {doc_part}");
     }
 
     use crate::listing::SearchResult;
