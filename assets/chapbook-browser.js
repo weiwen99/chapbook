@@ -505,16 +505,16 @@
       handleAction(event, actionBtn);
       return;
     }
-    // 树节点: 单击选中; 目录同时展开/收起 (不导航)
+    // 树节点: 单击打开 — 目录展开/收起, 文件 SPA 导航; 双击连击 (detail > 1)
+    // 不产生第二次动作 (第二次 click 直接返回; dblclick 分支同样阻断)
     const treeRow = event.target.closest('.cb-tree-row');
     if (treeRow) {
+      if (event.detail > 1) return;
       const li = treeRow.closest('li.cb-tree-node');
-      if (li) {
-        selectTreeNode(li);
-        if (isDirNode(li)) toggleTreeNode(li);
-        closeTreeDrawer(); // 窄屏抽屉: 选择条目后收起 (宽屏 no-op)
-      }
-      return;
+      if (!li) return;
+      selectTreeNode(li);
+      if (isDirNode(li)) toggleTreeNode(li); else navigateTreeNode(li);
+      closeTreeDrawer(); return; // 窄屏抽屉: 选择条目后收起 (宽屏 no-op)
     }
     // 面板/内容区内目录迷你列表: 拦截可操作 anchor — 树模式 SPA 下钻,
     // 目录模式保持面板内下钻
@@ -548,11 +548,10 @@
     ) {
       return;
     }
-    // 树节点双击: 整页导航 (与 Enter 一致)
-    const treeRow = event.target.closest('.cb-tree-row');
-    if (treeRow) {
-      const li = treeRow.closest('li.cb-tree-node');
-      if (li) navigateTreeNode(li);
+    // 树节点双击: 单击已打开 (目录展开/文件导航), 双击必须无第二次动作 —
+    // 阻断默认并返回, 不再整页/SPA 导航
+    if (event.target.closest('.cb-tree-row')) {
+      event.preventDefault();
       return;
     }
     const entry = event.target.closest(ENTRY_SELECTOR);
@@ -681,6 +680,9 @@
   // 已加载子项缓存: encoded dir path (无前导斜杠) -> 子节点 <li> 数组
   const treeCache = new Map();
   let treeSelectedEl = null;
+  // 稳定节点 id 计数器: 仅保证当前壳内唯一/稳定 (ARIA 活动后代公告锚点);
+  // 每次建壳复位 (退出树模式后旧节点随壳销毁, id 可安全复用).
+  let treeItemSeq = 0;
   // 树壳生命周期 generation: 退出树模式递增使全部在途响应失效 (镜像 previewGuard)
   let treeGen = 0;
   // 窄屏抽屉 (<64rem, off-canvas transform + 遮罩): 随树壳创建/销毁.
@@ -789,6 +791,10 @@
     li.className = 'cb-tree-node';
     const name = typeof entry.name === 'string' ? entry.name : '';
     const isDir = entry.dir === true;
+    li.id = 'cb-tree-item-' + (++treeItemSeq); // 稳定 id: ARIA 活动后代公告锚点
+    li.setAttribute('role', 'treeitem');
+    li.setAttribute('aria-selected', 'false');
+    if (isDir) li.setAttribute('aria-expanded', 'false');
     const href = typeof entry.href === 'string' ? entry.href : null;
     const relPath = treePathFromHref(href);
     // 可展开 = 目录 && 服务端 expandable && 有合法 href (环/非 UTF-8 目录恒不可展开)
@@ -835,6 +841,7 @@
     if (!ul) {
       ul = document.createElement('ul');
       ul.className = 'cb-tree-children';
+      ul.setAttribute('role', 'group');
       li.append(ul);
     }
     return ul;
@@ -862,6 +869,7 @@
     const ul = li.querySelector(':scope > ul.cb-tree-children');
     if (ul) ul.hidden = !expanded;
     if (isExpandableDir(li)) setTwist(li, expanded);
+    if (isDirNode(li)) li.setAttribute('aria-expanded', expanded ? 'true' : 'false');
     const path = encodedPathOf(li);
     if (path === null) return;
     const idx = treeExpandedPaths.indexOf(path);
@@ -923,9 +931,14 @@
   }
 
   function selectTreeNode(li) {
-    if (treeSelectedEl) treeSelectedEl.classList.remove('cb-selected');
+    if (treeSelectedEl) {
+      treeSelectedEl.classList.remove('cb-selected');
+      treeSelectedEl.setAttribute('aria-selected', 'false');
+    }
     treeSelectedEl = li;
     li.classList.add('cb-selected');
+    li.setAttribute('aria-selected', 'true');
+    if (treeRootUl) treeRootUl.setAttribute('aria-activedescendant', li.id);
     const path = encodedPathOf(li);
     try {
       if (path === null) {
@@ -939,8 +952,12 @@
   }
 
   function clearTreeSelection() {
-    if (treeSelectedEl) treeSelectedEl.classList.remove('cb-selected');
+    if (treeSelectedEl) {
+      treeSelectedEl.classList.remove('cb-selected');
+      treeSelectedEl.setAttribute('aria-selected', 'false');
+    }
     treeSelectedEl = null;
+    if (treeRootUl) treeRootUl.removeAttribute('aria-activedescendant');
   }
 
   function visibleTreeNodes() {
@@ -1104,10 +1121,12 @@
     treeNav = document.createElement('nav');
     treeNav.className = 'cb-tree';
     treeNav.setAttribute('aria-label', '目录树');
-    treeNav.tabIndex = -1; // 窄屏抽屉打开时程序化聚焦 (非 tab 序)
     treeNav.append(treeSearchForm());
+    treeItemSeq = 0; // 新壳: id 计数器复位 (id 仅需壳内稳定唯一, 见声明)
     treeRootUl = document.createElement('ul');
     treeRootUl.className = 'cb-tree-root';
+    treeRootUl.setAttribute('role', 'tree');
+    treeRootUl.tabIndex = 0; // 单 tab 停靠点; 活动后代经 aria-activedescendant 公告
     treeNav.append(treeRootUl);
     document.body.prepend(treeNav);
     // 列 2 树宽调整器 (宽屏常驻; 窄屏抽屉内 display:none, 无行为): ARIA
@@ -1253,10 +1272,12 @@
     if (treeOpenBtn) {
       treeOpenBtn.setAttribute('aria-expanded', 'true');
     }
-    // 焦点移入抽屉 (nav 非 tab 序, 仅程序化聚焦), 键盘导航立即可用
-    if (treeNav) {
+    // 焦点移入抽屉根树 (tabindex=0 单停靠点, aria-activedescendant 在根上
+    // 公告活动后代), 键盘导航立即可用; nav 仅兜底 (根缺失时)
+    const focusTarget = treeRootUl || treeNav;
+    if (focusTarget) {
       try {
-        treeNav.focus({ preventScroll: true });
+        focusTarget.focus({ preventScroll: true });
       } catch (err) {
         /* 老环境不支持 focus options: 忽略 */
       }
@@ -1405,7 +1426,7 @@
     // 展开路径: 折叠类移除 → 树/调整器解除 inert/hidden → 落点聚焦 → 恢复
     // 按钮隐藏 (任何已绘制帧都不暴露恢复控件). 落点: 窄屏抽屉唤起按钮 (宽
     // →窄过渡, 恢复按钮即将隐藏); 宽屏折叠按钮 (调整器子控件, 已解除隐藏),
-    // 折叠按钮缺失时回退调整器/树壳 — 焦点绝不停留在隐藏/inert 元素.
+    // 折叠按钮缺失时回退调整器/树根 (nav 仅最后兜底) — 焦点绝不停留在隐藏/inert 元素.
     document.body.classList.remove('cb-tree-collapsed');
     if (treeNav) {
       treeNav.inert = false;
@@ -1426,6 +1447,9 @@
       } else if (treeResizer) {
         treeResizer.focus({ preventScroll: true });
         treeFocusKind = 'resizer';
+      } else if (treeRootUl) {
+        treeRootUl.focus({ preventScroll: true });
+        treeFocusKind = 'tree';
       } else if (treeNav) {
         treeNav.focus({ preventScroll: true });
         treeFocusKind = 'tree';
@@ -2120,6 +2144,18 @@
     }
     if (isEditableTarget(event.target)) return;
     switch (event.key) {
+      case 'PageUp':
+        if (treeNav) {
+          treeNav.scrollBy({ top: -Math.round(treeNav.clientHeight * 0.8) });
+        }
+        event.preventDefault();
+        break;
+      case 'PageDown':
+        if (treeNav) {
+          treeNav.scrollBy({ top: Math.round(treeNav.clientHeight * 0.8) });
+        }
+        event.preventDefault();
+        break;
       case 'ArrowDown':
         moveTreeSelection(1);
         event.preventDefault();

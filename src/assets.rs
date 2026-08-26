@@ -1110,9 +1110,14 @@ mod tests {
         let fallback_resizer_at = apply
             .find("treeResizer.focus({ preventScroll: true })")
             .expect("折叠按钮缺失时回退调整器");
+        // 任务 5: nav 不再挂 tabIndex (不可聚焦), 回退链优先树根 (tabindex=0
+        // 单停靠点), nav 仅最后兜底 — 焦点绝不停留在隐藏/inert 元素.
+        let fallback_root_at = apply
+            .find("treeRootUl.focus({ preventScroll: true })")
+            .expect("调整器也缺失时回退树根");
         let fallback_nav_at = apply
             .find("treeNav.focus({ preventScroll: true })")
-            .expect("调整器也缺失时回退树壳");
+            .expect("树根也缺失时最后兜底树壳");
         let restore_hidden_at = apply
             .find("treeRestoreBtn.hidden = true")
             .expect("展开路径隐藏恢复按钮");
@@ -1125,7 +1130,8 @@ mod tests {
                 && kind_drawer_at < collapse_focus_at
                 && collapse_focus_at < kind_resizer_at
                 && kind_resizer_at < fallback_resizer_at
-                && fallback_resizer_at < fallback_nav_at
+                && fallback_resizer_at < fallback_root_at
+                && fallback_root_at < fallback_nav_at
                 && fallback_nav_at < restore_hidden_at,
             "展开路径: 移除类 → 解除 inert/hidden → 落点聚焦 → 记录种类 → 恢复按钮隐藏"
         );
@@ -1354,6 +1360,214 @@ mod tests {
                 matches!(got, quick_js::JsValue::Null),
                 "{expr}: expected null, got {got:?}"
             );
+        }
+    }
+
+    /// 任务 5: 树单击打开 (文件导航/目录展开) + 键盘可聚焦 ARIA 树. 行为导向
+    /// 源不变量:
+    /// - 单击树行: 双击连击守卫 (event.detail > 1) → li 定位守卫 → 选中 →
+    ///   目录展开 / 文件 navigateTreeNode → 收抽屉; dblclick 树行分支开头即
+    ///   阻断默认并返回 (导航完全移交单击, 双击不得产生第二次动作);
+    /// - ARIA 树 (搜索表单在 nav 内, role/tabindex 必须挂根 ul 而非 nav):
+    ///   根 ul role=tree + tabindex=0; nav 保留导航地标 aria-label 且不再挂
+    ///   tabIndex; 节点 li role=treeitem + 稳定 id (模块计数器, 每次建壳复位)
+    ///   与 aria-selected; 目录节点初始 aria-expanded=false, 展开态同步; 子 ul
+    ///   role=group, 根 aria-activedescendant 随选择更新/清除;
+    /// - openTreeDrawer 聚焦根 ul (nav 仅兜底) — 活动后代经 tabindex=0 根公告;
+    /// - PageUp/PageDown 滚动树列 80% 视口高并阻断默认 (Arrow 行为不变).
+    #[test]
+    fn browser_js_tree_click_and_aria_contract_is_locked() {
+        let js = BROWSER_JS;
+        // 单击处理: 树行分支内顺序 — detail 守卫 → li 定位 + 守卫 → 选中 →
+        // 目录展开 / 文件导航 → 收抽屉.
+        let click_start = js
+            .find("function onDocumentClick(")
+            .expect("onDocumentClick 存在");
+        let tree_row_at = js
+            .find("event.target.closest('.cb-tree-row')")
+            .expect("树行分支存在");
+        let dbl_at = js
+            .find("if (event.detail > 1) return;")
+            .expect("单击先拦双击连击 (detail > 1)");
+        let li_at = js
+            .find("const li = treeRow.closest('li.cb-tree-node');")
+            .expect("行定位 li");
+        let li_guard_at = js.find("if (!li) return;").expect("li 定位守卫");
+        let sel_at = js.find("selectTreeNode(li);").expect("单击选中");
+        let dir_at = js
+            .find("if (isDirNode(li)) toggleTreeNode(li); else navigateTreeNode(li);")
+            .expect("目录展开 / 文件导航分支");
+        let close_at = js
+            .find("closeTreeDrawer(); return;")
+            .expect("树行处理后收抽屉");
+        assert!(
+            click_start < tree_row_at
+                && tree_row_at < dbl_at
+                && dbl_at < li_at
+                && li_at < li_guard_at
+                && li_guard_at < sel_at
+                && sel_at < dir_at
+                && dir_at < close_at,
+            "单击顺序: 树行分支 → detail 守卫 → li 定位 → li 守卫 → 选中 → 展开/导航 → 收抽屉"
+        );
+        // 双击处理: 树行分支开头即阻断默认并返回 (不再整页/SPA 导航).
+        let dblclick_start = js
+            .find("function onDocumentDblclick(")
+            .expect("onDocumentDblclick 存在");
+        let dblclick_end = js
+            .find("function isEditableTarget(")
+            .expect("isEditableTarget 位于 onDocumentDblclick 之后");
+        let dblclick_body = &js[dblclick_start..dblclick_end];
+        let dbl_guard_at = dblclick_body
+            .find("if (event.target.closest('.cb-tree-row')) {")
+            .expect("dblclick 树行守卫存在");
+        let dbl_entry_at = dblclick_body
+            .find("const entry = event.target.closest(ENTRY_SELECTOR);")
+            .expect("ENTRY 分支位于树行守卫之后");
+        assert!(
+            dbl_guard_at < dbl_entry_at,
+            "dblclick 树行守卫必须位于树分支开头 (先于 ENTRY 分支)"
+        );
+        let dbl_guard = &dblclick_body[dbl_guard_at..dbl_entry_at];
+        assert!(
+            dbl_guard.contains("event.preventDefault();") && dbl_guard.contains("return;"),
+            "dblclick 树行: 阻断默认并返回, 不得再导航"
+        );
+        // ARIA 树根: 建壳时根 ul role=tree + tabindex=0; nav 保留地标且无 tabIndex.
+        let shell_at = js
+            .find("function buildTreeShell(")
+            .expect("buildTreeShell 存在");
+        let role_at = js
+            .find("treeRootUl.setAttribute('role', 'tree')")
+            .expect("根 ul role=tree");
+        let tab_at = js
+            .find("treeRootUl.tabIndex = 0")
+            .expect("根 ul tabindex=0");
+        assert!(
+            shell_at < role_at && role_at < tab_at,
+            "建壳时先设 role=tree 再设 tabindex=0"
+        );
+        assert!(
+            js.contains("treeNav.setAttribute('aria-label', '目录树')"),
+            "nav 保留导航地标 aria-label"
+        );
+        assert!(
+            !js.contains("treeNav.tabIndex"),
+            "nav 不得再挂 tabIndex (焦点与 role 在根 ul)"
+        );
+        // 稳定节点 id: 模块计数器声明早于建壳, 每次建壳复位; buildTreeNode 赋
+        // id/role/aria-selected, 目录节点初始 aria-expanded=false.
+        let counter_at = js.find("let treeItemSeq = 0;").expect("模块计数器声明存在");
+        let reset_at = js
+            .find("treeItemSeq = 0; // 新壳")
+            .expect("建壳复位计数器存在");
+        let node_at = js
+            .find("function buildTreeNode(")
+            .expect("buildTreeNode 存在");
+        assert!(
+            counter_at < node_at && node_at < shell_at && shell_at < reset_at,
+            "计数器声明 → 节点构建 → 建壳 → 复位 (id 从 1 起, 每壳唯一)"
+        );
+        let build_end = js
+            .find("function childrenUlFor(")
+            .expect("childrenUlFor 位于 buildTreeNode 之后");
+        let build = &js[node_at..build_end];
+        for needle in [
+            "li.id = 'cb-tree-item-' + (++treeItemSeq)",
+            "li.setAttribute('role', 'treeitem')",
+            "li.setAttribute('aria-selected', 'false')",
+            "li.setAttribute('aria-expanded', 'false')",
+        ] {
+            assert!(build.contains(needle), "buildTreeNode 缺少 seam: {needle}");
+        }
+        // 子 ul role=group; 展开态同步 aria-expanded.
+        let child_at = js
+            .find("function childrenUlFor(")
+            .expect("childrenUlFor 存在");
+        let child_end = js
+            .find("function isDirNode(")
+            .expect("isDirNode 位于 childrenUlFor 之后");
+        let child = &js[child_at..child_end];
+        assert!(
+            child.contains("ul.setAttribute('role', 'group')"),
+            "子 ul role=group"
+        );
+        let expand_at = js
+            .find("function setTreeNodeExpanded(")
+            .expect("setTreeNodeExpanded 存在");
+        let expand_end = js
+            .find("function fetchTreeEntries(")
+            .expect("fetchTreeEntries 位于 setTreeNodeExpanded 之后");
+        let expand = &js[expand_at..expand_end];
+        assert!(
+            expand.contains("li.setAttribute('aria-expanded', expanded ? 'true' : 'false')"),
+            "setTreeNodeExpanded 同步 aria-expanded"
+        );
+        // 选中: 旧节点 aria-selected=false, 新节点 true, 根 aria-activedescendant
+        // 指向新 id; 清除: 旧节点置 false, 根移除 aria-activedescendant.
+        let sel_fn_at = js
+            .find("function selectTreeNode(")
+            .expect("selectTreeNode 存在");
+        let clear_fn_at = js
+            .find("function clearTreeSelection(")
+            .expect("clearTreeSelection 存在");
+        let sel_fn = &js[sel_fn_at..clear_fn_at];
+        for needle in [
+            "treeSelectedEl.setAttribute('aria-selected', 'false')",
+            "li.setAttribute('aria-selected', 'true')",
+            "treeRootUl.setAttribute('aria-activedescendant', li.id)",
+        ] {
+            assert!(
+                sel_fn.contains(needle),
+                "selectTreeNode 缺少 seam: {needle}"
+            );
+        }
+        let clear_end = js
+            .find("function visibleTreeNodes(")
+            .expect("visibleTreeNodes 位于 clearTreeSelection 之后");
+        let clear_fn = &js[clear_fn_at..clear_end];
+        for needle in [
+            "treeSelectedEl.setAttribute('aria-selected', 'false')",
+            "treeRootUl.removeAttribute('aria-activedescendant')",
+        ] {
+            assert!(
+                clear_fn.contains(needle),
+                "clearTreeSelection 缺少 seam: {needle}"
+            );
+        }
+        // 抽屉打开聚焦根 ul, nav 仅兜底 (活动后代经根公告).
+        let open_at = js
+            .find("function openTreeDrawer(")
+            .expect("openTreeDrawer 存在");
+        let close_drawer_at = js
+            .find("function closeTreeDrawer(")
+            .expect("closeTreeDrawer 位于 openTreeDrawer 之后");
+        let open = &js[open_at..close_drawer_at];
+        assert!(
+            open.contains("const focusTarget = treeRootUl || treeNav;"),
+            "openTreeDrawer 聚焦根 ul, nav 仅兜底"
+        );
+        assert!(
+            open.contains("focusTarget.focus({ preventScroll: true })"),
+            "openTreeDrawer 程序化聚焦 (preventScroll)"
+        );
+        // PageUp/PageDown: 滚动树列 80% 视口高并阻断默认, PageUp 先于 PageDown.
+        let kd_at = js
+            .find("function onTreeKeydown(")
+            .expect("onTreeKeydown 存在");
+        let kd_end = js
+            .find("function init(")
+            .expect("init 位于 onTreeKeydown 之后");
+        let kd = &js[kd_at..kd_end];
+        let pu_at = kd.find("case 'PageUp':").expect("PageUp 分支存在");
+        let pd_at = kd.find("case 'PageDown':").expect("PageDown 分支存在");
+        assert!(pu_at < pd_at, "PageUp 先于 PageDown");
+        for needle in [
+            "treeNav.scrollBy({ top: -Math.round(treeNav.clientHeight * 0.8) })",
+            "treeNav.scrollBy({ top: Math.round(treeNav.clientHeight * 0.8) })",
+            "event.preventDefault();",
+        ] {
+            assert!(kd.contains(needle), "onTreeKeydown 缺少 seam: {needle}");
         }
     }
 }
