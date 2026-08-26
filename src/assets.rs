@@ -953,35 +953,46 @@ mod tests {
     }
     /// 任务 4: 手动折叠 (宽屏左树收起) seam. 行为导向源不变量:
     /// - 键/状态/函数 seam 存在: TREE_COLLAPSED_KEY, treeCollapsePreferred,
-    ///   applyTreeCollapsed, installTreeCollapseMql, cb-tree-collapsed, cb-tree-restore;
-    /// - applyTreeCollapsed 顺序契约: 生效态计算 → 焦点捕获 (document.activeElement)
-    ///   → 树内/调整器内包含判定 (折叠按钮是调整器子控件, 两处都要覆盖) → 恢复按钮
-    ///   解除 hidden → 移交焦点 → 折叠类/inert/aria-hidden/resizer 隐藏. 焦点必须
-    ///   在任何 class/inert/hidden 变更之前移交 (inert/隐藏元素不可聚焦), 恢复按钮
-    ///   必须先解除 hidden 才能聚焦 (display:none 不可聚焦), 展开路径先隐藏恢复
-    ///   按钮 (任何已绘制帧都不暴露恢复控件);
+    ///   模块级 treeCollapseBtn 引用 (建壳赋值/退出清空), 纯函数
+    ///   collapseFocusTarget, applyTreeCollapsed, installTreeCollapseMql,
+    ///   cb-tree-collapsed, cb-tree-restore; 导出含 collapseFocusTarget;
+    ///   跨断点时浏览器在 mql 处理器运行前就按新视口 CSS 隐藏目标控件并静默
+    ///   丢弃焦点 (activeElement 回落 body, 无 focusout 事件), 由 focusin 追踪
+    ///   记录 (treeFocusKind, 落到非树壳控件即清空) 补判;
+    ///   折叠路径: 恢复按钮解除 hidden → 折叠类 → 移交焦点 → 树 inert/aria →
+    ///   调整器隐藏 (恢复按钮必须先解除 hidden 才能聚焦, display:none 不可聚焦);
+    ///   折叠路径: 恢复按钮解除 hidden → 折叠类 → 移交焦点 → 树 inert/aria →
+    ///   调整器隐藏 (恢复按钮必须先解除 hidden 才能聚焦, display:none 不可聚焦);
+    ///   展开路径: 移除折叠类 → 树/调整器解除 inert/hidden → 落点聚焦 (窄屏
+    ///   抽屉唤起按钮; 宽屏折叠按钮, 回退调整器/树壳) → 恢复按钮隐藏 (任何已
+    ///   绘制帧都不暴露恢复控件), 焦点绝不停留在隐藏/inert 元素;
     /// - 持久化只写两态 '1'/'0'; 恢复按钮点击只写偏好 false;
     /// - mql install/uninstall 同一 handler 引用 add/remove (含 legacy 回退),
     ///   uninstall 清空引用;
-    /// - 折叠按钮 (resizer 子控件): 点击 stopPropagation → 偏好 true, 绝不触碰
-    ///   宽度/宽度存储; resizer keydown 同样跳过该子控件;
+    /// - 折叠按钮 (resizer 子控件): 模块引用先赋值再挂 click, click 顺序
+    ///   stopPropagation → 偏好 true, 绝不触碰宽度/宽度存储; resizer keydown
+    ///   同样跳过该子控件;
     /// - enter: 读偏好 (=== '1') → install → apply; exit: uninstall + 清类 +
-    ///   移除按钮, 绝不写 localStorage (偏好保留).
+    ///   清空折叠按钮引用 + 移除按钮, 绝不写 localStorage (偏好保留).
     #[test]
     fn browser_js_tree_collapse_seams_are_locked() {
         let js = BROWSER_JS;
         for needle in [
             "const TREE_COLLAPSED_KEY = 'cb-tree-collapsed'",
             "let treeCollapsePreferred = false",
-            "function applyTreeCollapsed(",
-            "function installTreeCollapseMql(",
+            "let treeFocusKind = null",
+            "function classifyTreeFocusTarget(",
+            "function onTreeFocusIn(",
+            "function onTreePointerDown(",
             "cb-tree-collapsed",
             "cb-tree-restore",
+            "collapseFocusTarget: collapseFocusTarget",
         ] {
             assert!(js.contains(needle), "missing tree-collapse seam: {needle}");
         }
         // applyTreeCollapsed 切片 (止于 setTreeCollapsePreference): 生效态计算、
-        // 焦点捕获/移交 (树内 + 调整器内) 与 class/inert/hidden 同步的顺序契约.
+        // 焦点捕获、四类焦点分类与纯函数落点计算必须先于任何 class/inert/hidden
+        // 变更; 折叠/展开两条路径的内部顺序契约见下.
         let apply_start = js
             .find("function applyTreeCollapsed(")
             .expect("applyTreeCollapsed 存在");
@@ -990,108 +1001,144 @@ mod tests {
             .expect("setTreeCollapsePreference 位于 applyTreeCollapsed 之后");
         let apply = &js[apply_start..apply_end];
         let state_at = apply
-            .find("treeCollapsed = treeCollapsePreferred && !narrow")
+            .find("const nextCollapsed = treeCollapsePreferred && !narrow")
             .expect("applyTreeCollapsed 先计算生效态");
         let capture_at = apply
             .find("const active = document.activeElement")
             .expect("applyTreeCollapsed 必须先捕获活动焦点");
-        let nav_at = apply
-            .find("treeNav.contains(active)")
-            .expect("焦点移交判定必须覆盖树内");
-        let resizer_at = apply
-            .find("treeResizer.contains(active)")
-            .expect("焦点移交判定必须覆盖调整器内 (折叠按钮子控件)");
-        let show_at = apply
-            .find("treeRestoreBtn.hidden = !treeCollapsed")
-            .expect("恢复按钮 hidden 同步存在");
+        let classify_at = apply
+            .find("classifyTreeFocusTarget(active)")
+            .expect("applyTreeCollapsed 必须经统一分类函数判定焦点");
+        let tracker_at = apply
+            .find("if (!activeKind && treeFocusKind)")
+            .expect("焦点被 CSS 静默丢弃时用追踪记录补判 (跨断点)");
+        let helper_at = apply
+            .find("collapseFocusTarget(nextCollapsed, narrow, activeKind)")
+            .expect("焦点落点由纯函数计算");
+        let unhide_at = apply
+            .find("treeRestoreBtn.hidden = false")
+            .expect("折叠路径先解除恢复按钮 hidden");
+        assert!(
+            state_at < capture_at
+                && capture_at < classify_at
+                && classify_at < tracker_at
+                && tracker_at < helper_at
+                && helper_at < unhide_at,
+            "生效态 → 焦点捕获 → 四类分类 → 追踪补判 → 落点计算必须全部先于任何 class/inert/hidden 变更"
+        );
+        // 统一分类函数: 四类判定 (树内/调整器内/恢复按钮/抽屉按钮) 按序内联,
+        // 覆盖折叠按钮 (调整器子控件) 与两个 identity 按钮.
+        let classify_start = js
+            .find("function classifyTreeFocusTarget(")
+            .expect("classifyTreeFocusTarget 存在");
+        let classify_end = js
+            .find("function onTreeFocusIn(")
+            .expect("onTreeFocusIn 位于 classifyTreeFocusTarget 之后");
+        let classify = &js[classify_start..classify_end];
+        let cls_nav_at = classify
+            .find("treeNav.contains(target)")
+            .expect("分类覆盖树内");
+        let cls_resizer_at = classify
+            .find("treeResizer.contains(target)")
+            .expect("分类覆盖调整器内 (折叠按钮子控件)");
+        let cls_restore_at = classify
+            .find("target === treeRestoreBtn")
+            .expect("分类覆盖恢复按钮自身");
+        let cls_drawer_at = classify
+            .find("target === treeOpenBtn")
+            .expect("分类覆盖抽屉唤起按钮自身");
+        assert!(
+            cls_nav_at < cls_resizer_at
+                && cls_resizer_at < cls_restore_at
+                && cls_restore_at < cls_drawer_at,
+            "分类顺序: 树内 → 调整器内 → 恢复按钮 → 抽屉按钮"
+        );
+        // 折叠路径: 解除 hidden → 折叠类 → 移交焦点 → 树 inert → aria → 调整器隐藏.
+        let class_add_at = apply
+            .find("classList.add('cb-tree-collapsed')")
+            .expect("折叠路径添加折叠类");
         let focus_at = apply
             .find("treeRestoreBtn.focus({ preventScroll: true })")
-            .expect("焦点移交到恢复按钮存在");
-        let class_at = apply
-            .find("classList.toggle('cb-tree-collapsed', treeCollapsed)")
-            .expect("折叠类同步存在");
+            .expect("折叠路径移交焦点到恢复按钮");
+        let kind_restore_at = apply
+            .find("treeFocusKind = 'restore'")
+            .expect("折叠路径记录焦点种类 (程序化移交不触发 focusin 的环境兜底)");
         let inert_at = apply
-            .find("treeNav.inert = treeCollapsed")
-            .expect("树 inert 同步存在");
+            .find("treeNav.inert = true")
+            .expect("折叠路径树 inert 同步存在");
         let aria_at = apply
-            .find("setAttribute('aria-hidden', treeCollapsed ? 'true' : 'false')")
-            .expect("aria-hidden 同步存在");
+            .find("treeNav.setAttribute('aria-hidden', 'true')")
+            .expect("折叠路径 aria-hidden 同步存在");
         let resizer_hidden_at = apply
-            .find("treeResizer.hidden = treeCollapsed")
-            .expect("调整器 hidden 同步存在");
+            .find("treeResizer.hidden = true")
+            .expect("折叠路径调整器隐藏存在");
         assert!(
-            state_at < capture_at && capture_at < nav_at && nav_at < resizer_at,
-            "生效态计算 → 焦点捕获 → 树/调整器包含判定必须依次在前 (先于任何 class/inert/hidden 变更)"
-        );
-        assert!(
-            resizer_at < show_at && show_at < focus_at,
-            "恢复按钮必须先解除 hidden, 再移交焦点 (display:none 不可聚焦)"
-        );
-        assert!(
-            focus_at < class_at
-                && class_at < inert_at
+            unhide_at < class_add_at
+                && class_add_at < focus_at
+                && focus_at < kind_restore_at
+                && kind_restore_at < inert_at
                 && inert_at < aria_at
                 && aria_at < resizer_hidden_at,
-            "焦点移交必须先于折叠类/inert/aria-hidden/resizer 隐藏"
+            "折叠路径: 解除 hidden → 折叠类 → 移交焦点 → 记录种类 → 树 inert/aria → 调整器隐藏"
         );
+        // 展开路径: 移除折叠类 → 树/调整器解除 inert/hidden → 落点聚焦 (窄屏
+        // 抽屉唤起按钮; 宽屏折叠按钮, 回退调整器/树壳) → 恢复按钮隐藏.
+        let class_remove_at = apply
+            .find("classList.remove('cb-tree-collapsed')")
+            .expect("展开路径移除折叠类");
+        let inert_clear_at = apply
+            .find("treeNav.inert = false")
+            .expect("展开路径解除树 inert");
+        let aria_clear_at = apply
+            .find("treeNav.setAttribute('aria-hidden', 'false')")
+            .expect("展开路径解除 aria-hidden");
+        let resizer_show_at = apply
+            .find("treeResizer.hidden = false")
+            .expect("展开路径解除调整器隐藏");
+        let drawer_focus_at = apply
+            .find("treeOpenBtn.focus({ preventScroll: true })")
+            .expect("窄屏展开路径焦点移交抽屉唤起按钮");
+        let kind_drawer_at = apply
+            .find("treeFocusKind = 'drawer'")
+            .expect("窄屏展开路径记录抽屉焦点种类");
+        let collapse_focus_at = apply
+            .find("treeCollapseBtn.focus({ preventScroll: true })")
+            .expect("宽屏展开路径焦点移交折叠按钮");
+        let kind_resizer_at = apply
+            .find("treeFocusKind = 'resizer'")
+            .expect("宽屏展开路径记录调整器焦点种类");
+        let fallback_resizer_at = apply
+            .find("treeResizer.focus({ preventScroll: true })")
+            .expect("折叠按钮缺失时回退调整器");
+        let fallback_nav_at = apply
+            .find("treeNav.focus({ preventScroll: true })")
+            .expect("调整器也缺失时回退树壳");
+        let restore_hidden_at = apply
+            .find("treeRestoreBtn.hidden = true")
+            .expect("展开路径隐藏恢复按钮");
         assert!(
-            show_at < resizer_hidden_at,
-            "恢复按钮 hidden 同步必须先于调整器隐藏 (展开路径先隐藏恢复控件)"
+            class_remove_at < inert_clear_at
+                && inert_clear_at < aria_clear_at
+                && aria_clear_at < resizer_show_at
+                && resizer_show_at < drawer_focus_at
+                && drawer_focus_at < kind_drawer_at
+                && kind_drawer_at < collapse_focus_at
+                && collapse_focus_at < kind_resizer_at
+                && kind_resizer_at < fallback_resizer_at
+                && fallback_resizer_at < fallback_nav_at
+                && fallback_nav_at < restore_hidden_at,
+            "展开路径: 移除类 → 解除 inert/hidden → 落点聚焦 → 记录种类 → 恢复按钮隐藏"
         );
-        // setTreeCollapsePreference: persist 只写两态 '1'/'0', 随后立即重算生效态.
-        let pref_start = apply_end;
-        let pref_end = js
-            .find("function installTreeCollapseMql(")
-            .expect("installTreeCollapseMql 位于 setTreeCollapsePreference 之后");
-        let pref = &js[pref_start..pref_end];
-        assert!(
-            pref.contains("localStorage.setItem(TREE_COLLAPSED_KEY, preferred ? '1' : '0')"),
-            "持久化只写 '1'/'0' 两态"
-        );
-        assert!(
-            pref.contains("applyTreeCollapsed();"),
-            "设置偏好后必须立即重算生效态"
-        );
-        // mql install/uninstall: 同一 handler 引用 add/remove, 含 legacy 回退,
-        // uninstall 清空引用 (幂等, 不残留).
-        let inst_start = pref_end;
-        let inst_end = js
-            .find("function uninstallTreeCollapseMql()")
-            .expect("uninstallTreeCollapseMql 存在");
-        let inst = &js[inst_start..inst_end];
-        for needle in [
-            "treeCollapseMql = window.matchMedia(TREE_DRAWER_MQL)",
-            "treeCollapseMqlHandler = applyTreeCollapsed",
-            "addEventListener('change', treeCollapseMqlHandler)",
-            "addListener(treeCollapseMqlHandler)",
-        ] {
-            assert!(
-                inst.contains(needle),
-                "installTreeCollapseMql 必须包含 {needle}"
-            );
-        }
-        let uninst = &js[inst_end..];
-        assert!(
-            uninst.contains("removeEventListener('change', treeCollapseMqlHandler)"),
-            "uninstall 必须移除同一 change 监听"
-        );
-        assert!(
-            uninst.contains("removeListener(treeCollapseMqlHandler)"),
-            "uninstall 必须移除 legacy 监听"
-        );
-        assert!(
-            uninst.contains("treeCollapseMql = null;"),
-            "uninstall 必须清空 mql 引用"
-        );
-        assert!(
-            uninst.contains("treeCollapseMqlHandler = null;"),
-            "uninstall 必须清空 handler 引用"
-        );
-        // 折叠按钮 (resizer 子控件) click: 先阻断冒泡再写偏好 true, 绝不触碰
-        // 宽度或其存储键; resizer keydown 对同一子控件同样放行 (不步进).
+        // 折叠按钮 (resizer 子控件): 建壳时先赋值模块引用再挂 click; click 先
+        // 阻断冒泡再写偏好 true, 绝不触碰宽度或其存储键; resizer keydown 对
+        // 同一子控件同样放行 (不步进).
+        let create_at = js
+            .find("treeCollapseBtn = document.createElement('button')")
+            .expect("折叠按钮创建必须赋值模块引用");
         let click_start = js
             .find("treeCollapseBtn.addEventListener('click',")
             .expect("折叠按钮 click 处理器存在");
+        assert!(create_at < click_start, "折叠按钮先创建再挂 click");
         let click_end = js
             .find("treeResizer.append(treeCollapseBtn)")
             .expect("折叠按钮 append 存在");
@@ -1126,7 +1173,7 @@ mod tests {
             "恢复点击写入偏好 false 并持久化"
         );
         // enter: 读偏好 (=== '1') → install → apply; exit: uninstall + 清类 +
-        // 移除恢复按钮, 绝不触碰 localStorage (偏好原样保留).
+        // 清空折叠按钮引用 + 移除按钮, 绝不触碰 localStorage (偏好原样保留).
         let enter_start = js
             .find("function enterTreeMode()")
             .expect("enterTreeMode 存在");
@@ -1147,6 +1194,62 @@ mod tests {
             load_at < inst_call && inst_call < apply_call,
             "enter: 先读偏好, 再装 mql, 最后应用生效态"
         );
+        // 焦点追踪随壳安装: focusin 记录 + pointerdown 清空 (内容区点击不触发
+        // focusin, 必须单独清空防过期记录误判).
+        assert!(
+            enter.contains("document.addEventListener('focusin', onTreeFocusIn, true)"),
+            "enter 安装 focusin 追踪"
+        );
+        assert!(
+            enter.contains("document.addEventListener('pointerdown', onTreePointerDown, true)"),
+            "enter 安装 pointerdown 追踪"
+        );
+        // 追踪 handler 本身: focusin 经统一分类记录; pointerdown 仅当按下非
+        // 树壳控件时清空 (树壳控件按下不动作, 随后的 focusin 重新记录).
+        let focusin_start = js
+            .find("function onTreeFocusIn(")
+            .expect("onTreeFocusIn 存在");
+        let pointer_start = js
+            .find("function onTreePointerDown(")
+            .expect("onTreePointerDown 存在");
+        assert!(
+            focusin_start < pointer_start,
+            "onTreeFocusIn 必须位于 onTreePointerDown 之前"
+        );
+        let focusin_body = &js[focusin_start..pointer_start];
+        assert!(
+            focusin_body.contains("treeFocusKind = classifyTreeFocusTarget(event.target)"),
+            "focusin 记录最近一次树壳焦点"
+        );
+        let pointer_end = js
+            .find("function applyTreeCollapsed(")
+            .expect("applyTreeCollapsed 位于 onTreePointerDown 之后");
+        let pointer_body = &js[pointer_start..pointer_end];
+        assert!(
+            pointer_body.contains("treeFocusKind = null"),
+            "pointerdown 落在非树壳控件时清空追踪记录"
+        );
+        let exit_start = enter_end;
+        let exit_end = js
+            .find("function applyTreeMode()")
+            .expect("applyTreeMode 位于 exitTreeMode 之后");
+        let exit = &js[exit_start..exit_end];
+        assert!(
+            exit.contains("uninstallTreeCollapseMql();"),
+            "exit 卸载折叠 mql"
+        );
+        assert!(
+            exit.contains("document.removeEventListener('focusin', onTreeFocusIn, true)"),
+            "exit 卸载 focusin 追踪"
+        );
+        assert!(
+            exit.contains("document.removeEventListener('pointerdown', onTreePointerDown, true)"),
+            "exit 卸载 pointerdown 追踪"
+        );
+        assert!(
+            exit.contains("treeFocusKind = null"),
+            "exit 清空焦点追踪记录"
+        );
         let exit_start = enter_end;
         let exit_end = js
             .find("function applyTreeMode()")
@@ -1161,6 +1264,10 @@ mod tests {
             "exit 清除生效折叠类"
         );
         assert!(
+            exit.contains("treeCollapseBtn = null"),
+            "exit 清空折叠按钮引用 (随壳销毁)"
+        );
+        assert!(
             exit.contains("treeRestoreBtn.remove()"),
             "exit 移除恢复按钮"
         );
@@ -1168,5 +1275,85 @@ mod tests {
             !exit.contains("localStorage"),
             "exit 绝不写折叠键 (偏好保留)"
         );
+    }
+
+    /// 任务 4 质量收尾: 折叠/展开焦点落点纯函数在 QuickJS 中真实执行. 行为
+    /// 矩阵覆盖全部过渡与 no-op:
+    /// - 折叠生效 (nextCollapsed): 焦点在树内/调整器内/抽屉唤起按钮 → 'restore'
+    ///   (inert/隐藏元素不可聚焦, 必须提前移交); 焦点在恢复按钮自身或受影响
+    ///   控件之外 → null (恢复按钮保持可见, 无需移交);
+    /// - 展开生效 (!nextCollapsed): 焦点在恢复按钮 → 窄屏 'drawer' (恢复按钮
+    ///   即将隐藏, 抽屉唤起按钮可见) / 宽屏 'collapse' (折叠按钮是调整器子控件,
+    ///   树列重新可见); 宽屏下抽屉唤起按钮焦点 → 'collapse'; 焦点在树内/调整器
+    ///   内/其余 → null (元素保持可见/可聚焦, 不移交).
+    #[test]
+    fn browser_js_tree_collapse_focus_target_matrix() {
+        let ctx = quick_js::Context::new().expect("quick-js context");
+        // CommonJS 钩子 shim: 与 Node 的 module.exports 语义一致 (浏览器无 module).
+        ctx.eval("globalThis.module = { exports: {} };")
+            .expect("CommonJS module shim");
+        ctx.eval(BROWSER_JS).expect("eval BROWSER_JS");
+        // 期望 'restore': 折叠生效时树内/调整器内/抽屉唤起按钮焦点一律移交恢复按钮.
+        for expr in [
+            "collapseFocusTarget(true, false, 'tree')",
+            "collapseFocusTarget(true, false, 'resizer')",
+            "collapseFocusTarget(true, false, 'drawer')",
+        ] {
+            let got = ctx
+                .eval(&format!("module.exports.{expr}"))
+                .expect("collapseFocusTarget must not throw");
+            assert_eq!(
+                got.as_str(),
+                Some("restore"),
+                "{expr}: expected restore, got {got:?}"
+            );
+        }
+        // 期望 'collapse': 宽屏展开 — 恢复按钮焦点落回折叠按钮; 抽屉唤起按钮
+        // 焦点落回折叠按钮 (树列重新可见).
+        for expr in [
+            "collapseFocusTarget(false, false, 'restore')",
+            "collapseFocusTarget(false, false, 'drawer')",
+        ] {
+            let got = ctx
+                .eval(&format!("module.exports.{expr}"))
+                .expect("collapseFocusTarget must not throw");
+            assert_eq!(
+                got.as_str(),
+                Some("collapse"),
+                "{expr}: expected collapse, got {got:?}"
+            );
+        }
+        // 期望 'drawer': 收窄到抽屉且焦点在恢复按钮 → 移交可见的抽屉唤起按钮.
+        let expr = "collapseFocusTarget(false, true, 'restore')";
+        let got = ctx
+            .eval(&format!("module.exports.{expr}"))
+            .expect("collapseFocusTarget must not throw");
+        assert_eq!(
+            got.as_str(),
+            Some("drawer"),
+            "{expr}: expected drawer, got {got:?}"
+        );
+        // 期望 null (不移交): 焦点元素保持可见/可聚焦, 或不在受影响控件内.
+        for expr in [
+            "collapseFocusTarget(false, false, 'tree')",
+            "collapseFocusTarget(false, false, 'resizer')",
+            "collapseFocusTarget(false, false, null)",
+            "collapseFocusTarget(false, true, 'tree')",
+            "collapseFocusTarget(false, true, 'resizer')",
+            "collapseFocusTarget(false, true, 'drawer')",
+            "collapseFocusTarget(false, true, null)",
+            "collapseFocusTarget(true, false, 'restore')",
+            "collapseFocusTarget(true, false, null)",
+            "collapseFocusTarget(true, true, 'restore')",
+            "collapseFocusTarget(true, true, null)",
+        ] {
+            let got = ctx
+                .eval(&format!("module.exports.{expr}"))
+                .expect("collapseFocusTarget must not throw");
+            assert!(
+                matches!(got, quick_js::JsValue::Null),
+                "{expr}: expected null, got {got:?}"
+            );
+        }
     }
 }

@@ -315,10 +315,16 @@ body.cb-tree-mode.cb-tree-collapsed .cb-tree-restore {
   color: var(--cb-text);
   cursor: pointer;
 }
-body.cb-tree-mode.cb-tree-collapsed .cb-tree-restore:hover {
-  border-color: var(--cb-accent);
-  color: var(--cb-accent);
+/* 键盘焦点可见性: 高对比 outline, 仅键盘触发 (鼠标点击不显示) — 树壳全部
+ * 交互控件统一 (折叠/恢复/抽屉唤起/模式切换), 保证纯键盘操作可定位焦点 */
+.cb-tree-collapse:focus-visible,
+.cb-tree-restore:focus-visible,
+.cb-tree-open:focus-visible,
+.cb-mode-toggle:focus-visible {
+  outline: 2px solid var(--cb-accent);
+  outline-offset: 2px;
 }
+/* 拖拽期间: 全局 col-resize 光标 + 禁文本选择 (指针已捕获, 双保险) */
 /* 拖拽期间: 全局 col-resize 光标 + 禁文本选择 (指针已捕获, 双保险) */
 body.cb-tree-resizing {
   cursor: col-resize;

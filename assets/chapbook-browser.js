@@ -711,6 +711,13 @@
   let treeRestoreBtn = null; // 左缘恢复按钮 (仅折叠生效时可见)
   let treeCollapseMql = null; // 断点感知: 窄屏强制展开, 宽屏重放偏好
   let treeCollapseMqlHandler = null;
+  let treeCollapseBtn = null; // 折叠按钮 (调整器子控件; 展开态焦点落点, 随壳创建/销毁)
+  // 树壳焦点追踪: 跨断点时浏览器在 mql 处理器运行前就按新视口 CSS 把目标
+  // 控件 display:none 并静默丢弃焦点 (无 focusout 事件), 处理器启动时
+  // activeElement 已回落 body. focusin 捕获阶段记录最近一次落在树壳控件上的
+  // 焦点种类, 落到非树壳控件 (键盘移出/指针点击内容区) 即清空; applyTreeCollapsed
+  // 仅在 activeElement 已丢失焦点时用它补判跨断点落点, 不会因过期记录抢焦点.
+  let treeFocusKind = null;
   function loadJsonArray(key, fallback) {
     try {
       const value = JSON.parse(localStorage.getItem(key) || 'null');
@@ -1189,7 +1196,7 @@
     });
     // 折叠按钮: resizer 子控件. pointerdown 守卫 (closest('.cb-tree-collapse'))
     // 已排除拖拽, keydown 守卫已排除步进. 点击只改折叠偏好, 绝不触碰宽度.
-    const treeCollapseBtn = document.createElement('button');
+    treeCollapseBtn = document.createElement('button');
     treeCollapseBtn.type = 'button';
     treeCollapseBtn.className = 'cb-tree-collapse';
     treeCollapseBtn.setAttribute('aria-label', '收起目录树');
@@ -1316,36 +1323,115 @@
     }
     treeViewportResizeHandler = null;
   }
-  /* ---------- 手动折叠 (宽屏左树收起) ---------- */
+  // 焦点落点纯函数: 返回 'restore' | 'collapse' | 'drawer' | null.
+  // - 折叠生效 (nextCollapsed): 树/调整器/抽屉唤起按钮内的焦点一律移交恢复
+  //   按钮 (inert/隐藏元素不可聚焦, 必须先移出); 恢复按钮自身保持可见, 无需移交.
+  // - 展开生效: 恢复按钮焦点落回折叠按钮 (宽屏 — 树列重新可见) 或抽屉唤起
+  //   按钮 (窄屏 — 恢复按钮即将隐藏); 宽屏下抽屉唤起按钮焦点落回折叠按钮.
+  // - 其余 (焦点在保持可见/可聚焦的元素, 或不在受影响控件内): null 不移交.
+  function collapseFocusTarget(nextCollapsed, narrow, activeKind) {
+    if (
+      nextCollapsed &&
+      (activeKind === 'tree' || activeKind === 'resizer' || activeKind === 'drawer')
+    ) {
+      return 'restore';
+    }
+    if (!nextCollapsed && activeKind === 'restore') {
+      return narrow ? 'drawer' : 'collapse';
+    }
+    if (!nextCollapsed && !narrow && activeKind === 'drawer') {
+      return 'collapse';
+    }
+    return null;
+  }
 
-  // 生效态 = 偏好 && 非窄屏 (窄屏抽屉恒展开, 偏好原样保留). 折叠时树列与
-  // 调整器隐藏 (inert + aria-hidden 双保险), 左缘恢复按钮常驻. 折叠前先移交
-  // 焦点: 焦点必须在任何 class/inert/hidden 变更之前捕获 — inert/隐藏元素
-  // 不可聚焦, 一旦失能焦点即丢且无法再移交; 折叠按钮是调整器子控件, 移交
-  // 判定必须同时覆盖树内与调整器内. 恢复按钮须先解除 hidden 再聚焦
-  // (display:none 不可聚焦); 展开路径先隐藏恢复按钮, 已绘制帧绝不暴露.
+  // 树壳焦点分类: 树内 → 'tree', 调整器内 (折叠按钮是调整器子控件) →
+  // 'resizer', 恢复按钮自身 → 'restore', 抽屉唤起按钮自身 → 'drawer', 其余
+  // → null. 供 applyTreeCollapsed 与焦点追踪共用, 判定顺序先包含后 identity.
+  function classifyTreeFocusTarget(target) {
+    if (treeNav && treeNav.contains(target)) return 'tree';
+    if (treeResizer && treeResizer.contains(target)) return 'resizer';
+    if (treeRestoreBtn && target === treeRestoreBtn) return 'restore';
+    if (treeOpenBtn && target === treeOpenBtn) return 'drawer';
+    return null;
+  }
+
+  // 焦点追踪 (见 treeFocusKind 注释): focusin 捕获阶段记录/清空; 指针按下
+  // 非树壳控件 (内容区等, 不可聚焦元素不触发 focusin) 时清空, 防止过期记录
+  // 在后续断点过渡中误判.
+  function onTreeFocusIn(event) {
+    treeFocusKind = classifyTreeFocusTarget(event.target);
+  }
+
+  function onTreePointerDown(event) {
+    if (!classifyTreeFocusTarget(event.target)) {
+      treeFocusKind = null;
+    }
+  }
+
+  // 焦点必须在任何 class/inert/hidden 变更之前捕获并分类: inert/隐藏元素
+  // 不可聚焦, 一旦失能焦点即丢且无法再移交. 跨断点时焦点可能已被新视口 CSS
+  // 静默丢弃 (见 treeFocusKind), 用追踪记录补判; 落点由纯函数计算, 与最终
+  // 生效态互不纠缠.
   function applyTreeCollapsed() {
     const narrow = treeCollapseMql
       ? treeCollapseMql.matches
       : window.matchMedia(TREE_DRAWER_MQL).matches;
-    treeCollapsed = treeCollapsePreferred && !narrow;
+    const nextCollapsed = treeCollapsePreferred && !narrow;
     const active = document.activeElement;
-    const needsFocusTransfer =
-      treeCollapsed &&
-      treeRestoreBtn &&
-      active &&
-      ((treeNav && treeNav.contains(active)) ||
-        (treeResizer && treeResizer.contains(active)));
-    if (treeRestoreBtn) treeRestoreBtn.hidden = !treeCollapsed;
-    if (needsFocusTransfer) {
-      treeRestoreBtn.focus({ preventScroll: true });
+    let activeKind = active ? classifyTreeFocusTarget(active) : null;
+    if (!activeKind && treeFocusKind) {
+      activeKind = treeFocusKind;
     }
-    document.body.classList.toggle('cb-tree-collapsed', treeCollapsed);
+    const focusTarget = collapseFocusTarget(nextCollapsed, narrow, activeKind);
+
+    treeCollapsed = nextCollapsed;
+    if (treeCollapsed) {
+      // 折叠路径: 恢复按钮先解除 hidden → 折叠类 → 移交焦点 → 树/调整器
+      // inert/hidden (display:none 不可聚焦, 恢复按钮必须先可见才能聚焦).
+      if (treeRestoreBtn) treeRestoreBtn.hidden = false;
+      document.body.classList.add('cb-tree-collapsed');
+      if (focusTarget === 'restore' && treeRestoreBtn) {
+        treeRestoreBtn.focus({ preventScroll: true });
+        treeFocusKind = 'restore'; // 程序化移交不触发 focusin 的环境下直接记录
+      }
+      if (treeNav) {
+        treeNav.inert = true;
+        treeNav.setAttribute('aria-hidden', 'true');
+      }
+      if (treeResizer) treeResizer.hidden = true;
+      return;
+    }
+    // 展开路径: 折叠类移除 → 树/调整器解除 inert/hidden → 落点聚焦 → 恢复
+    // 按钮隐藏 (任何已绘制帧都不暴露恢复控件). 落点: 窄屏抽屉唤起按钮 (宽
+    // →窄过渡, 恢复按钮即将隐藏); 宽屏折叠按钮 (调整器子控件, 已解除隐藏),
+    // 折叠按钮缺失时回退调整器/树壳 — 焦点绝不停留在隐藏/inert 元素.
+    document.body.classList.remove('cb-tree-collapsed');
     if (treeNav) {
-      treeNav.inert = treeCollapsed;
-      treeNav.setAttribute('aria-hidden', treeCollapsed ? 'true' : 'false');
+      treeNav.inert = false;
+      treeNav.setAttribute('aria-hidden', 'false');
     }
-    if (treeResizer) treeResizer.hidden = treeCollapsed;
+    if (treeResizer) treeResizer.hidden = false;
+    if (focusTarget === 'drawer') {
+      // 收窄到抽屉且焦点在恢复按钮 (跨断点补判): 恢复按钮即将隐藏, 焦点移交
+      // 可见的抽屉唤起按钮.
+      if (treeOpenBtn) {
+        treeOpenBtn.focus({ preventScroll: true });
+        treeFocusKind = 'drawer';
+      }
+    } else if (focusTarget === 'restore' || focusTarget === 'collapse') {
+      if (treeCollapseBtn) {
+        treeCollapseBtn.focus({ preventScroll: true });
+        treeFocusKind = 'resizer';
+      } else if (treeResizer) {
+        treeResizer.focus({ preventScroll: true });
+        treeFocusKind = 'resizer';
+      } else if (treeNav) {
+        treeNav.focus({ preventScroll: true });
+        treeFocusKind = 'tree';
+      }
+    }
+    if (treeRestoreBtn) treeRestoreBtn.hidden = true;
   }
 
   // 折叠偏好: persist 只写两态 '1'/'0' (仅按钮交互写入; 窄屏抽屉交互不触碰
@@ -1843,6 +1929,10 @@
     }
     installTreeCollapseMql();
     applyTreeCollapsed();
+    // 树壳焦点追踪: 跨断点过渡需要最近一次树壳焦点记录 (见 treeFocusKind),
+    // 随壳安装/卸载.
+    document.addEventListener('focusin', onTreeFocusIn, true);
+    document.addEventListener('pointerdown', onTreePointerDown, true);
     // 宽屏视口 resize 重钳制: 宽度状态就绪后安装一次 (生效宽随 50vw 上限浮动)
     installTreeViewportResizeHandler();
     // 目录模式预览面板在树模式不存在: 关闭并作废在途预览 (媒体/迟到响应不得残留)
@@ -1938,6 +2028,9 @@
     uninstallDrawerMql();
     uninstallTreeViewportResizeHandler();
     uninstallTreeCollapseMql();
+    document.removeEventListener('focusin', onTreeFocusIn, true);
+    document.removeEventListener('pointerdown', onTreePointerDown, true);
+    treeFocusKind = null; // 焦点追踪随壳销毁, 不残留到下一次进入
     document.body.classList.remove('cb-tree-collapsed');
     // 在途拖拽手势先安全复位: 移除 resizer 会隐式释放捕获并触发
     // lostpointercapture — owner 此刻已复位, 幂等收尾重入直接返回, 不重复清理.
@@ -1951,6 +2044,7 @@
       treeResizer.remove();
       treeResizer = null;
     }
+    treeCollapseBtn = null; // 折叠按钮是调整器子控件, 随壳销毁; 引用必须清空
     document.body.style.removeProperty('--cb-tree-width');
     document.body.classList.remove('cb-tree-resizing');
     if (treeScrim) treeScrim.remove();
@@ -2142,6 +2236,7 @@
       canonicalTransportKey: canonicalTransportKey,
       canStartTreeResize: canStartTreeResize,
       ownsTreeResize: ownsTreeResize,
+      collapseFocusTarget: collapseFocusTarget,
     };
   }
 })();

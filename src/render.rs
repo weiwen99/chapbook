@@ -1054,7 +1054,40 @@ mod tests {
         assert!(css.contains(".cb-doc pre code span.keyword"), "css: {css}");
         assert!(css.contains(".cb-doc #TOC a:hover"), "css: {css}");
         assert!(css.contains(".cb-doc .katex-display"), "css: {css}");
-        // filter/perspective 全局禁止 (树壳也不使用). transform 仅允许树模式外壳
+        // 区内的单个平移函数声明: 窄屏抽屉 .cb-tree 位移 + 折叠/恢复按钮居中
+        // (translate/translateX/translateY 三选一, 一行只允许一个); rotate/scale/
+        // matrix/perspective/translate3d 显式拒绝 — 即使同行出现 translate 也不
+        // 放行 (translate3d 是 3D 位移, 同样拒绝); transition: transform 是过渡
+        // 声明, 与 transform 值声明区分对待. 文档内容区恒禁止 transform.
+        assert!(!css.contains("filter"), "css: {css}");
+        assert!(!css.contains("perspective"), "css: {css}");
+        let (doc_part, shell_part) = css
+            .split_once("/* ---------- 树模式外壳")
+            .expect("tree shell section marker");
+        assert!(!doc_part.contains("transform"), "doc part: {doc_part}");
+        for line in shell_part.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.contains("transform") && !trimmed.starts_with('*') {
+                let is_transition = trimmed.contains("transition: transform");
+                let translate_forms = ["translate(", "translateX(", "translateY("];
+                let translate_count = translate_forms
+                    .iter()
+                    .filter(|form| trimmed.contains(*form))
+                    .count();
+                let banned = [
+                    "rotate(",
+                    "scale(",
+                    "matrix(",
+                    "perspective",
+                    "translate3d(",
+                ];
+                let has_banned = banned.iter().any(|b| trimmed.contains(b));
+                assert!(
+                    is_transition || (translate_count == 1 && !has_banned),
+                    "unexpected transform: {line}"
+                );
+            }
+        }
         // 区内的平移位移: 窄屏抽屉 .cb-tree 位移 + 折叠/恢复按钮居中
         // (translateX/translateY/translate, 无 rotate/scale/matrix); 文档内容区恒禁止.
         assert!(!css.contains("filter"), "css: {css}");
