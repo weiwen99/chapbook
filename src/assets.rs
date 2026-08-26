@@ -954,9 +954,12 @@ mod tests {
     /// 任务 4: 手动折叠 (宽屏左树收起) seam. 行为导向源不变量:
     /// - 键/状态/函数 seam 存在: TREE_COLLAPSED_KEY, treeCollapsePreferred,
     ///   applyTreeCollapsed, installTreeCollapseMql, cb-tree-collapsed, cb-tree-restore;
-    /// - applyTreeCollapsed: 生效态 = 偏好 && 非窄屏 (窄屏抽屉恒展开), 折叠类
-    ///   toggle + 树 inert/aria-hidden + resizer hidden + 恢复按钮 hidden 同步;
-    ///   折叠且焦点在树内时移交恢复按钮 (inert 前必须移出);
+    /// - applyTreeCollapsed 顺序契约: 生效态计算 → 焦点捕获 (document.activeElement)
+    ///   → 树内/调整器内包含判定 (折叠按钮是调整器子控件, 两处都要覆盖) → 恢复按钮
+    ///   解除 hidden → 移交焦点 → 折叠类/inert/aria-hidden/resizer 隐藏. 焦点必须
+    ///   在任何 class/inert/hidden 变更之前移交 (inert/隐藏元素不可聚焦), 恢复按钮
+    ///   必须先解除 hidden 才能聚焦 (display:none 不可聚焦), 展开路径先隐藏恢复
+    ///   按钮 (任何已绘制帧都不暴露恢复控件);
     /// - 持久化只写两态 '1'/'0'; 恢复按钮点击只写偏好 false;
     /// - mql install/uninstall 同一 handler 引用 add/remove (含 legacy 回退),
     ///   uninstall 清空引用;
@@ -978,7 +981,7 @@ mod tests {
             assert!(js.contains(needle), "missing tree-collapse seam: {needle}");
         }
         // applyTreeCollapsed 切片 (止于 setTreeCollapsePreference): 生效态计算、
-        // 折叠类/inert/aria-hidden/resizer/恢复按钮同步、焦点移交.
+        // 焦点捕获/移交 (树内 + 调整器内) 与 class/inert/hidden 同步的顺序契约.
         let apply_start = js
             .find("function applyTreeCollapsed(")
             .expect("applyTreeCollapsed 存在");
@@ -986,20 +989,55 @@ mod tests {
             .find("function setTreeCollapsePreference(")
             .expect("setTreeCollapsePreference 位于 applyTreeCollapsed 之后");
         let apply = &js[apply_start..apply_end];
-        for needle in [
-            "treeCollapsed = treeCollapsePreferred && !narrow",
-            "classList.toggle('cb-tree-collapsed', treeCollapsed)",
-            "treeNav.inert = treeCollapsed",
-            "setAttribute('aria-hidden', treeCollapsed ? 'true' : 'false')",
-            "treeResizer.hidden = treeCollapsed",
-            "treeRestoreBtn.hidden = !treeCollapsed",
-            "treeRestoreBtn.focus({ preventScroll: true })",
-        ] {
-            assert!(
-                apply.contains(needle),
-                "applyTreeCollapsed 必须包含 {needle}"
-            );
-        }
+        let state_at = apply
+            .find("treeCollapsed = treeCollapsePreferred && !narrow")
+            .expect("applyTreeCollapsed 先计算生效态");
+        let capture_at = apply
+            .find("const active = document.activeElement")
+            .expect("applyTreeCollapsed 必须先捕获活动焦点");
+        let nav_at = apply
+            .find("treeNav.contains(active)")
+            .expect("焦点移交判定必须覆盖树内");
+        let resizer_at = apply
+            .find("treeResizer.contains(active)")
+            .expect("焦点移交判定必须覆盖调整器内 (折叠按钮子控件)");
+        let show_at = apply
+            .find("treeRestoreBtn.hidden = !treeCollapsed")
+            .expect("恢复按钮 hidden 同步存在");
+        let focus_at = apply
+            .find("treeRestoreBtn.focus({ preventScroll: true })")
+            .expect("焦点移交到恢复按钮存在");
+        let class_at = apply
+            .find("classList.toggle('cb-tree-collapsed', treeCollapsed)")
+            .expect("折叠类同步存在");
+        let inert_at = apply
+            .find("treeNav.inert = treeCollapsed")
+            .expect("树 inert 同步存在");
+        let aria_at = apply
+            .find("setAttribute('aria-hidden', treeCollapsed ? 'true' : 'false')")
+            .expect("aria-hidden 同步存在");
+        let resizer_hidden_at = apply
+            .find("treeResizer.hidden = treeCollapsed")
+            .expect("调整器 hidden 同步存在");
+        assert!(
+            state_at < capture_at && capture_at < nav_at && nav_at < resizer_at,
+            "生效态计算 → 焦点捕获 → 树/调整器包含判定必须依次在前 (先于任何 class/inert/hidden 变更)"
+        );
+        assert!(
+            resizer_at < show_at && show_at < focus_at,
+            "恢复按钮必须先解除 hidden, 再移交焦点 (display:none 不可聚焦)"
+        );
+        assert!(
+            focus_at < class_at
+                && class_at < inert_at
+                && inert_at < aria_at
+                && aria_at < resizer_hidden_at,
+            "焦点移交必须先于折叠类/inert/aria-hidden/resizer 隐藏"
+        );
+        assert!(
+            show_at < resizer_hidden_at,
+            "恢复按钮 hidden 同步必须先于调整器隐藏 (展开路径先隐藏恢复控件)"
+        );
         // setTreeCollapsePreference: persist 只写两态 '1'/'0', 随后立即重算生效态.
         let pref_start = apply_end;
         let pref_end = js

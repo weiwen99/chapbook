@@ -1319,28 +1319,33 @@
   /* ---------- 手动折叠 (宽屏左树收起) ---------- */
 
   // 生效态 = 偏好 && 非窄屏 (窄屏抽屉恒展开, 偏好原样保留). 折叠时树列与
-  // 调整器隐藏 (inert + aria-hidden 双保险), 左缘恢复按钮常驻; 焦点若在树内
-  // 则先移交恢复按钮 (inert 元素不可聚焦, 必须提前移出).
+  // 调整器隐藏 (inert + aria-hidden 双保险), 左缘恢复按钮常驻. 折叠前先移交
+  // 焦点: 焦点必须在任何 class/inert/hidden 变更之前捕获 — inert/隐藏元素
+  // 不可聚焦, 一旦失能焦点即丢且无法再移交; 折叠按钮是调整器子控件, 移交
+  // 判定必须同时覆盖树内与调整器内. 恢复按钮须先解除 hidden 再聚焦
+  // (display:none 不可聚焦); 展开路径先隐藏恢复按钮, 已绘制帧绝不暴露.
   function applyTreeCollapsed() {
     const narrow = treeCollapseMql
       ? treeCollapseMql.matches
       : window.matchMedia(TREE_DRAWER_MQL).matches;
     treeCollapsed = treeCollapsePreferred && !narrow;
+    const active = document.activeElement;
+    const needsFocusTransfer =
+      treeCollapsed &&
+      treeRestoreBtn &&
+      active &&
+      ((treeNav && treeNav.contains(active)) ||
+        (treeResizer && treeResizer.contains(active)));
+    if (treeRestoreBtn) treeRestoreBtn.hidden = !treeCollapsed;
+    if (needsFocusTransfer) {
+      treeRestoreBtn.focus({ preventScroll: true });
+    }
     document.body.classList.toggle('cb-tree-collapsed', treeCollapsed);
     if (treeNav) {
       treeNav.inert = treeCollapsed;
       treeNav.setAttribute('aria-hidden', treeCollapsed ? 'true' : 'false');
     }
     if (treeResizer) treeResizer.hidden = treeCollapsed;
-    if (treeRestoreBtn) treeRestoreBtn.hidden = !treeCollapsed;
-    if (
-      treeCollapsed &&
-      treeRestoreBtn &&
-      treeNav &&
-      treeNav.contains(document.activeElement)
-    ) {
-      treeRestoreBtn.focus({ preventScroll: true });
-    }
   }
 
   // 折叠偏好: persist 只写两态 '1'/'0' (仅按钮交互写入; 窄屏抽屉交互不触碰

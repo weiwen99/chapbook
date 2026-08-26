@@ -290,7 +290,10 @@ body.cb-tree-mode.cb-tree-collapsed .cb-tree-resizer {
   display: none;
   pointer-events: none;
 }
-.cb-tree-restore {
+/* 恢复按钮可见性由 JS hidden 属性同步, 不能无条件 display:none: 折叠前 JS
+ * 必须先解除 hidden 再聚焦 (display:none 元素不可聚焦), 基规则只按 [hidden]
+ * 隐藏; 折叠态规则特异性更高, 但折叠时 JS 恒 hidden=false, 展开时恒 true. */
+.cb-tree-restore[hidden] {
   display: none; /* 仅折叠生效时可见 */
 }
 body.cb-tree-mode.cb-tree-collapsed .cb-tree-restore {
