@@ -258,19 +258,18 @@ mod tests {
     /// Task 1 行为导向源不变量: canonical transport key seam 必须锁定。
     /// - 纯函数 canonicalTransportKey 存在, 且位于 actionUrl 之前;
     /// - 请求路径与 wrapper path 都在 commitPane 中经该 seam 绑定;
+    /// - commitPane 绑定顺序: requestedKey 赋值 < wrapperKey 赋值 < equality
+    ///   守卫 < wrapper action URL 构造 < DOM/history 提交;
     /// - transport key 构造段不 decode (no-decode action 契约保留);
     /// - 编码斜杠 `%2F` 必须拒绝 (byte === 0x2f);
     /// - 经 CommonJS 钩子暴露 (浏览器无全局污染)。
     #[test]
     fn browser_js_canonical_transport_binding_seam_is_locked() {
         let js = BROWSER_JS;
-        for seam in [
-            "function canonicalTransportKey(",
-            "canonicalTransportKey(encodedPath)",
-            "canonicalTransportKey(wrapperPath)",
-        ] {
-            assert!(js.contains(seam), "missing transport seam: {seam}");
-        }
+        assert!(
+            js.contains("function canonicalTransportKey("),
+            "transport-key 函数存在"
+        );
         let start = js
             .find("function canonicalTransportKey(")
             .expect("transport-key function");
@@ -288,17 +287,28 @@ mod tests {
             "encoded slash must be rejected"
         );
         assert!(js.contains("canonicalTransportKey: canonicalTransportKey"));
-        // 绑定强度: commitPane 内 equality 守卫必须先于 wrapper action URL 构造,
-        // 且 DOM/history 提交必须发生在守卫之后; requested/wrapper key 绝不直接
-        // 参与 action URL 构造.
+        // 绑定强度: commitPane 内 requestedKey 必须先于 wrapperKey 绑定赋值,
+        // equality 守卫先于 wrapper action URL 构造, DOM/history 提交发生在全部
+        // 绑定与守卫之后; requested/wrapper key 绝不直接参与 action URL 构造.
         let cp_start = js.find("function commitPane(").expect("commitPane 存在");
         let cp_end = js
             .find("function clearTreeCurrent(")
             .expect("clearTreeCurrent 位于 commitPane 之后");
         let cp_body = &js[cp_start..cp_end];
+        let requested_at = cp_body
+            .find("const requestedKey = canonicalTransportKey(encodedPath);")
+            .expect("requestedKey 绑定赋值存在");
+        let wrapper_at = cp_body
+            .find("const wrapperKey = canonicalTransportKey(wrapperPath);")
+            .expect("wrapperKey 绑定赋值存在");
+        assert!(
+            requested_at < wrapper_at,
+            "requestedKey 赋值必须先于 wrapperKey 赋值"
+        );
         let eq = cp_body
             .find("requestedKey === wrapperKey")
             .expect("equality 守卫存在");
+        assert!(wrapper_at < eq, "wrapperKey 绑定必须先于 equality 守卫");
         let action = cp_body
             .find("actionUrl(wrapperPath, 'full')")
             .expect("wrapper action URL 构造存在");
@@ -325,6 +335,7 @@ mod tests {
     /// 可执行行为矩阵: 在 QuickJS 中运行真实的 canonicalTransportKey, 覆盖
     /// 非规范 %HH / 大小写混合 / 字面 Unicode / 服务端保留 ASCII /
     /// 字面 + % 与反斜杠 / 编码斜杠拒绝 / dot segment 拒绝 / 非法 % /
+    /// 多段路径与段内 %HH 保留 / 前导·尾随·空段拒绝 / 非法 %HH hex 拒绝 /
     /// 空串 root / 孤立代理项拒绝 / 合法 emoji 与 U+FFFD 的 UTF-8 大写百分号编码。
     /// 与 Node 矩阵同构 (quick-js 核心无 TextEncoder, 测试内供 WHATWG 同语义
     /// 单标量 UTF-8 polyfill; BROWSER_JS 本身仅把 encode 结果逐字节 percent 化)。
@@ -379,7 +390,11 @@ mod tests {
             ("a%25b.md", Some("a%25b.md")),
             ("a\\b.md", Some("a%5Cb.md")),
             ("a%5cb.md", Some("a%5Cb.md")),
+            ("a/b%20c.md", Some("a/b%20c.md")),
             ("a%2Fb.md", None),
+            ("/a", None),
+            ("a/", None),
+            ("a//b", None),
             (".", None),
             ("%2e", None),
             ("..", None),
@@ -387,6 +402,8 @@ mod tests {
             (".%2e", None),
             ("%2e.", None),
             ("bad%", None),
+            ("%GG", None),
+            ("%2x", None),
             ("😀.md", Some("%F0%9F%98%80.md")),
             ("\u{FFFD}.md", Some("%EF%BF%BD.md")),
         ];
@@ -407,8 +424,8 @@ mod tests {
                 ),
             }
         }
-        // 孤立代理项无法在 Rust str 中表示 (非合法标量), 经 JS 转义构造输入;
-        // 现行实现 String.fromCodePoint 会抛 RangeError → RED, 修复后返回 null.
+        // 孤立代理项无法在 Rust str 中表示 (非合法标量); 以 JS 转义字面量构造输入,
+        // 必须不抛异常并返回 null.
         for literal in ["'\\uD800'", "'\\uDC00'"] {
             let js = format!("module.exports.canonicalTransportKey({literal})");
             let got = ctx.eval(&js).expect("canonicalTransportKey must not throw");
