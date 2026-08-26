@@ -435,4 +435,23 @@ mod tests {
             );
         }
     }
+
+    /// 任务 2: 文档布局 seam (installDocLayout 移动 TOC 节点, 不克隆).
+    #[test]
+    fn browser_js_document_layout_seam_is_locked() {
+        let js = BROWSER_JS;
+        for seam in [
+            "function installDocLayout(",
+            "cb-doc-layout",
+            "cb-doc-toc",
+            "cb-doc-content",
+            "installDocLayout(wrapper.querySelector('.cb-doc'))",
+        ] {
+            assert!(js.contains(seam), "missing document-layout seam: {seam}");
+        }
+        assert!(
+            js.contains("tocHost.append(tocNav)"),
+            "TOC node must move, not clone"
+        );
+    }
 }

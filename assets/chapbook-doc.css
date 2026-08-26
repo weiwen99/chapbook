@@ -151,29 +151,43 @@ html:has(> body.cb-doc-page) {
   .cb-doc pre code span.constant { color: #79c0ff; }
   .cb-doc pre code span.type, .cb-doc pre code span.variable { color: #ffa657; }
 }
-/* 宽屏: TOC 固定为右侧边栏, 正文左移并在剩余空间中居中; 窄屏/打印: 保持顶部卡片.
- * margin-right 仅在页面确实有 TOC 时生效 — 代码文件页无 TOC, 否则会留出空侧栏位.
- * 固定定位属页面级行为, 挂在 .cb-doc-page (片段嵌入宿主时不搬走宿主布局) */
+/* 文档布局 (ticket 02, JS 渐进增强 installDocLayout): TOC 与正文是命名网格的
+ * 真实兄弟列 — 正文永不环绕/流入 TOC 列. 宽屏 (≥ 75rem): 内容区 + 右侧 240px
+ * TOC 列, TOC sticky 于自身滚动容器 (完整页视口 / pane) 内, 长 TOC 内部滚动.
+ * 窄屏: 单列, DOM 序 TOC 在内容前. 无 JS / 无 TOC 文档: wrapper 不建, TOC 保持
+ * 顶部卡片. 完整页与片段共用 (宿主无关). */
+.cb-doc-layout,
+.cb-doc-content,
+.cb-doc-toc {
+  min-width: 0;
+}
+
 @media screen and (min-width: 75rem) {
-  .cb-doc-page:has(#TOC), .cb-doc-page:has(#table-of-contents) {
-    margin-right: max(19rem, calc((100% - 100rem) / 2 + 9.5rem));
+  .cb-doc-layout {
+    display: grid;
+    grid-template-areas: "content toc";
+    grid-template-columns: minmax(0, 1fr) 240px;
+    gap: 20px;
+    align-items: start;
   }
-  .cb-doc-page #TOC, .cb-doc-page #table-of-contents {
-    position: fixed;
+  .cb-doc-content { grid-area: content; }
+  .cb-doc-toc {
+    grid-area: toc;
+    position: sticky;
     top: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 10;
-    width: 19rem;
-    margin: 0;
-    padding: 2.5rem 1.4rem;
+    max-height: calc(100vh - 2rem);
     overflow-y: auto;
-    overflow-wrap: break-word;
-    border: none;
-    border-left: 1px solid var(--cb-border);
-    border-radius: 0;
-    font-size: 0.9em;
   }
+}
+
+@media screen and (max-width: 74.999rem) {
+  .cb-doc-layout {
+    display: grid;
+    grid-template-areas: "toc" "content";
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .cb-doc-toc { grid-area: toc; }
+  .cb-doc-content { grid-area: content; }
 }
 
 /* ---------- 树模式外壳 (chapbook-browser.js) ---------- */
@@ -228,31 +242,6 @@ body.cb-tree-mode .cb-pane {
   overflow-y: auto;
   min-width: 0;
   min-height: 0;
-}
-/* ---------- 树模式 pane 内 TOC 侧栏 (ticket 08) ----------
- * 文档 fragment 在 .cb-pane 内宽屏 (≥ 75rem) 时 #TOC 浮到右侧并 sticky 在
- * pane 滚动容器内: float + sticky 使正文正常流环绕侧栏, 不改变块级间距
- * (margin 折叠保留); 纯 CSS 布局, 无 JS disposer — 窄屏/无 TOC 时规则
- * 不命中, 保持顶部卡片. max-height 以 pane 可视高度为上限, 长 TOC 内部滚动. */
-@media screen and (min-width: 75rem) {
-  body.cb-tree-mode .cb-pane .cb-doc #TOC,
-  body.cb-tree-mode .cb-pane .cb-doc #table-of-contents {
-    float: right;
-    position: sticky;
-    top: 0;
-    z-index: 5;
-    width: 19rem;
-    max-height: calc(100vh - 6.5rem);
-    margin: 0 0 1em 2rem;
-    overflow-y: auto;
-    overflow-wrap: break-word;
-  }
-  /* 标题块同样左浮到正文栏: 块盒不环绕 float, 否则标题独占整行, rail 起点
-   * 落在标题下方; 两者同行后 rail 与完整页 (ticket 03) 一致从 pane 顶部开始 */
-  body.cb-tree-mode .cb-pane .cb-doc > header#title-block-header {
-    float: left;
-    width: calc(100% - 21rem);
-  }
 }
 
 .cb-tree ul {
@@ -401,20 +390,6 @@ body.cb-tree-mode [data-cb-action="native"] {
   }
 }
 
-/* ---------- ticket 08 review fixes ---------- */
-/* 树模式下完整页 fixed rail 规则不得作用于 pane (ticket 03 rail 仅完整页):
- * 取消 body 双栏预留; pane 内 TOC 只服从 pane rail 规则. */
-body.cb-tree-mode.cb-doc-page:has(#TOC),
-body.cb-tree-mode.cb-doc-page:has(#table-of-contents) {
-  margin-right: 0;
-}
-body.cb-tree-mode .cb-pane .cb-doc #TOC,
-body.cb-tree-mode .cb-pane .cb-doc #table-of-contents {
-  right: auto;
-  bottom: auto;
-  border: none;
-  padding: 0.9em 1.4em;
-}
 /* 恢复 pane 错误横幅样式 (ticket 06, 实现 08 时误删) */
 body.cb-tree-mode .cb-pane .cb-pane-error {
   margin: 1rem 1.5rem 0;

@@ -1289,6 +1289,13 @@
       document.title = titleEl.textContent.trim();
     }
     pane.scrollTop = 0;
+    // 文档布局: wrapper 即 .cb-doc (文档片段) 时直接装; 否则查内层 .cb-doc
+    // (目录/媒体片段无 .cb-doc: installDocLayout(null) no-op, 不建 wrapper)
+    if (wrapper.matches('.cb-doc')) {
+      installDocLayout(wrapper);
+    } else {
+      installDocLayout(wrapper.querySelector('.cb-doc'));
+    }
     installPaneTocSpy(wrapper); // 新内容就位后重建 pane TOC spy (无 TOC 则 no-op)
     paneCommittedPath = wrapperPath;
     paneCommittedGen = gen;
@@ -1352,6 +1359,32 @@
   // TOC 容器: markdown/org 自渲染为 #TOC; #table-of-contents 为 pandoc 兼容形态.
   function tocNavIn(root) {
     return root.querySelector('#TOC, #table-of-contents');
+  }
+
+  // 文档布局 (ticket 02): TOC 与正文是 .cb-doc 下的真实兄弟列. 幂等 — 已装过
+  // 直接返回现有 layout. 原 #TOC / #table-of-contents 节点被移动 (绝不克隆),
+  // 锚点 id / href / slug 契约不变. 无 TOC 文档返回 null, 不建 wrapper.
+  function installDocLayout(docEl) {
+    if (!docEl) return null;
+    const existing = docEl.querySelector(':scope > .cb-doc-layout');
+    if (existing) return existing;
+    const tocNav = tocNavIn(docEl);
+    if (!tocNav) return null;
+    const originalNodes = Array.from(docEl.childNodes);
+    const layout = document.createElement('div');
+    layout.className = 'cb-doc-layout';
+    const tocHost = document.createElement('aside');
+    tocHost.className = 'cb-doc-toc';
+    tocHost.setAttribute('aria-label', '文档目录');
+    const content = document.createElement('div');
+    content.className = 'cb-doc-content';
+    tocHost.append(tocNav); // 原节点移动: slug/href 配对与标题锚点不变
+    originalNodes.forEach(function (node) {
+      if (node !== tocNav) content.append(node);
+    });
+    layout.append(tocHost, content); // TOC-first DOM (a11y / 窄屏阅读序)
+    docEl.replaceChildren(layout);
+    return layout;
   }
 
   // 通用 scroll-spy: 观察被 TOC 收录的标题锚点 (hN > a[id] 且 id 出现在 TOC
@@ -1487,13 +1520,11 @@
   let fullPageSpyDisposer = null;
   function initFullPageTocSpy() {
     if (!document.body.classList.contains('cb-doc-page')) return;
-    const tocNav = tocNavIn(document);
+    const docEl = document.querySelector('.cb-doc');
+    installDocLayout(docEl); // 先装布局 (TOC 移入 toc 列), 再按新 DOM 装 spy
+    const tocNav = docEl ? tocNavIn(docEl) : null;
     if (!tocNav) return; // 无 TOC 页面 (代码/无标题文档): 不启用 spy
-    fullPageSpyDisposer = installTocSpy(
-      document.querySelector('.cb-doc') || document.body,
-      tocNav,
-      null
-    );
+    fullPageSpyDisposer = installTocSpy(docEl, tocNav, null);
   }
 
   function installPaneTocSpy(wrapper) {

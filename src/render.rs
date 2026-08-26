@@ -839,8 +839,22 @@ mod tests {
             "css: {css}"
         );
         assert!(css.contains(".cb-doc-page"), "css: {css}");
-        assert!(css.contains(".cb-doc-page:has(#TOC)"), "css: {css}");
-        assert!(css.contains(".cb-doc-page #TOC"), "css: {css}");
+        // 文档布局 (ticket 02): TOC 是命名网格的兄弟列, 旧 fixed rail (完整页) 与
+        // float rail (pane) 必须彻底移除 — 正文不得环绕/流入 TOC 列, rail 不得叠在正文上.
+        assert!(
+            css.contains("grid-template-areas: \"content toc\""),
+            "css: {css}"
+        );
+        assert!(css.contains("grid-area: content"), "css: {css}");
+        assert!(css.contains("grid-area: toc"), "css: {css}");
+        assert!(
+            !css.contains("float: right"),
+            "TOC must not float over document text: {css}"
+        );
+        assert!(
+            !css.contains(".cb-doc-page #TOC {\n    position: fixed"),
+            "old fixed rail must be gone: {css}"
+        );
         assert!(!css.contains("body:has(#TOC)"), "css: {css}");
         assert!(!css.contains("\nhtml {"), "css: {css}");
         assert!(!css.contains("\nbody {"), "css: {css}");
