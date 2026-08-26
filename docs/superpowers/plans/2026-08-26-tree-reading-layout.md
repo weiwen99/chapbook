@@ -571,14 +571,15 @@ git commit -m "feat(tree): add resizable scrollbar-free sidebar"
 - Modify: `assets/chapbook-doc.css:195-410`
 
 - [ ] **Step 1: Add a failing source-invariant test**
-
 ```rust
 #[test]
 fn browser_js_tree_collapse_seams_are_locked() {
     let js = BROWSER_JS;
     for seam in [
         "TREE_COLLAPSED_KEY = 'cb-tree-collapsed'",
-        "function setTreeCollapsed(",
+        "treeCollapsePreferred",
+        "function applyTreeCollapsed(",
+        "function installTreeCollapseMql(",
         "cb-tree-collapsed",
         "cb-tree-restore",
     ] {
@@ -594,14 +595,19 @@ cargo test assets::tests::browser_js_tree_collapse_seams_are_locked -- --exact
 ```
 
 - [ ] **Step 3: Add state and controls**
-
 ```js
   const TREE_COLLAPSED_KEY = 'cb-tree-collapsed';
-  let treeCollapsed = false;
+  let treeCollapsePreferred = false; // persisted wide-screen preference
+  let treeCollapsed = false; // currently effective layout state
   let treeRestoreBtn = null;
+  let treeCollapseMql = null;
+  let treeCollapseMqlHandler = null;
 
-  function setTreeCollapsed(collapsed, persist) {
-    treeCollapsed = collapsed && !window.matchMedia('(width < 64rem)').matches;
+  function applyTreeCollapsed() {
+    const narrow = treeCollapseMql
+      ? treeCollapseMql.matches
+      : window.matchMedia('(width < 64rem)').matches;
+    treeCollapsed = treeCollapsePreferred && !narrow;
     document.body.classList.toggle('cb-tree-collapsed', treeCollapsed);
     if (treeNav) {
       treeNav.inert = treeCollapsed;
@@ -617,11 +623,38 @@ cargo test assets::tests::browser_js_tree_collapse_seams_are_locked -- --exact
     ) {
       treeRestoreBtn.focus({ preventScroll: true });
     }
+  }
+
+  function setTreeCollapsePreference(preferred, persist) {
+    treeCollapsePreferred = preferred;
     if (persist) {
       try {
-        localStorage.setItem(TREE_COLLAPSED_KEY, treeCollapsed ? '1' : '0');
+        localStorage.setItem(TREE_COLLAPSED_KEY, preferred ? '1' : '0');
       } catch (err) {}
     }
+    applyTreeCollapsed();
+  }
+
+  function installTreeCollapseMql() {
+    treeCollapseMql = window.matchMedia('(width < 64rem)');
+    treeCollapseMqlHandler = applyTreeCollapsed;
+    if (treeCollapseMql.addEventListener) {
+      treeCollapseMql.addEventListener('change', treeCollapseMqlHandler);
+    } else {
+      treeCollapseMql.addListener(treeCollapseMqlHandler);
+    }
+  }
+
+  function uninstallTreeCollapseMql() {
+    if (treeCollapseMql && treeCollapseMqlHandler) {
+      if (treeCollapseMql.removeEventListener) {
+        treeCollapseMql.removeEventListener('change', treeCollapseMqlHandler);
+      } else {
+        treeCollapseMql.removeListener(treeCollapseMqlHandler);
+      }
+    }
+    treeCollapseMql = null;
+    treeCollapseMqlHandler = null;
   }
 ```
 
@@ -636,7 +669,7 @@ Add a collapse button inside the resizer and a left-edge restore button:
     collapseBtn.textContent = '‹';
     collapseBtn.addEventListener('click', function (event) {
       event.stopPropagation();
-      setTreeCollapsed(true, true);
+      setTreeCollapsePreference(true, true);
     });
     treeResizer.append(collapseBtn);
 
@@ -647,12 +680,12 @@ Add a collapse button inside the resizer and a left-edge restore button:
     treeRestoreBtn.title = '显示目录树';
     treeRestoreBtn.setAttribute('aria-label', '显示目录树');
     treeRestoreBtn.addEventListener('click', function () {
-      setTreeCollapsed(false, true);
+      setTreeCollapsePreference(false, true);
     });
     document.body.append(treeRestoreBtn);
 ```
 
-Load `cb-tree-collapsed` in `enterTreeMode()`; remove controls in `exitTreeMode()`.
+In `enterTreeMode()`, load `treeCollapsePreferred`, install the media-change listener, then call `applyTreeCollapsed()`. In `exitTreeMode()`, uninstall the listener, remove controls and clear the effective class without overwriting the persisted preference.
 
 - [ ] **Step 4: Add collapsed CSS**
 
@@ -674,6 +707,9 @@ body.cb-tree-mode.cb-tree-collapsed .cb-tree-resizer {
 }
 body.cb-tree-mode.cb-tree-collapsed .cb-tree-restore { display: block; }
 @media (width < 64rem) {
+  body.cb-tree-mode.cb-tree-collapsed {
+    grid-template-columns: minmax(0, 1fr); /* drawer always wins while narrow */
+  }
   body.cb-tree-mode .cb-tree-restore,
   body.cb-tree-mode .cb-tree-collapse { display: none; }
 }
@@ -681,7 +717,7 @@ body.cb-tree-mode.cb-tree-collapsed .cb-tree-restore { display: block; }
 
 - [ ] **Step 5: Verify and commit**
 
-Chromium: collapse/restore, reload persistence, saved width restoration, drawer unaffected at 500px, focus never remains in hidden tree.
+Chromium: collapse/restore, reload persistence, saved width restoration, focus never remains in hidden tree, and the full transition matrix: wide collapsed → narrow drawer opens normally → wide reapplies the persisted collapsed preference.
 
 ```bash
 cargo test assets::tests::browser_js_tree_collapse_seams_are_locked -- --exact

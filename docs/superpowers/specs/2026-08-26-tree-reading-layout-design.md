@@ -133,11 +133,13 @@ The scroll viewport remains `<nav class="cb-tree" aria-label="目录树">`, whil
 Tree collapse is explicit, not automatic.
 
 - localStorage key: `cb-tree-collapsed`.
+- Persisted preference (`treeCollapsePreferred`) is separate from effective layout state (`treeCollapsed`).
+- A `(width < 64rem)` media-change handler forces effective collapse off while narrow, so the drawer contract always wins; returning wide reapplies the persisted preference.
 - A small chevron control lives on the wide resizer.
 - Collapsing sets the tree column to zero and hides the resizer, while leaving a compact left-edge restore button.
 - Restoring uses the previously saved tree width.
 - File navigation never auto-collapses the tree.
-- Narrow drawer state is separate and does not read or overwrite the wide collapse state.
+- Narrow drawer state never reads or overwrites the persisted wide collapse preference.
 
 ## Tree Click Contract
 
@@ -193,7 +195,7 @@ This covers noncanonical `%41`, mixed-case escapes, literal Unicode, literal `+`
 - Directory first click expands exactly once; file first click opens exactly once; double-click creates no second action.
 - Wide TOC is a true sibling column; long text never enters beneath it.
 - Narrow DOM and visual order are TOC then content.
-- Manual collapse/restore persists without affecting drawer state.
+- Manual collapse/restore persists; wide collapsed → narrow drawer → wide restores the collapsed preference without breaking the drawer.
 - Directory and document hosts produce identical workspace geometry.
 - Full-page and SPA replacements install exactly one correct-root scroll-spy.
 - Transport-key matrix: mixed-case escapes, Unicode, `+`, `%`, literal-backslash filename, malformed escape, encoded slash and dot segments.
