@@ -366,6 +366,7 @@ dependencies = [
  "maud",
  "orgize",
  "percent-encoding",
+ "quick-js",
  "serde",
  "serde_json",
  "syntect",

@@ -288,5 +288,130 @@ mod tests {
             "encoded slash must be rejected"
         );
         assert!(js.contains("canonicalTransportKey: canonicalTransportKey"));
+        // 绑定强度: commitPane 内 equality 守卫必须先于 wrapper action URL 构造,
+        // 且 DOM/history 提交必须发生在守卫之后; requested/wrapper key 绝不直接
+        // 参与 action URL 构造.
+        let cp_start = js.find("function commitPane(").expect("commitPane 存在");
+        let cp_end = js
+            .find("function clearTreeCurrent(")
+            .expect("clearTreeCurrent 位于 commitPane 之后");
+        let cp_body = &js[cp_start..cp_end];
+        let eq = cp_body
+            .find("requestedKey === wrapperKey")
+            .expect("equality 守卫存在");
+        let action = cp_body
+            .find("actionUrl(wrapperPath, 'full')")
+            .expect("wrapper action URL 构造存在");
+        assert!(eq < action, "equality 守卫必须先于 action URL 构造");
+        for mutation in [
+            "replaceChildren(wrapper)",
+            "history.replaceState",
+            "history.pushState",
+        ] {
+            let at = cp_body
+                .find(mutation)
+                .unwrap_or_else(|| panic!("commitPane 必须包含 {mutation}"));
+            assert!(action < at, "{mutation} 必须发生在 binding 守卫之后");
+        }
+        assert!(
+            !cp_body.contains("actionUrl(requestedKey"),
+            "requested key 绝不直接用于 action URL"
+        );
+        assert!(
+            !cp_body.contains("actionUrl(wrapperKey"),
+            "wrapper key 绝不直接用于 action URL"
+        );
+    }
+    /// 可执行行为矩阵: 在 QuickJS 中运行真实的 canonicalTransportKey, 覆盖
+    /// 非规范 %HH / 大小写混合 / 字面 Unicode / 服务端保留 ASCII /
+    /// 字面 + % 与反斜杠 / 编码斜杠拒绝 / dot segment 拒绝 / 非法 % /
+    /// 空串 root / 孤立代理项拒绝 / 合法 emoji 与 U+FFFD 的 UTF-8 大写百分号编码。
+    /// 与 Node 矩阵同构 (quick-js 核心无 TextEncoder, 测试内供 WHATWG 同语义
+    /// 单标量 UTF-8 polyfill; BROWSER_JS 本身仅把 encode 结果逐字节 percent 化)。
+    #[test]
+    fn browser_js_canonical_transport_key_matrix() {
+        let ctx = quick_js::Context::new().expect("quick-js context");
+        // CommonJS 钩子 shim: 与 Node 的 module.exports 语义一致 (浏览器无 module).
+        ctx.eval(
+            r#"
+            var module = { exports: {} };
+            globalThis.TextEncoder = function TextEncoder() {
+              this.encode = function (str) {
+                var bytes = [];
+                for (var i = 0; i < str.length;) {
+                  var cp = str.codePointAt(i);
+                  if (cp >= 0xD800 && cp < 0xE000) cp = 0xFFFD;
+                  if (cp < 0x80) {
+                    bytes.push(cp);
+                  } else if (cp < 0x800) {
+                    bytes.push(0xC0 | (cp >> 6), 0x80 | (cp & 0x3F));
+                  } else if (cp < 0x10000) {
+                    bytes.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+                  } else {
+                    bytes.push(
+                      0xF0 | (cp >> 18),
+                      0x80 | ((cp >> 12) & 0x3F),
+                      0x80 | ((cp >> 6) & 0x3F),
+                      0x80 | (cp & 0x3F)
+                    );
+                  }
+                  i += cp > 0xFFFF ? 2 : 1;
+                }
+                return bytes;
+              };
+            };
+            "#,
+        )
+        .expect("test harness setup");
+        ctx.eval(BROWSER_JS).expect("eval BROWSER_JS");
+        let cases: &[(&str, Option<&str>)] = &[
+            ("%41", Some("A")),
+            ("%2b", Some("%2B")),
+            ("中.md", Some("%E4%B8%AD.md")),
+            ("%E4%b8%AD.md", Some("%E4%B8%AD.md")),
+            ("~!$()*", Some("~!$()*")),
+            ("a+b.md", Some("a%2Bb.md")),
+            ("a%25b.md", Some("a%25b.md")),
+            ("a\\b.md", Some("a%5Cb.md")),
+            ("a%5cb.md", Some("a%5Cb.md")),
+            ("a%2Fb.md", None),
+            (".", None),
+            ("%2e", None),
+            ("..", None),
+            ("%2e%2e", None),
+            (".%2e", None),
+            ("%2e.", None),
+            ("bad%", None),
+            ("", Some("")),
+            ("😀", Some("%F0%9F%98%80")),
+            ("\u{FFFD}", Some("%EF%BF%BD")),
+        ];
+        for (input, expected) in cases {
+            let literal = serde_json::to_string(input).expect("json string literal");
+            let got = ctx
+                .eval(&format!("module.exports.canonicalTransportKey({literal})"))
+                .expect("canonicalTransportKey");
+            match expected {
+                Some(exp) => assert_eq!(
+                    got.as_str(),
+                    Some(*exp),
+                    "input {input:?}: expected {exp:?}, got {got:?}"
+                ),
+                None => assert!(
+                    matches!(got, quick_js::JsValue::Null),
+                    "input {input:?}: expected null, got {got:?}"
+                ),
+            }
+        }
+        // 孤立代理项无法在 Rust str 中表示 (非合法标量), 经 JS 转义构造输入;
+        // 现行实现 String.fromCodePoint 会抛 RangeError → RED, 修复后返回 null.
+        for literal in ["'\\uD800'", "'\\uDC00'"] {
+            let js = format!("module.exports.canonicalTransportKey({literal})");
+            let got = ctx.eval(&js).expect("canonicalTransportKey must not throw");
+            assert!(
+                matches!(got, quick_js::JsValue::Null),
+                "lone surrogate {literal}: expected null, got {got:?}"
+            );
+        }
     }
 }

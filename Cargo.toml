@@ -40,6 +40,9 @@ syntect = "5"
 tempfile = "3"
 # 测试内构造最小 docx/xlsx fixture (与 anydoc 的 zip 版本一致, 锁文件复用)
 zip = "8"
+# 测试内执行内嵌浏览器 JS (canonical transport 行为矩阵): 与 katex 相同的
+# 本地 vendor patch (栈 8MB), 仅测试使用, 非运行时依赖.
+quick-js = "=0.4.1"
 
 # vendor 的 quick-js (katex crate 的 JS 引擎): 加大 QuickJS 默认 JS 栈
 # (256KB -> 8MB), 否则 KaTeX 解析深嵌套公式 (\cfrac 7+ 层) 栈溢出.

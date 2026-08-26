@@ -70,7 +70,9 @@
           i += 3;
           continue;
         }
-        const scalar = String.fromCodePoint(rawSegment.codePointAt(i));
+        const cp = rawSegment.codePointAt(i);
+        if (cp >= 0xd800 && cp <= 0xdfff) return null; // 孤立代理项: 合法标量拒绝
+        const scalar = String.fromCodePoint(cp);
         const bytes = new TextEncoder().encode(scalar);
         if (bytes.length === 1 && TRANSPORT_LITERAL_ASCII.test(scalar)) {
           segment += scalar;
