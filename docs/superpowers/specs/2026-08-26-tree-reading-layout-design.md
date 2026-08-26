@@ -121,6 +121,13 @@ scrollbar-width: none;
 
 WebKit additionally hides `::-webkit-scrollbar`. Mouse-wheel, touchpad, touch and keyboard scrolling remain available. Only the scrollbar chrome disappears.
 
+The wide tree viewport is keyboard-focusable and exposes tree semantics:
+
+- `<nav role="tree" tabindex="0" aria-label="目录树">`
+- rows use `role="treeitem"` and nested lists use `role="group"`
+- the current programmatic-only `tabIndex = -1` is replaced
+- after Tab focuses the viewport, Arrow-key tree navigation plus PageUp/PageDown scrolling remain discoverable without a visible scrollbar
+
 ## Manual Reading Collapse
 
 Tree collapse is explicit, not automatic.
@@ -149,7 +156,7 @@ The pane must stay bound to the requested filesystem identity. It must not accep
 A shared pure function produces a canonical transport comparison key, segment by segment:
 
 1. Split only on literal `/`; never decode separators.
-2. Reject malformed `%HH`, encoded slash/backslash and dot-segment forms after normalization.
+2. Reject malformed `%HH`, encoded slash (`%2F`) and dot-segment forms after normalization. Encoded backslash (`%5C`) remains valid: on the Unix server `\` is a literal filename byte, not a separator.
 3. Normalize valid `%HH` hex to uppercase.
 4. Decode percent-encoded RFC 3986 unreserved ASCII into literal characters.
 5. Keep reserved bytes percent-encoded and uppercase.
@@ -158,7 +165,7 @@ A shared pure function produces a canonical transport comparison key, segment by
 8. Compare the requested key exactly with the wrapper canonical `data-native-path-encoded` key.
 9. Only after equality may the pane install DOM or update history; the wrapper value remains the committed canonical identity.
 
-This covers noncanonical `%41`, mixed-case escapes, literal Unicode, literal `+`/`%` filenames and encoded-separator rejection without weakening the action-path no-decode contract.
+This covers noncanonical `%41`, mixed-case escapes, literal Unicode, literal `+`/`%`/backslash filenames and encoded-slash rejection without weakening the action-path no-decode contract.
 
 ## Error Handling
 
@@ -182,14 +189,14 @@ This covers noncanonical `%41`, mixed-case escapes, literal Unicode, literal `+`
 
 - Drag to minimum/maximum, release outside the handle, reload, and verify persistence.
 - Resize by separator keyboard controls and verify ARIA values.
-- Hidden tree scrollbar with wheel, touchpad and keyboard scrolling still functional.
+- Hidden tree scrollbar with wheel, touchpad and keyboard scrolling still functional after Tab focuses the `role="tree"` viewport.
 - Directory first click expands exactly once; file first click opens exactly once; double-click creates no second action.
 - Wide TOC is a true sibling column; long text never enters beneath it.
 - Narrow DOM and visual order are TOC then content.
 - Manual collapse/restore persists without affecting drawer state.
 - Directory and document hosts produce identical workspace geometry.
 - Full-page and SPA replacements install exactly one correct-root scroll-spy.
-- Transport-key matrix: mixed-case escapes, Unicode, `+`, `%`, malformed escape, encoded slash/backslash and dot segments.
+- Transport-key matrix: mixed-case escapes, Unicode, `+`, `%`, literal-backslash filename, malformed escape, encoded slash and dot segments.
 
 ## Out of Scope
 
