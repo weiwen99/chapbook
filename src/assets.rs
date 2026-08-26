@@ -636,4 +636,111 @@ mod tests {
             "拖拽结束时持久化未截断的目标宽"
         );
     }
+
+    /// 任务 3 收尾: 宽屏视口 resize 重钳制生效宽. 宽屏下视口收窄 (仍 ≥64rem)
+    /// 时 50vw 上限下降, 生效宽必须跟随重钳制; 持久化偏好原样保留, resize
+    /// 绝不写 localStorage. 命名处理器 (install/uninstall seam) 在进入树模式、
+    /// 宽度状态就绪后安装一次, 退出树模式卸载 (行为矩阵见 Chromium 验收).
+    #[test]
+    fn browser_js_tree_viewport_resize_reclamp_seam_is_locked() {
+        let js = BROWSER_JS;
+        // 命名处理器状态 + install/uninstall seam: add/remove 必须走同一引用
+        for needle in [
+            "let treeViewportResizeHandler = null;",
+            "function installTreeViewportResizeHandler()",
+            "function uninstallTreeViewportResizeHandler()",
+            "window.addEventListener('resize', treeViewportResizeHandler)",
+            "window.removeEventListener('resize', treeViewportResizeHandler)",
+        ] {
+            assert!(
+                js.contains(needle),
+                "missing viewport-resize seam: {needle}"
+            );
+        }
+        // handler 体: 窄屏抽屉直接返回 (resizer 隐藏, 宽度不生效); 宽屏按偏好
+        // 重钳制, persist=false (绝不写 localStorage). 顺序: 守卫 → 钳制 → 挂载.
+        let inst_start = js
+            .find("function installTreeViewportResizeHandler()")
+            .expect("installTreeViewportResizeHandler 存在");
+        let inst_end = js
+            .find("function uninstallTreeViewportResizeHandler()")
+            .expect("uninstallTreeViewportResizeHandler 位于 install 之后");
+        let inst = &js[inst_start..inst_end];
+        assert!(
+            inst.contains("setTreeWidth(treePreferredWidth, false)"),
+            "resize 必须按偏好重钳制且不持久化"
+        );
+        assert!(
+            !inst.contains("localStorage"),
+            "resize 处理器不得写入 localStorage"
+        );
+        let guard_at = inst
+            .find("matchMedia(TREE_DRAWER_MQL).matches")
+            .expect("resize 窄屏守卫存在");
+        let clamp_at = inst
+            .find("setTreeWidth(treePreferredWidth, false)")
+            .expect("resize 重钳制调用存在");
+        let attach_at = inst
+            .find("addEventListener('resize', treeViewportResizeHandler)")
+            .expect("resize 监听挂载存在");
+        assert!(
+            guard_at < clamp_at && clamp_at < attach_at,
+            "install: 先判窄屏, 再定义重钳制, 最后挂载监听"
+        );
+        // uninstall: 处理器存在才移除, 随后清空引用 (幂等, 不残留)
+        let uninst_start = inst_end;
+        let uninst_end = js
+            .find("function enterTreeMode()")
+            .expect("enterTreeMode 位于 uninstall 之后");
+        let uninst = &js[uninst_start..uninst_end];
+        let rm_at = uninst
+            .find("removeEventListener('resize', treeViewportResizeHandler)")
+            .expect("uninstall 移除 resize 监听");
+        assert!(
+            uninst[rm_at..].contains("treeViewportResizeHandler = null;"),
+            "uninstall 移除监听后必须清空处理器引用"
+        );
+        // install 调用点: enterTreeMode 内宽度状态就绪后安装一次
+        let enter_start = js
+            .find("function enterTreeMode()")
+            .expect("enterTreeMode 存在");
+        let enter_end = js
+            .find("function exitTreeMode()")
+            .expect("exitTreeMode 位于 enterTreeMode 之后");
+        let enter = &js[enter_start..enter_end];
+        let load_at = enter
+            .find("treePreferredWidth = loadTreePreferredWidth()")
+            .expect("enterTreeMode 恢复偏好");
+        let inst_call = enter
+            .find("installTreeViewportResizeHandler()")
+            .expect("enterTreeMode 安装 resize 处理器");
+        assert!(load_at < inst_call, "宽度状态就绪后才能安装 resize 处理器");
+        assert_eq!(
+            enter.matches("installTreeViewportResizeHandler()").count(),
+            1,
+            "resize 处理器只安装一次"
+        );
+        // uninstall 调用点: exitTreeMode 内重载前卸载
+        let exit_start = enter_end;
+        let exit_end = js
+            .find("function applyTreeMode()")
+            .expect("applyTreeMode 位于 exitTreeMode 之后");
+        let exit = &js[exit_start..exit_end];
+        let uninst_call = exit
+            .find("uninstallTreeViewportResizeHandler();")
+            .expect("exitTreeMode 卸载 resize 处理器");
+        let reload_at = exit
+            .find("location.reload();")
+            .expect("exitTreeMode 整页重载");
+        assert!(
+            uninst_call < reload_at,
+            "退出树模式必须先卸载 resize 处理器再重载"
+        );
+        assert_eq!(
+            exit.matches("uninstallTreeViewportResizeHandler();")
+                .count(),
+            1,
+            "resize 处理器只卸载一次"
+        );
+    }
 }

@@ -680,6 +680,9 @@
   let treeOpenBtn = null; // 唤起按钮 (仅窄屏可见)
   let drawerMql = null; // 窄屏 media query (跨回宽屏时清理打开态)
   let drawerMqlHandler = null;
+  // 宽屏视口 resize 重钳制: 视口收窄 (仍 ≥64rem) 时 50vw 上限下降, 生效宽
+  // 需跟随重钳制; 命名处理器便于 enter/exit 对称安装卸载 (绝不写 localStorage).
+  let treeViewportResizeHandler = null;
   // 树宽 (宽屏列 1): resizer 常驻调整; 窄屏抽屉内 resizer 隐藏, 宽度值不生效.
   // treePreferredWidth 是持久化偏好: 仅硬边界 [160,480] 截断, 绝不被窄屏 50vw
   // 上限改写; treeWidth 是当前生效宽 (宽屏 = 偏好按视口约束, 窄屏抽屉忽略).
@@ -1233,6 +1236,22 @@
     drawerMql = null;
     drawerMqlHandler = null;
   }
+  // 宽屏 resize 重钳制: 窄屏抽屉直接忽略 (resizer 隐藏, 宽度不生效); 宽屏按
+  // 持久化偏好重钳制生效宽 (persist=false — 不写 localStorage, 偏好原样保留).
+  function installTreeViewportResizeHandler() {
+    treeViewportResizeHandler = function () {
+      if (window.matchMedia(TREE_DRAWER_MQL).matches) return;
+      setTreeWidth(treePreferredWidth, false);
+    };
+    window.addEventListener('resize', treeViewportResizeHandler);
+  }
+
+  function uninstallTreeViewportResizeHandler() {
+    if (treeViewportResizeHandler) {
+      window.removeEventListener('resize', treeViewportResizeHandler);
+    }
+    treeViewportResizeHandler = null;
+  }
 
   /* ---------- SPA 内容区导航 (树模式) ---------- */
 
@@ -1681,6 +1700,8 @@
     if (!window.matchMedia(TREE_DRAWER_MQL).matches) {
       setTreeWidth(treePreferredWidth, false);
     }
+    // 宽屏视口 resize 重钳制: 宽度状态就绪后安装一次 (生效宽随 50vw 上限浮动)
+    installTreeViewportResizeHandler();
     // 目录模式预览面板在树模式不存在: 关闭并作废在途预览 (媒体/迟到响应不得残留)
     closePanel();
     // Q17 能力边界: 树模式不仅门禁事件路径, 更清空 JS 内存中的 token 并移除
@@ -1772,6 +1793,7 @@
     }
     closeTreeDrawer();
     uninstallDrawerMql();
+    uninstallTreeViewportResizeHandler();
     // 树宽调整器与 CSS 变量随壳销毁: 残留变量会污染再进入时的默认列 (变量
     // 只在树模式被 JS 重新写入, 但避免 dir 宿主残留样式差异).
     if (treeResizer) {
