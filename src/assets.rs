@@ -623,13 +623,14 @@ mod tests {
         }
     }
 
-    /// 任务 3 质量收尾: 拖拽手势单 owner + 捕获失败干净回退的源码切片.
-    /// pointerdown 顺序: 折叠守卫 → 主指针守卫 → setPointerCapture → 激活 id
-    /// 赋值 → class 添加; 捕获失败在 class 添加前 return (不留 class/监听/
-    /// 持久化状态). move/end 均经 ownsTreeResize 过滤 (多指不得移动/结束在途
-    /// 手势); 幂等收尾 onEnd 顺序: owns 守卫 → 复位 id → 移除全部监听 (含
-    /// lostpointercapture) → 移除 class → 释放捕获 → 持久化一次 (id 先复位,
-    /// releasePointerCapture 触发的 lostpointercapture 重入直接返回).
+    /// 任务 3 质量收尾: 拖拽手势单 owner + 捕获失败干净回退的源码切片 (全部
+    /// 切片止于下一条 sibling 监听或各自闭合标记, 不越过函数边界).
+    /// pointerdown 顺序: 折叠守卫 → 主指针守卫 → setPointerCapture → 异常分支
+    /// → 激活 id 赋值 → class 添加; 捕获失败在 class 添加前 return (不留
+    /// class/监听/持久化状态). move/end 均经 ownsTreeResize 过滤 (多指不得
+    /// 移动/结束在途手势); 幂等收尾 onEnd 顺序: owns 守卫 → 复位 id → 移除
+    /// 全部监听 (含 lostpointercapture) → 移除 class → 释放捕获 → 持久化一次
+    /// (id 先复位, releasePointerCapture 触发的 lostpointercapture 重入直接返回).
     #[test]
     fn browser_js_tree_resize_gesture_ownership_is_locked() {
         let js = BROWSER_JS;
@@ -644,11 +645,19 @@ mod tests {
                 "missing gesture-ownership seam: {needle}"
             );
         }
-        // pointerdown 切片: 折叠守卫 < 主指针守卫 < 捕获 < 激活 id < class.
+        // pointerdown 切片 (止于下一条 sibling 监听, 不越过 handler 边界):
+        // 折叠守卫 < 主指针守卫 < 捕获 < 异常分支 < 激活 id < class.
         let pd_start = js
             .find("treeResizer.addEventListener('pointerdown',")
             .expect("resizer pointerdown 处理器存在");
-        let pd = &js[pd_start..];
+        let pd_end = js
+            .find("treeResizer.addEventListener('keydown',")
+            .expect("resizer keydown 处理器存在");
+        assert!(
+            pd_start < pd_end,
+            "pointerdown 处理器必须位于 keydown 监听之前"
+        );
+        let pd = &js[pd_start..pd_end];
         let collapse_at = pd
             .find("closest('.cb-tree-collapse')")
             .expect("pointerdown 折叠按钮守卫存在");
@@ -658,6 +667,9 @@ mod tests {
         let capture_at = pd
             .find("setPointerCapture(event.pointerId)")
             .expect("pointerdown 指针捕获存在");
+        let catch_at = pd
+            .find("} catch (err) {")
+            .expect("pointerdown 捕获异常分支存在");
         let owner_at = pd
             .find("treeResizePointerId = pointerId")
             .expect("pointerdown 激活手势 id 赋值存在");
@@ -667,22 +679,20 @@ mod tests {
         assert!(
             collapse_at < can_start_at
                 && can_start_at < capture_at
-                && capture_at < owner_at
+                && capture_at < catch_at
+                && catch_at < owner_at
                 && owner_at < class_at,
-            "pointerdown 顺序: 折叠守卫 → 主指针守卫 → 捕获 → 激活 id → class"
+            "pointerdown 顺序: 折叠守卫 → 主指针守卫 → 捕获 → 异常分支 → 激活 id → class"
         );
-        // 捕获失败必须干净返回: catch 内 return, 且先于 class 添加.
-        let catch_at = pd
-            .find("} catch (err) {")
-            .expect("pointerdown 捕获异常分支存在");
-        let catch_return = pd[catch_at..]
-            .find("return;")
-            .expect("捕获失败干净返回存在");
+        // 捕获失败必须干净返回: catch 块 (止于 owner 赋值, 同一坐标系) 内含
+        // return, 先于 owner 激活与 class 添加 — 不留 class/监听/持久化状态.
+        let catch_block = &pd[catch_at..owner_at];
         assert!(
-            catch_at < class_at && catch_return < class_at,
-            "setPointerCapture 失败必须在 class 添加前返回"
+            catch_block.contains("return;"),
+            "setPointerCapture 失败必须在捕获块内 return (先于 owner 激活与 class 添加)"
         );
         // onMove 定义在 onEnd 之前, 且只认 owner: 非 owner 指针的 move 不得改宽.
+        // 两个局部函数切片均止于各自闭合 };, 不吞入后续代码.
         let on_move_at = pd
             .find("const onMove = function (moveEvent) {")
             .expect("onMove 函数存在");
@@ -690,7 +700,8 @@ mod tests {
             .find("const onEnd = function (endEvent) {")
             .expect("onEnd 收尾函数存在");
         assert!(on_move_at < on_end_at, "onMove 必须先于 onEnd 定义");
-        let on_move_body = &pd[on_move_at..on_end_at];
+        let on_move_close = pd[on_move_at..].find("};").expect("onMove 闭合缺失");
+        let on_move_body = &pd[on_move_at..on_move_at + on_move_close];
         assert!(
             on_move_body.contains("ownsTreeResize(moveEvent, treeResizePointerId)"),
             "onMove 必须经 ownsTreeResize 过滤"
@@ -707,9 +718,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {needle}"));
             assert!(at > class_at, "{needle} 必须晚于手势启动");
         }
-        // onEnd 幂等收尾切片: owns 守卫 → 复位 id → 移除全部监听 → 移除 class
-        // → 释放捕获 → 持久化一次.
-        let on_end = &pd[on_end_at..];
+        // onEnd 幂等收尾切片 (止于闭合 };): owns 守卫 → 复位 id → 移除全部监听
+        // → 移除 class → 释放捕获 → 持久化一次.
+        let on_end_close = pd[on_end_at..].find("};").expect("onEnd 闭合缺失");
+        let on_end = &pd[on_end_at..on_end_at + on_end_close];
         let owns_at = on_end
             .find("ownsTreeResize(endEvent, treeResizePointerId)")
             .expect("onEnd 必须校验手势所有权");
