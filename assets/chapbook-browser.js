@@ -684,16 +684,15 @@
   // (重复激活返回同一 Promise, 绝不二次 fetch); 条目只由 owner Promise 的
   // finally 清理, 退出树模式整体清空.
   const treePendingLoads = new Map();
-  // 目录展开意图: path -> desired boolean. 在途加载期间再次激活可翻转意图
-  // (加载完成前表达收起); 响应落地时终态跟随意图, 绝不盲目展开.
-  const treeDesiredExpanded = new Map();
-  // 显式用户展开意图 (path 集合): 与 nav/默认意图分离 — reveal/persist 写入
-  // 的 desired 只是默认展开意图, 不算用户动作; 只有用户激活 (click/键盘) 才
-  // 入集合. 在途 toggle 无显式意图时按可见 DOM 推导 (!expanded), nav 的隐藏
-  // desired 绝不参与翻转 (首击可见折叠目录即表达展开); 有显式意图则翻转当前
-  // desired. 安装方消费 (desired + 显式标记), 失败响应 (无缓存) / 叶子化 /
-  // 退出壳兜底清除.
-  const treeUserExpansionIntent = new Set();
+  // 目录展开意图: path -> { expanded, version, explicit } 记录. 按发布时序
+  // (全局单调 treeExpansionIntentVersion) 版本化 — 最新记录即终态权威: 更新
+  // 的导航 (explicit=false) 覆盖更早的显式折叠, 更晚的显式点击覆盖导航.
+  // 安装方 (installTreeChildren) 在落地终态后按记录身份消费; 失败响应 (无
+  // 缓存) 兜底只删本请求适用记录; 叶子化/退出壳整体清除.
+  const treeExpansionIntents = new Map();
+  // 全局单调版本: 每次发布意图递增 — 跨路径共享时序; 记录比较只用身份/版本
+  // (跨壳不清零: 记录已随壳清空, 身份比较天然隔离).
+  let treeExpansionIntentVersion = 0;
   let treeSelectedEl = null;
   // 稳定节点 id 计数器: 仅保证当前壳内唯一/稳定 (ARIA 活动后代公告锚点);
   // 每次建壳复位 (退出树模式后旧节点随壳销毁, id 可安全复用).
@@ -920,16 +919,28 @@
       });
   }
 
-  // 展开意图纯函数 (DOM 无关 seam): 显式用户意图与 nav/默认意图分离.
-  // - 在途 (pending) + 有显式用户意图 (hasExplicitIntent): 翻转当前 desired
-  //   — true→false 即加载完成前收起, false→true 即重新表达展开;
-  // - 在途 + 无显式用户意图: 按当前可见态推导 (!expanded) — 首击可见折叠的
-  //   目录表达展开 (true), nav/reveal 写入的隐藏 desired 绝不参与翻转;
-  // - 无在途: 按当前可见态翻转 (展开→收起 / 收起→展开), 与意图参数无关.
-  // 返回最新 desired 意图.
-  function treeExpansionIntent(pending, expanded, desired, hasExplicitIntent) {
-    if (pending && hasExplicitIntent) return desired === true ? false : true;
-    return expanded ? false : true;
+  // 展开意图纯函数 (DOM 无关 seam): 显式用户激活的下一条意图. prior 为最新
+  // 已发布记录或 null. 最新记录为显式用户意图 (explicit=true) 时翻转其
+  // expanded (第二次激活表达收起); 其余 (无记录 / nav 默认 explicit=false)
+  // 按可见 DOM 推导 (!expanded — 首击可见折叠目录即表达展开, nav 的隐藏意图
+  // 绝不参与). 返回 { expanded, explicit: true } — 调用方经
+  // publishTreeExpansionIntent 发布 (版本化: 更晚的显式动作自然覆盖更早导航).
+  function treeNextExplicitIntent(prior, expanded) {
+    if (prior && prior.explicit) return { expanded: !prior.expanded, explicit: true };
+    return { expanded: expanded ? false : true, explicit: true };
+  }
+
+  // 发布展开意图 (唯一写入点): 递增全局单调版本并存储记录, 返回记录. 导航/
+  // 默认发布 (explicit=false) 与显式用户发布 (explicit=true) 共用 — 时序即
+  // 优先级: 更新的记录永远覆盖更旧的 (latest wins).
+  function publishTreeExpansionIntent(path, expanded, explicit) {
+    const record = {
+      expanded: expanded,
+      version: ++treeExpansionIntentVersion,
+      explicit: explicit,
+    };
+    treeExpansionIntents.set(path, record);
+    return record;
   }
 
   // 树加载提交决策纯函数 (DOM 无关 seam): 提交 DOM/展开/持久化前必须通过 —
@@ -962,15 +973,15 @@
     if (treeExpandedPaths.length !== before) {
       saveJsonArray(TREE_EXPANDED_KEY, treeExpandedPaths);
     }
-    treeDesiredExpanded.delete(path);
-    treeUserExpansionIntent.delete(path); // 叶子无展开语义: 显式标记一并清除
+    treeExpansionIntents.delete(path); // 叶子无展开语义: 意图记录一并清除
   }
 
   // 唯一子项替换点: 把缓存子项安装进 li (缓存命中与异步响应共用). 空缓存 →
   // 叶子化; 替换前先清除被替换子树内的选中 (aria-activedescendant 同步移除);
-  // 终态跟随最新意图 (在途期间可翻转表达收起), 绝不盲目 true; 落地终态后消费
-  // 意图 (desired + 显式标记, DOM 即权威) — 续接方晚于 owner finally 注册,
-  // 意图必须由安装方清理, 否则 finally 抢先清除会让续接方读到已清除的意图.
+  // 终态跟随最新意图记录 (在途期间可翻转表达收起), 无记录默认展开, 绝不盲目
+  // 折叠; 落地终态后按记录身份消费 (DOM 即权威) — 续接方晚于 owner finally
+  // 注册, 意图必须由安装方清理, 否则 finally 抢先清除会让续接方读到已清除的
+  // 意图; 身份比对绝不误删更新导航/显式点击发布的更新记录.
   function installTreeChildren(li, path) {
     const cached = treeCache.get(path);
     if (!cached) return;
@@ -983,9 +994,11 @@
       clearTreeSelection();
     }
     ul.replaceChildren(...cached);
-    setTreeNodeExpanded(li, treeDesiredExpanded.get(path) !== false);
-    treeDesiredExpanded.delete(path); // 意图已消费: DOM 即权威, 不留残留
-    treeUserExpansionIntent.delete(path); // 显式标记随意图一并消费
+    const record = treeExpansionIntents.get(path);
+    setTreeNodeExpanded(li, record ? record.expanded : true);
+    if (treeExpansionIntents.get(path) === record) {
+      treeExpansionIntents.delete(path); // 意图已消费: DOM 即权威, 不留残留
+    }
   }
 
   // 共享在途结果的续接方提交: 响应可能因发起方所有权陈旧只写缓存未动 DOM —
@@ -1001,39 +1014,40 @@
   // 懒加载目录子项; 失败静默 (网络/服务端错误不留半展开态). 同一目录路径只
   // 允许一个在途请求: 重复激活复用同一 Promise, 绝不二次 fetch; 每个调用方
   // 都在共享 Promise 上挂自己的续接 — 发起方所有权陈旧时 (如陈旧导航) 响应
-  // 只写缓存不落 DOM, 本调用方所有权当前则补齐安装, 终态跟随最新意图
-  // (treeDesiredExpanded), 绝不盲目展开; 响应落地后安装方 (installTreeChildren)
-  // 在落地终态后消费意图 (DOM 即权威), finally 在 owner 块内清除在途条目,
-  // 失败响应 (无安装方) 才由 finally 兜底清除意图 (旧壳 finally 不得删新壳
-  // 条目; 续接方晚于 finally 注册, 意图不得被 finally 抢先清除).
+  // 只写缓存不落 DOM, 本调用方所有权当前则补齐安装, 终态跟随最新意图记录
+  // (treeExpansionIntents, 无记录默认展开), 绝不盲目折叠; 响应落地后安装方
+  // (installTreeChildren) 在落地终态后按记录身份消费意图 (DOM 即权威), finally
+  // 在 owner 块内清除在途条目, 失败响应 (无缓存) 才由 finally 兜底删除本请求
+  // 适用记录 (旧壳 finally 不得删新壳条目; 续接方晚于 finally 注册, 意图不得
+  // 被 finally 抢先清除; 更新记录绝不被删除).
   // owner 传调用方所有权: { navGen } (reveal/sync 导航链) 或 { enterGen }
   // (进入链持久化展开) — 响应落地时导航/进入链已过期则只共享缓存结果, 不
-  // 提交 DOM/展开/持久化; 无 owner (显式用户调用) 可采纳共享在途结果.
+  // 提交 DOM/展开/持久化; owner 存在时每次调用都发布 nav/默认意图
+  // (expanded=true, explicit=false) — 更新的导航覆盖更早的显式折叠; 无 owner
+  // (显式用户调用) 可采纳共享在途结果, 意图已由调用方发布.
   function loadTreeChildren(li, path, owner) {
     const gen = treeGen;
     const navGen = owner && typeof owner.navGen === 'number' ? owner.navGen : undefined;
     const enterGen = owner && typeof owner.enterGen === 'number' ? owner.enterGen : undefined;
     const navRequired = navGen !== undefined;
     const navCurrent = navRequired && paneNavGuard.isCurrent(navGen);
+    // nav/进入链 (owner 存在) 每次请求/复用祖先展开都发布 nav/默认意图 — 时序
+    // 即优先级: 更新的导航 (explicit=false) 覆盖更早的显式折叠; 显式用户调用
+    // (无 owner) 已由 toggleTreeNode/ArrowRight 发布显式意图, 此处绝不覆盖.
+    if (owner) publishTreeExpansionIntent(path, true, false);
     if (treeCache.has(path)) {
       // 缓存结果可共享: 陈旧导航/进入链只取结果, 不提交 DOM/展开/持久化
       if (!treeLoadMayCommit(enterGen === undefined || enterGen === treeGen, navRequired, navCurrent)) {
         return Promise.resolve();
-      }
-      if (!treeDesiredExpanded.has(path)) {
-        treeDesiredExpanded.set(path, true); // reveal/persist 复用同一入口即表达展开
       }
       installTreeChildren(li, path);
       return Promise.resolve();
     }
     const inFlight = treePendingLoads.get(path);
     if (inFlight) {
-      if (!treeDesiredExpanded.has(path)) {
-        treeDesiredExpanded.set(path, true); // 在途: 复用同一请求, 刷新展开意图
-      }
       // 每个调用方都挂自己的续接: 发起方所有权陈旧时 (如陈旧导航) 响应只写缓存
-      // 不落 DOM — 本调用方所有权当前则补齐安装, 终态跟随最新意图 (缓存结果
-      // 共享); 绝不 bare-return 发起方的 Promise. 所有权在响应落地时重查:
+      // 不落 DOM — 本调用方所有权当前则补齐安装, 终态跟随最新意图记录 (缓存
+      // 结果共享); 绝不 bare-return 发起方的 Promise. 所有权在响应落地时重查:
       // 调用时的快照 (navCurrent/壳代) 会过期 — 跨导航/跨壳后不得提交.
       return inFlight.then(function (entries) {
         if (!treeLoadMayCommit(gen === treeGen, navRequired, paneNavGuard.isCurrent(navGen))) {
@@ -1043,9 +1057,9 @@
         return entries;
       });
     }
-    if (!treeDesiredExpanded.has(path)) {
-      treeDesiredExpanded.set(path, true); // reveal/persist 复用同一入口即表达展开
-    }
+    // 请求起始记录 (版本 token): 失败兜底只删本请求适用记录, 绝不删除更新
+    // 导航/显式点击发布的更新记录.
+    const intentRecord = treeExpansionIntents.get(path);
     const pending = fetchTreeEntries(path, treeAbort ? treeAbort.signal : undefined).then(
       function (entries) {
         // 旧壳/旧进入链在途响应: 不得写缓存、不得触碰新壳 DOM
@@ -1065,20 +1079,15 @@
     pending.finally(function () {
       // 清理只由 owner Promise 执行: 先比对在途条目身份 (恒为本 Promise) —
       // 旧壳/旧链的 finally 不得删除新壳注册的条目与意图. 成功响应已由安装方
-      // (installTreeChildren) 在落地终态后消费意图 (desired + 显式标记);
-      // 此处兜底只清无消费方的意图: 失败响应 (无缓存, 无安装方) 删 desired +
-      // 显式标记; 成功落地但无安装方 (陈旧导航只写缓存未落 DOM) 时, 无显式
-      // 标记则删默认 nav/reveal desired — 后续缓存命中会重新置默认展开, 无
-      // 行为损失; 有显式标记则保留 — 续接方 (inFlight.then) 注册晚于本
-      // finally, 若在此无条件删除, 续接方将读到已清除的意图 (折叠意图丢失),
-      // 显式意图由当前 ownerless 续接方安装时经 installTreeChildren 一并消费.
+      // (installTreeChildren) 在落地终态后按记录身份消费; 此处兜底只清无消费
+      // 方的意图: 失败响应 (无缓存) 且当前记录仍是本请求起始记录 (身份相同)
+      // 才删除 — 绝不删除更新导航/显式点击发布的更新记录 (latest wins); 成功
+      // 落地但无安装方 (陈旧导航只写缓存, 有缓存) 不删 — 后续发布恒新版本,
+      // 陈旧 nav 记录不影响任何决策.
       if (treePendingLoads.get(path) === pending) {
         treePendingLoads.delete(path);
-        if (!treeCache.has(path)) {
-          treeDesiredExpanded.delete(path);
-          treeUserExpansionIntent.delete(path);
-        } else if (!treeUserExpansionIntent.has(path)) {
-          treeDesiredExpanded.delete(path);
+        if (!treeCache.has(path) && treeExpansionIntents.get(path) === intentRecord) {
+          treeExpansionIntents.delete(path);
         }
       }
     });
@@ -1093,30 +1102,27 @@
     const expanded = !!ul && !ul.hidden;
     const pending = treePendingLoads.has(path);
     if (pending) {
-      // 在途: 显式用户意图与 nav/默认意图分离 — 无显式意图时按可见 DOM 推导
-      // (!expanded, nav 的隐藏 desired 绝不参与翻转 — 首击可见折叠目录即表达
-      // 展开), 有显式意图则翻转当前 desired; 写入 desired + 标记显式后, 恒经
+      // 在途: 经意图纯函数按最新记录推导 — prior 显式则翻转 (第二次激活表达
+      // 收起), prior 无/nav 默认按可见 DOM 推导 (!expanded, nav 的隐藏意图
+      // 绝不参与 — 首击可见折叠目录即表达展开); 发布显式意图 (版本化) 后恒经
       // loadTreeChildren 挂 ownerless 续接 (在途去重: 绝不发起第二个请求) —
-      // 响应落地时由续接方安装, 终态跟随最新意图, 安装方消费意图后 DOM 成为
+      // 响应落地时由续接方安装, 终态跟随最新记录, 安装方消费意图后 DOM 成为
       // 权威. 绝不裸 return: 无续接时陈旧 nav owner 的响应不会安装, 用户点击
       // 将落空 (需要第三次点击).
-      const desired = treeDesiredExpanded.has(path)
-        ? treeDesiredExpanded.get(path)
-        : expanded;
-      const next = treeExpansionIntent(pending, expanded, desired, treeUserExpansionIntent.has(path));
-      treeDesiredExpanded.set(path, next);
-      treeUserExpansionIntent.add(path);
+      const next = treeNextExplicitIntent(treeExpansionIntents.get(path), expanded);
+      publishTreeExpansionIntent(path, next.expanded, true);
       return loadTreeChildren(li, path);
     }
-    // 无在途: 意图无消费方, 绝不写入残留 (陈旧意图会挡住后续 reveal 的缓存
-    // 命中展开) — DOM 直接为权威.
+    // 无在途: 意图无消费方 — 收起直接改 DOM (绝不写入残留, 陈旧意图会挡住
+    // 后续 reveal 的缓存命中展开); 展开经纯函数 + 发布显式意图后加载.
     if (expanded) {
       setTreeNodeExpanded(li, false);
     } else {
-      // 用户激活即显式意图 (nav/reveal 默认 desired 不算): 标记后经
-      // loadTreeChildren 加载 — 在途期间的后续激活按显式意图翻转 (第二次
-      // 激活表达收起), 而不是把首击当 nav 默认意图翻转.
-      treeUserExpansionIntent.add(path);
+      // 用户激活即显式意图 (nav/reveal 默认不算): 经最新记录推导并发布 —
+      // 在途期间的后续激活按显式记录翻转 (第二次激活表达收起), 而不是把首击
+      // 当 nav 默认意图翻转.
+      const next = treeNextExplicitIntent(treeExpansionIntents.get(path), expanded);
+      publishTreeExpansionIntent(path, next.expanded, true);
       loadTreeChildren(li, path);
     }
   }
@@ -2346,8 +2352,7 @@
     treeRootUl = null;
     treeCache.clear();
     treePendingLoads.clear(); // 在途加载与意图随壳销毁 (旧壳响应已由 treeGen 作废)
-    treeDesiredExpanded.clear();
-    treeUserExpansionIntent.clear(); // 显式用户意图随壳销毁
+    treeExpansionIntents.clear(); // 意图记录随壳销毁 (版本计数保留: 跨壳单调)
     clearTreeSelection();
     // SPA 期间 pane 内容已被 fragment 替换: 离开树模式重载当前 URL 恢复完整页.
     // 仅在真实离开树模式时 (init 时 treeMode 为 false 则 pane 不存在, 不重载).
@@ -2497,16 +2502,15 @@
         event.preventDefault();
         break;
       case 'ArrowRight':
-        // → 只展开 (契约: → 展开 / ← 收起); 已展开则 no-op. 显式激活先记录
-        // 展开意图 (覆盖既有收起意图 — 最新用户动作权威) 并标记显式用户意图,
-        // 在途响应终态跟随.
+        // → 只展开 (契约: → 展开 / ← 收起); 已展开则 no-op. 显式激活发布显式
+        // 展开意图 (覆盖既有收起意图 — 最新用户动作权威, 版本化), 在途响应
+        // 终态跟随最新记录.
         if (treeSelectedEl && isExpandableDir(treeSelectedEl)) {
           const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
           if (!ul || ul.hidden) {
             const path = encodedPathOf(treeSelectedEl);
             if (path !== null) {
-              treeDesiredExpanded.set(path, true);
-              treeUserExpansionIntent.add(path);
+              publishTreeExpansionIntent(path, true, true);
               loadTreeChildren(treeSelectedEl, path);
             }
           }
@@ -2608,7 +2612,8 @@
       ownsTreeResize: ownsTreeResize,
       collapseFocusTarget: collapseFocusTarget,
       treeKeyScope: treeKeyScope,
-      treeExpansionIntent: treeExpansionIntent,
+      treeNextExplicitIntent: treeNextExplicitIntent,
+      publishTreeExpansionIntent: publishTreeExpansionIntent,
       treeLoadMayCommit: treeLoadMayCommit,
     };
   }

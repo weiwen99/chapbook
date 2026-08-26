@@ -1,4 +1,5 @@
-// Task5 异步树竞态验收 — 确定性 CDP 浏览器验收 (A/A2/B/C/D/E/F/G + nav-only stale cleanup).
+// Task5 异步树竞态验收 — 确定性 CDP 浏览器验收 (A/A2/1-4/C/D/E/F/G: 版本化
+// 展开意图 + 跨壳/导航竞态敏感场景).
 //
 // 手动调用 (非 cargo test), 自包含: 仅 Node 内置模块 + 系统 Chrome 的 CDP
 // WebSocket (无任何 npm 包); 自建临时 fixture (目录/文件/空目录/循环符号链接),
@@ -14,14 +15,19 @@
 // 场景:
 //   A   陈旧 nav owner 响应 + 当前壳首次点击续接: 恰一次请求, 首击即展开
 //   A2  在途两次点击 (显式翻转): 恰一次请求, 落地折叠, 第三次点击缓存命中展开
-//   B   nav 续接方提交前更新导航: 陈旧响应零 DOM/持久化/current/选中变更
+//   1   在途显式折叠后更新导航 (back + 下钻): 版本化意图 — 更新的 nav 记录
+//       覆盖更早显式折叠, release 后祖先展开, 子项 current/选中, 恰一次请求
+//   2   当前导航续接方 (re-attach) 在 release 前被更新导航取代: 陈旧续接零
+//       安装/零变异 (e913 settle 重查所有权)
+//   3   跨壳 + 壳 B 在途交互: A release 不得触碰 B 的 pending 身份/请求/
+//       意图; B 按自身最新意图安装一次, 无第三次请求
+//   4   nav-only 陈旧成功: 缓存存在/在途清除; 后续缓存命中 reveal 展开零额外
+//       请求; 折叠/再展开交互零额外请求 (无陈旧记录残留影响)
 //   C   旧/新壳同路径 (abort no-op): 旧壳响应不得删除新壳在途/意图, 新壳安装一次
 //   D   已缓存折叠祖先 → 面板下钻子项: 祖先缓存命中展开, 子项 current/选中
 //   E   空目录持久化展开重复条目: 叶子化移除全部重复, 零披露零额外请求
 //   F   根加载失败: nav 内 role=alert 文本错误, 零未处理拒绝; 重进新壳恢复
 //   G   行点击焦点落树根 (preventScroll) + 键盘; ARIA 可访问名排除字形
-//   N   陈旧 nav-only 成功落地无续接方: 缓存存在/在途清除/默认 desired 不残留,
-//       后续当前导航缓存命中展开, 零额外请求
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -246,6 +252,13 @@ class Page {
   }
 
   async close() {
+    // FETCH teardown: 先禁用 fetch 域 (释放全部被 held 的暂停请求 — 页面即将
+    // 关闭, 任何失败路径都不得遗留 paused 请求/监听), 再移除监听并关闭目标.
+    try {
+      await this.send('Fetch.disable');
+    } catch {
+      /* fetch 域未启用 */
+    }
     for (const [method, handler] of this._listeners) {
       this.cdp.remove(method, handler);
     }
@@ -316,7 +329,22 @@ function cleanup() {
     chrome = null;
   }
   if (chromeProfile) {
-    rmSync(chromeProfile, { recursive: true, force: true });
+    // SIGTERM 后 Chrome 可能仍在收尾 (写 profile): 重试删除, 残留临时目录不
+    // 阻断退出 (系统临时目录由 OS 清理).
+    let lastErr = null;
+    for (let i = 0; i < 10; i++) {
+      try {
+        rmSync(chromeProfile, { recursive: true, force: true });
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      }
+    }
+    if (lastErr) {
+      console.error('WARN: chrome profile cleanup failed (left for OS): ' + lastErr.message);
+    }
     chromeProfile = null;
   }
   if (fixture) {
@@ -436,6 +464,10 @@ await browserCdp.open();
 
 const pausedCounts = {};
 const netCounts = {};
+// 当前场景活动页: fresh 创建后登记, runScenario 的 finally 统一关闭 — 任何
+// 断言/步骤抛出时也执行 FETCH 释放 + 监听移除 + 页面关闭 (绝不遗留 paused
+// 请求/监听/页面), 场景体不再各自 close.
+let activePage = null;
 
 async function fresh(mode, opts) {
   const { targetId } = await browserCdp.send('Target.createTarget', { url: 'about:blank' });
@@ -444,6 +476,7 @@ async function fresh(mode, opts) {
     flatten: true,
   });
   const page = new Page(browserCdp, targetId, sessionId);
+  activePage = page; // 先于任何可能抛出的步骤登记: fresh 失败同样走 finally 关闭
   const pageErrors = [];
   const onException = (params, sid) => {
     if (sid !== sessionId) return;
@@ -607,6 +640,18 @@ async function runScenario(name, fn) {
     await fn();
   } catch (e) {
     rec(name, false, 'THREW: ' + String(e && e.message ? e.message : e));
+  } finally {
+    // 异常安全收尾: 任何失败路径都释放 FETCH/监听并关闭页面 (幂等 — 场景体
+    // 不再各自 close), 随后继续下一场景/汇总.
+    if (activePage) {
+      const page = activePage;
+      activePage = null;
+      try {
+        await page.close();
+      } catch (e) {
+        rec(name, false, 'TEARDOWN THREW: ' + String(e && e.message ? e.message : e));
+      }
+    }
   }
 }
 
@@ -660,7 +705,6 @@ await runScenario('A stale nav owner: first click while pending -> desired true 
     'pre=' + JSON.stringify(preClick) + ' focus=' + JSON.stringify(focusState) + ' mid=' + JSON.stringify(mid) +
       ' final=' + JSON.stringify(final) + ' expanded=' + JSON.stringify(expanded) + ' current=' + JSON.stringify(cur) +
       ' sel=' + JSON.stringify(sel) + ' counts=' + JSON.stringify(counts) + ' errors=' + JSON.stringify(pageErrors));
-  await page.close();
 });
 
 /* =====================================================================
@@ -705,49 +749,115 @@ await runScenario('A2 two clicks while pending: exactly one request; final colla
       counts.paused === 1 && counts.net === 1 && pageErrors.length === 0,
     'mid=' + JSON.stringify(mid) + ' final=' + JSON.stringify(final) + ' expanded=' + JSON.stringify(expanded) +
       ' third=' + JSON.stringify(third) + ' counts=' + JSON.stringify(counts) + ' errors=' + JSON.stringify(pageErrors));
-  await page.close();
 });
 
 /* =====================================================================
- * B. nav 续接方开始时当前, release 前更新导航 -> 陈旧 nav 续接方响应零安装:
- *    无 DOM/无 localStorage/无 cb-current/无选中变更.
+ * 1. 在途显式折叠被更新导航覆盖 (版本化意图): nav A 发起 P 请求 (在途);
+ *    在途期间显式点击两次表达收起 (最新记录 = expanded:false, explicit:true);
+ *    更新的导航 C (back 回 P) 与 D (下钻 P/child) 在途复用同一请求并发布
+ *    nav 意图 (expanded:true, explicit:false, 版本更新) — release 后安装方
+ *    按最新记录展开, 子项 current/选中, 恰一次请求. (旧 bug: nav 复用不覆盖
+ *    既有 desired, 显式折叠终态残留 → 落地折叠.)
  * ===================================================================== */
-await runScenario('B newer nav before release: stale nav adopter no DOM/persist/current/selection mutation', async () => {
+await runScenario('1 newer nav while pending overrides explicit collapse: release -> ancestor expanded, child current/selected, one request', async () => {
   const { page, pageErrors } = await fresh('tree');
   const holdSet = new Set(['/adir']);
   const held = new Map();
   await holdTreePath(page, holdSet, held);
 
+  // nav A: 面板 -> /adir (held; nav 默认意图 true)
   await waitFor(() => page.evaluate("!!document.querySelector('.cb-pane .cb-dir-mini a[href=\"/adir\"]')"), 'pane-mini-ready');
   await page.click('.cb-pane .cb-dir-mini a[href="/adir"]');
-  await waitHeld(page, held, '/adir', 1, 'B-adir-held');
+  await waitHeld(page, held, '/adir', 1, '1-adir-held');
   await sleep(300);
+  // nav B: 树行点击 a.md -> 提交 (nav A 陈旧; adir 仍在途)
   await page.click('[data-native-path-encoded="a.md"] .cb-tree-row');
-  await waitFor(() => page.evaluate("location.pathname === '/a.md'"), 'B-commit');
+  await waitFor(() => page.evaluate("location.pathname === '/a.md'"), '1-commit-B');
+  await sleep(300);
+  // 在途期间显式点击两次: 点击1 = 显式展开意图, 点击2 = 翻转 -> 收起
+  await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
+  await sleep(250);
+  await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
+  await sleep(300);
+  // nav C: back -> /adir (popstate 导航; 在途复用 + 发布新 nav 意图)
+  await page.evaluate('history.back()');
+  await waitFor(() => page.evaluate("location.pathname === '/adir'"), '1-nav-C-adir');
+  // nav D: 面板下钻 P/child (在途复用 + 再发布新 nav 意图)
+  await waitFor(() => page.evaluate("!!document.querySelector('.cb-pane .cb-dir-mini a[href=\"/adir/child.md\"]')"), '1-pane-child-mini-ready');
+  await page.click('.cb-pane .cb-dir-mini a[href="/adir/child.md"]');
+  await waitFor(() => page.evaluate("location.pathname === '/adir/child.md'"), '1-nav-D-child');
+  await sleep(300);
+  const mid = { held: (held.get('/adir') || []).length, paused: pausedCounts['/adir'] || 0, net: netCounts['/adir'] || 0 };
+  // release: 恰一次请求; 安装方按最新 nav 意图展开 (覆盖显式折叠)
+  await releaseOne(page, held, '/adir');
+  await waitFor(() => page.evaluate("!!document.querySelector('[data-native-path-encoded=\"adir\"] ul.cb-tree-children li')"), '1-adir-landed');
   await sleep(400);
-  const s1 = {
-    expanded: await expandedList(page),
-    current: await currentPaths(page),
-    sel: await selState(page),
-  };
+  const final = await dirState(page, 'adir');
+  const expanded = await expandedList(page);
+  const cur = await currentPaths(page);
+  const sel = await selState(page);
+  const counts = { paused: pausedCounts['/adir'] || 0, net: netCounts['/adir'] || 0 };
+  rec('1 newer nav while pending overrides explicit collapse: release -> ancestor expanded, child current/selected, one request',
+    mid.held === 1 && mid.paused === 1 && mid.net === 1 &&
+      final.children === 2 && final.hidden === false && final.expanded === 'true' && final.twist === '▾' &&
+      Array.isArray(expanded) && expanded.includes('adir') &&
+      JSON.stringify(cur) === JSON.stringify(['adir/child.md']) &&
+      sel.selected === 'adir/child.md' && sel.adLive === true &&
+      counts.paused === 1 && counts.net === 1 && pageErrors.length === 0,
+    'mid=' + JSON.stringify(mid) + ' final=' + JSON.stringify(final) + ' expanded=' + JSON.stringify(expanded) +
+      ' current=' + JSON.stringify(cur) + ' sel=' + JSON.stringify(sel) + ' counts=' + JSON.stringify(counts) +
+      ' errors=' + JSON.stringify(pageErrors));
+});
+
+/* =====================================================================
+ * 2. 当前导航续接方 (re-attach) 在 release 前被更新导航取代: nav A 发起 P
+ *    (在途); nav B 提交别处 (A 陈旧); nav C 回到 P (续接方挂载时 C 当前,
+ *    在途复用并发布新 nav 意图); nav R (Backspace -> 根) 再更新导航 (C
+ *    陈旧); release 后 A 的响应与 C 的续接都不得安装/变异 DOM、持久化、
+ *    current/选中 (e913: settle 时重查导航所有权).
+ * ===================================================================== */
+await runScenario('2 current nav adopter superseded before release: stale adopter cannot install/mutate', async () => {
+  const { page, pageErrors } = await fresh('tree');
+  const holdSet = new Set(['/adir']);
+  const held = new Map();
+  await holdTreePath(page, holdSet, held);
+
+  // nav A: 面板 -> /adir (held)
+  await waitFor(() => page.evaluate("!!document.querySelector('.cb-pane .cb-dir-mini a[href=\"/adir\"]')"), 'pane-mini-ready');
+  await page.click('.cb-pane .cb-dir-mini a[href="/adir"]');
+  await waitHeld(page, held, '/adir', 1, '2-adir-held');
+  await sleep(300);
+  // nav B: 树行点击 a.md -> 提交 (nav A 陈旧)
+  await page.click('[data-native-path-encoded="a.md"] .cb-tree-row');
+  await waitFor(() => page.evaluate("location.pathname === '/a.md'"), '2-commit-B');
+  await sleep(300);
+  // nav C: back -> /adir (popstate 导航; 续接方挂载时 C 当前, 在途复用)
+  await page.evaluate('history.back()');
+  await waitFor(() => page.evaluate("location.pathname === '/adir'"), '2-nav-C');
+  await sleep(300);
+  // nav R: Backspace -> 根 (更新导航取代 C)
+  await page.press('Backspace', 'Backspace', 8);
+  await waitFor(() => page.evaluate("location.pathname === '/'"), '2-nav-R');
+  await sleep(300);
+  const mid = { held: (held.get('/adir') || []).length, paused: pausedCounts['/adir'] || 0, net: netCounts['/adir'] || 0 };
+  // release A: 陈旧发起方响应只写缓存; C 的续接 settle 时已非当前 — 零安装
   await releaseOne(page, held, '/adir');
   await sleep(600);
-  const s2 = {
+  const s = {
     adir: await dirState(page, 'adir'),
     expanded: await expandedList(page),
     current: await currentPaths(page),
     sel: await selState(page),
     errBanner: await page.evaluate("!!document.querySelector('.cb-pane-error')"),
   };
-  rec('B newer nav before release: stale nav adopter no DOM/persist/current/selection mutation',
-    s2.adir.expanded === 'false' && s2.adir.hasUl === false && s2.adir.twist === '▸' &&
-      JSON.stringify(s2.expanded) === JSON.stringify(s1.expanded) &&
-      !(JSON.stringify(s2.expanded) || '').includes('adir') &&
-      JSON.stringify(s2.current) === JSON.stringify(s1.current) && JSON.stringify(s2.current) === JSON.stringify(['a.md']) &&
-      s2.sel.selected === 'a.md' && s2.sel.adLive === true && s2.sel.selTrue === 1 &&
-      s2.errBanner === false && pageErrors.length === 0,
-    's1=' + JSON.stringify(s1) + ' s2=' + JSON.stringify(s2) + ' errors=' + JSON.stringify(pageErrors));
-  await page.close();
+  rec('2 current nav adopter superseded before release: stale adopter cannot install/mutate',
+    mid.held === 1 && mid.paused === 1 && mid.net === 1 &&
+      s.adir.expanded === 'false' && s.adir.hasUl === false && s.adir.twist === '▸' &&
+      !(JSON.stringify(s.expanded) || '').includes('adir') &&
+      JSON.stringify(s.current) === JSON.stringify([]) &&
+      s.sel.selected === null && s.sel.selTrue === 0 &&
+      s.errBanner === false && pageErrors.length === 0,
+    'mid=' + JSON.stringify(mid) + ' s=' + JSON.stringify(s) + ' errors=' + JSON.stringify(pageErrors));
 });
 
 /* =====================================================================
@@ -804,7 +914,73 @@ await runScenario('C cross-shell: release A (abort-mocked) leaves B pending/DOM 
       finalCounts.paused === 2 && finalCounts.net === 2 && pageErrors.length === 0,
     'midB=' + JSON.stringify(midB) + ' afterA=' + JSON.stringify(afterA) + ' finalB=' + JSON.stringify(finalB) +
       ' finalCounts=' + JSON.stringify(finalCounts) + ' errors=' + JSON.stringify(pageErrors));
-  await page.close();
+});
+
+/* =====================================================================
+ * 3. 跨壳 + 壳 B 在途交互: 壳 A 发起 P (held); 退出/重进壳 B 发起 P (held);
+ *    B 在途期间交互 (显式点击翻转: 最新记录 = 收起); 先 release A (abort 伪装
+ *    no-op, A 响应真实 resolve) — A 的 finally 不得触碰 B 的 pending 条目
+ *    (身份比对) 与更新的意图记录 (记录身份比对); release B -> 恰一次当前壳
+ *    安装 (按 B 自身最新意图), 无第三次请求.
+ * ===================================================================== */
+await runScenario('3 cross-shell with in-B interaction: A release leaves B pending/intent untouched; B installs its latest intent once', async () => {
+  const { page, pageErrors } = await fresh('dir', { nohost: true, patchAbort: true });
+  const holdSet = new Set(['/adir']);
+  const held = new Map();
+  await holdTreePath(page, holdSet, held);
+
+  // 壳 A: 点击 adir -> 请求 A held
+  await page.click('.cb-mode-toggle');
+  await waitFor(() => page.evaluate("!!document.querySelector('ul#cb-tree-root > li.cb-tree-node')"), 'A-root-attached');
+  await sleep(300);
+  await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
+  await waitHeld(page, held, '/adir', 1, 'A-held');
+  await sleep(200);
+  // 退出 (无 pane -> 不重载; abort 伪装), 重进 -> 壳 B
+  await page.click('.cb-mode-toggle');
+  await waitFor(() => page.evaluate("!document.body.classList.contains('cb-tree-mode')"), 'exited-A');
+  await page.click('.cb-mode-toggle');
+  await waitFor(() => page.evaluate("!!document.querySelector('ul#cb-tree-root > li.cb-tree-node')"), 'B-root-attached');
+  await sleep(300);
+  // 壳 B: 点击 adir -> 请求 B held
+  await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
+  await waitHeld(page, held, '/adir', 2, 'B-held');
+  await sleep(300);
+  // B 在途交互: 再点击 adir (显式翻转: 展开意图 -> 收起意图; 版本更新)
+  await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
+  await sleep(300);
+  const midB = {
+    held: (held.get('/adir') || []).length,
+    paused: pausedCounts['/adir'] || 0,
+    net: netCounts['/adir'] || 0,
+    bReqId: (held.get('/adir') || [])[1],
+  };
+  // 先 release A: A 的 finally 不得删除 B 的 pending 条目或更新的意图
+  await releaseOne(page, held, '/adir');
+  await sleep(600);
+  const afterA = {
+    held: (held.get('/adir') || []).length,
+    sameBReq: (held.get('/adir') || [])[0] === midB.bReqId,
+    paused: pausedCounts['/adir'] || 0,
+    net: netCounts['/adir'] || 0,
+    state: await dirState(page, 'adir'),
+    abortMock: await page.evaluate('window.__abortMock'),
+  };
+  // release B: B 按自身最新意图 (收起) 安装一次
+  await releaseOne(page, held, '/adir');
+  await waitFor(() => page.evaluate("!!document.querySelector('[data-native-path-encoded=\"adir\"] ul.cb-tree-children li')"), 'B-landed');
+  await sleep(400);
+  const finalB = await dirState(page, 'adir');
+  const finalCounts = { paused: pausedCounts['/adir'] || 0, net: netCounts['/adir'] || 0 };
+  rec('3 cross-shell with in-B interaction: A release leaves B pending/intent untouched; B installs its latest intent once',
+    midB.held === 2 && midB.paused === 2 && midB.net === 2 &&
+      afterA.held === 1 && afterA.sameBReq === true && afterA.paused === 2 && afterA.net === 2 &&
+      afterA.state.expandable === '1' && afterA.state.expanded === 'false' && afterA.state.hasUl === false && afterA.state.twist === '▸' &&
+      afterA.abortMock >= 1 &&
+      finalB.children === 2 && finalB.hidden === true && finalB.expanded === 'false' && finalB.twist === '▸' &&
+      finalCounts.paused === 2 && finalCounts.net === 2 && pageErrors.length === 0,
+    'midB=' + JSON.stringify(midB) + ' afterA=' + JSON.stringify(afterA) + ' finalB=' + JSON.stringify(finalB) +
+      ' finalCounts=' + JSON.stringify(finalCounts) + ' errors=' + JSON.stringify(pageErrors));
 });
 
 /* =====================================================================
@@ -847,7 +1023,6 @@ await runScenario('D cached collapsed ancestor -> pane navigate child: ancestor 
       pageErrors.length === 0,
     'collapsed=' + JSON.stringify(collapsed) + ' afterDirNav=' + JSON.stringify(afterDirNav) +
       ' s=' + JSON.stringify(s) + ' errors=' + JSON.stringify(pageErrors));
-  await page.close();
 });
 
 /* =====================================================================
@@ -898,7 +1073,6 @@ await runScenario('E duplicated persisted empty dir: ALL occurrences removed, no
       pageErrors.length === 0,
     'leaf=' + JSON.stringify(leaf) + ' list=' + JSON.stringify(list) + ' counts=' + JSON.stringify(counts) +
       ' counts2=' + JSON.stringify(counts2) + ' errors=' + JSON.stringify(pageErrors));
-  await page.close();
 });
 
 /* =====================================================================
@@ -936,7 +1110,6 @@ await runScenario('F root endpoint fail: visible role=alert error, zero unhandle
       retryState.children === 4 && retryState.hasError === false && retryState.uhr.length === 0 &&
       pageErrors.length === 0,
     'err=' + JSON.stringify(errState) + ' retry=' + JSON.stringify(retryState) + ' errors=' + JSON.stringify(pageErrors));
-  await page.close();
 });
 
 /* =====================================================================
@@ -982,32 +1155,32 @@ await runScenario('G row click focuses tree root (preventScroll) + keyboard work
       pageErrors.length === 0,
     'focus=' + JSON.stringify(focus1) + ' selAfter=' + JSON.stringify(selAfter) + ' attrs=' + JSON.stringify(attrs) +
       ' fileAXName=' + JSON.stringify(fileName) + ' dirAXName=' + JSON.stringify(dirName) + ' errors=' + JSON.stringify(pageErrors));
-  await page.close();
 });
 
 /* =====================================================================
- * N. 陈旧 nav-only 成功落地 (无续接方): 响应只写缓存未安装 — 缓存存在、
- *    在途清除、默认 desired/显式标记不残留; 后续当前导航缓存命中展开,
- *    零额外请求 (默认 nav/reveal desired 不留壳生命周期).
+ * 4. nav-only 陈旧成功落地 (无续接方): 响应只写缓存未安装 — 缓存存在、在途
+ *    清除; 后续当前导航缓存命中展开零额外请求; 随后折叠/再展开交互 (缓存
+ *    命中) 零额外请求 — 版本化意图下陈旧 nav 记录不残留影响后续 toggle 推导.
+ *    浏览器侧只断言可观察行为 (计数/状态); 意图记录的状态级不变量由 Rust
+ *    QuickJS 侧 seam 测试覆盖 (不向全局暴露 DOM 内部).
  * ===================================================================== */
-await runScenario('N stale nav-only settlement: cache exists/pending gone; later cache-hit reveal expands with zero extra requests', async () => {
+await runScenario('4 nav-only stale settlement: later cache-hit reveal expands; follow-up toggles with zero extra requests', async () => {
   const { page, pageErrors } = await fresh('tree');
   const holdSet = new Set(['/adir']);
   const held = new Map();
   await holdTreePath(page, holdSet, held);
 
-  // nav A: 面板 -> /adir (held; nav 默认 desired=true)
+  // nav A: 面板 -> /adir (held; nav 默认意图)
   await waitFor(() => page.evaluate("!!document.querySelector('.cb-pane .cb-dir-mini a[href=\"/adir\"]')"), 'pane-mini-ready');
   await page.click('.cb-pane .cb-dir-mini a[href="/adir"]');
-  await waitHeld(page, held, '/adir', 1, 'N-adir-held');
+  await waitHeld(page, held, '/adir', 1, '4-adir-held');
   await sleep(300);
   // nav B: 树行点击 a.md -> 提交 (nav A 陈旧; 无任何用户目录点击)
   await page.click('[data-native-path-encoded="a.md"] .cb-tree-row');
-  await waitFor(() => page.evaluate("location.pathname === '/a.md'"), 'N-commit-B');
+  await waitFor(() => page.evaluate("location.pathname === '/a.md'"), '4-commit-B');
   await sleep(300);
   const mid = { held: (held.get('/adir') || []).length, paused: pausedCounts['/adir'] || 0, net: netCounts['/adir'] || 0 };
-  // release A: 陈旧 nav-only 成功落地 -> 只写缓存, 零安装; finally 清在途 +
-  //   默认 desired (无显式标记)
+  // release A: 陈旧 nav-only 成功落地 -> 只写缓存, 零安装; finally 清在途
   await releaseOne(page, held, '/adir');
   await sleep(600);
   const after = {
@@ -1019,27 +1192,39 @@ await runScenario('N stale nav-only settlement: cache exists/pending gone; later
   // 后续当前导航: history.back() -> /adir (popstate -> paneNavigate -> reveal):
   //   缓存命中展开, 绝不重新请求 (在途已清, 缓存可共享)
   await page.evaluate('history.back()');
-  await waitFor(() => page.evaluate("location.pathname === '/adir'"), 'N-back-adir');
-  await waitFor(() => page.evaluate("!!document.querySelector('[data-native-path-encoded=\"adir\"] ul.cb-tree-children li')"), 'N-adir-reveal-landed');
+  await waitFor(() => page.evaluate("location.pathname === '/adir'"), '4-back-adir');
+  await waitFor(() => page.evaluate("!!document.querySelector('[data-native-path-encoded=\"adir\"] ul.cb-tree-children li')"), '4-adir-reveal-landed');
   await sleep(400);
-  const final = {
+  const revealed = {
     adir: await dirState(page, 'adir'),
     current: await currentPaths(page),
     sel: await selState(page),
     paused: pausedCounts['/adir'] || 0,
     net: netCounts['/adir'] || 0,
   };
-  rec('N stale nav-only settlement: cache exists/pending gone; later cache-hit reveal expands with zero extra requests',
+  // 折叠再展开 (缓存命中交互): 零额外请求 — 陈旧记录不影响后续 toggle 推导
+  await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
+  await waitFor(() => page.evaluate("document.querySelector('[data-native-path-encoded=\"adir\"] > ul.cb-tree-children')?.hidden === true"), '4-collapsed');
+  await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
+  await waitFor(() => page.evaluate("(() => { const li = document.querySelector('[data-native-path-encoded=\"adir\"]'); return li && li.getAttribute('aria-expanded') === 'true' && li.querySelector(':scope > ul.cb-tree-children')?.hidden === false; })()"), '4-reexpanded');
+  await sleep(400);
+  const final = {
+    adir: await dirState(page, 'adir'),
+    paused: pausedCounts['/adir'] || 0,
+    net: netCounts['/adir'] || 0,
+  };
+  rec('4 nav-only stale settlement: later cache-hit reveal expands; follow-up toggles with zero extra requests',
     mid.held === 1 && mid.paused === 1 && mid.net === 1 &&
       after.held === 0 && after.paused === 1 && after.net === 1 &&
       after.state.expanded === 'false' && after.state.hasUl === false && after.state.twist === '▸' &&
+      revealed.adir.children === 2 && revealed.adir.hidden === false && revealed.adir.expanded === 'true' && revealed.adir.twist === '▾' &&
+      JSON.stringify(revealed.current) === JSON.stringify(['adir']) &&
+      revealed.sel.selected === 'adir' && revealed.sel.adLive === true &&
+      revealed.paused === 1 && revealed.net === 1 &&
       final.adir.children === 2 && final.adir.hidden === false && final.adir.expanded === 'true' && final.adir.twist === '▾' &&
-      JSON.stringify(final.current) === JSON.stringify(['adir']) &&
-      final.sel.selected === 'adir' && final.sel.adLive === true &&
       final.paused === 1 && final.net === 1 && pageErrors.length === 0,
-    'mid=' + JSON.stringify(mid) + ' after=' + JSON.stringify(after) + ' final=' + JSON.stringify(final) +
-      ' errors=' + JSON.stringify(pageErrors));
-  await page.close();
+    'mid=' + JSON.stringify(mid) + ' after=' + JSON.stringify(after) + ' revealed=' + JSON.stringify(revealed) +
+      ' final=' + JSON.stringify(final) + ' errors=' + JSON.stringify(pageErrors));
 });
 
 /* ---------- 收尾: 汇总 + 清理 ---------- */
@@ -1057,5 +1242,9 @@ try {
   } catch {
     /* 已关闭 */
   }
-  cleanup();
+  try {
+    cleanup();
+  } catch (err) {
+    console.error('WARN: cleanup failed: ' + (err && err.message ? err.message : String(err)));
+  }
 }

@@ -1685,7 +1685,7 @@ mod tests {
             "ArrowLeft 收起必须经 setTreeNodeExpanded"
         );
         assert!(
-            !al_branch.contains("treeDesiredExpanded"),
+            !al_branch.contains("treeExpansionIntents"),
             "ArrowLeft 收起 (无在途) 不得写意图"
         );
         let focus_gate = "(event.target === treeRootUl || document.activeElement === treeRootUl)";
@@ -1803,16 +1803,18 @@ mod tests {
         }
     }
 
-    /// 任务 5 质量收尾: 展开意图纯函数在 QuickJS 中真实执行. 行为矩阵 (显式
-    /// 用户意图与 nav/默认意图分离):
-    /// - 在途 (pending) + 无显式用户意图 (hasExplicitIntent 缺省): 按当前
-    ///   可见态推导 — 可见折叠 (expanded=false) 即表达展开 (true), nav 的
-    ///   隐藏 desired 绝不参与 (首击可见折叠目录必须展开, 无需第三次点击);
-    /// - 在途 + 有显式用户意图: 翻转当前 desired — true→false (加载完成前
-    ///   收起), false→true (重新表达展开), 意图缺失按展开处理 (undefined → true);
-    /// - 无在途: 按当前可见态翻转 — 展开→收起 (false), 收起→展开 (true),
-    ///   desired/hasExplicitIntent 不影响非在途判定 (可见态权威);
-    /// - 返回的意图直接决定响应落地时的 hidden/expanded 终态 (绝不盲目 true).
+    /// 任务 5 收尾 (版本化意图重构): 显式用户激活意图纯函数 + 发布版本时序在
+    /// QuickJS 中真实执行. 行为矩阵 (latest-wins 时序语义):
+    /// - prior 为最新已发布记录且 explicit=true (显式用户意图): 翻转其 expanded
+    ///   — true→false (第二次激活表达收起), false→true (重新表达展开); 可见态
+    ///   expanded 参数不参与 (最新用户意图权威);
+    /// - prior 为 null (无记录) 或 nav/默认记录 (explicit=false): 按可见 DOM
+    ///   推导 — 可见折叠 (expanded=false) 即表达展开 (true), nav 的隐藏意图
+    ///   绝不参与 (首击可见折叠目录必须展开, 无需第三次点击);
+    /// - 返回记录 { expanded, explicit: true } — 显式标记恒 true;
+    /// - publishTreeExpansionIntent 递增全局单调版本并返回记录: 更晚发布天然
+    ///   覆盖更早 (更新的导航覆盖更早显式折叠 / 更晚显式点击覆盖导航); 版本
+    ///   跨路径共享时序 (全局计数器).
     #[test]
     fn browser_js_tree_expansion_intent_matrix() {
         let ctx = quick_js::Context::new().expect("quick-js context");
@@ -1820,58 +1822,103 @@ mod tests {
         ctx.eval("globalThis.module = { exports: {} };")
             .expect("CommonJS module shim");
         ctx.eval(BROWSER_JS).expect("eval BROWSER_JS");
-        // 在途 + 无显式意图 (nav/默认 desired 不参与): 按可见态推导.
+        // prior 显式: 翻转其 expanded (可见态参数不参与 — 最新用户意图权威).
         for (expr, expected) in [
-            ("treeExpansionIntent(true, false, true)", true),
-            ("treeExpansionIntent(true, false, false)", true),
-            ("treeExpansionIntent(true, false)", true),
-            ("treeExpansionIntent(true, true, true)", false),
-            ("treeExpansionIntent(true, true, false)", false),
-            ("treeExpansionIntent(true, true)", false),
+            (
+                "treeNextExplicitIntent({ expanded: true, explicit: true }, false)",
+                false,
+            ),
+            (
+                "treeNextExplicitIntent({ expanded: true, explicit: true }, true)",
+                false,
+            ),
+            (
+                "treeNextExplicitIntent({ expanded: false, explicit: true }, false)",
+                true,
+            ),
+            (
+                "treeNextExplicitIntent({ expanded: false, explicit: true }, true)",
+                true,
+            ),
         ] {
             let got = ctx
-                .eval(&format!("module.exports.{expr}"))
-                .expect("treeExpansionIntent must not throw");
+                .eval(&format!("module.exports.{expr}.expanded"))
+                .expect("treeNextExplicitIntent must not throw");
             assert!(
                 matches!(got, quick_js::JsValue::Bool(b) if b == expected),
                 "{expr}: expected {expected}, got {got:?}"
             );
         }
-        // 在途 + 显式用户意图: 翻转当前 desired.
+        // prior 无 / nav 默认 (explicit=false): 按可见 DOM 推导 (!expanded) —
+        // nav 的隐藏意图绝不参与 (首击可见折叠目录必须展开).
         for (expr, expected) in [
-            ("treeExpansionIntent(true, false, true, true)", false),
-            ("treeExpansionIntent(true, false, false, true)", true),
-            ("treeExpansionIntent(true, false, undefined, true)", true),
-            ("treeExpansionIntent(true, true, true, true)", false),
-            ("treeExpansionIntent(true, true, false, true)", true),
+            ("treeNextExplicitIntent(null, false)", true),
+            ("treeNextExplicitIntent(null, true)", false),
+            (
+                "treeNextExplicitIntent({ expanded: true, explicit: false }, false)",
+                true,
+            ),
+            (
+                "treeNextExplicitIntent({ expanded: true, explicit: false }, true)",
+                false,
+            ),
+            (
+                "treeNextExplicitIntent({ expanded: false, explicit: false }, false)",
+                true,
+            ),
         ] {
             let got = ctx
-                .eval(&format!("module.exports.{expr}"))
-                .expect("treeExpansionIntent must not throw");
+                .eval(&format!("module.exports.{expr}.expanded"))
+                .expect("treeNextExplicitIntent must not throw");
             assert!(
                 matches!(got, quick_js::JsValue::Bool(b) if b == expected),
                 "{expr}: expected {expected}, got {got:?}"
             );
         }
-        // 非在途: 按当前可见态翻转 (意图与显式标记均无关).
-        for (expr, expected) in [
-            ("treeExpansionIntent(false, true, true, true)", false),
-            ("treeExpansionIntent(false, true, false, false)", false),
-            ("treeExpansionIntent(false, true, true)", false),
-            ("treeExpansionIntent(false, true)", false),
-            ("treeExpansionIntent(false, false, false, true)", true),
-            ("treeExpansionIntent(false, false, true, false)", true),
-            ("treeExpansionIntent(false, false, false)", true),
-            ("treeExpansionIntent(false, false)", true),
+        // 返回记录形态: explicit 恒 true (用户激活即显式).
+        for expr in [
+            "treeNextExplicitIntent(null, false)",
+            "treeNextExplicitIntent({ expanded: true, explicit: false }, true)",
+            "treeNextExplicitIntent({ expanded: true, explicit: true }, false)",
         ] {
             let got = ctx
-                .eval(&format!("module.exports.{expr}"))
-                .expect("treeExpansionIntent must not throw");
+                .eval(&format!("module.exports.{expr}.explicit"))
+                .expect("treeNextExplicitIntent must not throw");
             assert!(
-                matches!(got, quick_js::JsValue::Bool(b) if b == expected),
-                "{expr}: expected {expected}, got {got:?}"
+                matches!(got, quick_js::JsValue::Bool(true)),
+                "{expr}: explicit 恒 true, got {got:?}"
             );
         }
+        // 发布版本单调: 每次发布递增全局版本; 更晚发布覆盖更早 (latest wins).
+        let v1 = ctx
+            .eval_as::<i32>("module.exports.publishTreeExpansionIntent('p', true, false).version")
+            .expect("publishTreeExpansionIntent must not throw");
+        let v2 = ctx
+            .eval_as::<i32>("module.exports.publishTreeExpansionIntent('p', false, true).version")
+            .expect("publishTreeExpansionIntent must not throw");
+        let v3 = ctx
+            .eval_as::<i32>("module.exports.publishTreeExpansionIntent('q', true, true).version")
+            .expect("publishTreeExpansionIntent must not throw");
+        assert!(
+            v1 < v2 && v2 < v3,
+            "发布版本必须严格单调递增 (跨路径共享全局时序): {v1} < {v2} < {v3}"
+        );
+        // 发布记录形态: { expanded, version, explicit } 三字段齐全.
+        let rec_explicit = ctx
+            .eval("module.exports.publishTreeExpansionIntent('p', false, true).explicit")
+            .expect("publishTreeExpansionIntent must not throw");
+        let rec_expanded = ctx
+            .eval("module.exports.publishTreeExpansionIntent('p', false, true).expanded")
+            .expect("publishTreeExpansionIntent must not throw");
+        let rec_version = ctx
+            .eval_as::<i32>("module.exports.publishTreeExpansionIntent('p', false, true).version")
+            .expect("publishTreeExpansionIntent must not throw");
+        assert!(
+            matches!(rec_explicit, quick_js::JsValue::Bool(true))
+                && matches!(rec_expanded, quick_js::JsValue::Bool(false))
+                && rec_version > v3,
+            "发布记录必须含 expanded/version/explicit 且版本继续单调: explicit={rec_explicit:?} expanded={rec_expanded:?} version={rec_version} (v3={v3})"
+        );
     }
 
     /// 任务 5 质量收尾: 树键范围 helper 必须被生产 onTreeKeydown 使用.
@@ -2015,43 +2062,55 @@ mod tests {
         );
     }
 
-    /// 任务 5 收尾 + 异步生命周期隔离: 懒加载并发去重 + 意图终态 seam.
-    /// 行为导向源不变量:
-    /// - 模块状态: treePendingLoads (path → 在途 Promise)、treeDesiredExpanded
-    ///   (path → 最新意图) 与 treeUserExpansionIntent (path → 显式用户意图
-    ///   集合) 声明, 退出树模式整体清空; 意图只在退出/叶子化/安装方消费/
-    ///   owner finally 失败兜底清除;
+    /// 任务 5 收尾 (版本化意图重构) + 异步生命周期隔离: 懒加载并发去重 +
+    /// 意图终态 seam. 行为导向源不变量:
+    /// - 模块状态: treePendingLoads (path → 在途 Promise) 与 treeExpansionIntents
+    ///   (path → { expanded, version, explicit } 意图记录) 声明; 全局单调
+    ///   treeExpansionIntentVersion 由发布递增 (跨路径共享时序), 退出树模式
+    ///   清空记录但版本计数保留 (跨壳单调, 记录身份比较天然隔离); 意图只在
+    ///   退出/叶子化/安装方消费/owner finally 失败兜底清除;
+    /// - publishTreeExpansionIntent(path, expanded, explicit): 唯一写入点 —
+    ///   递增版本、存储记录并返回; 时序即优先级 — 更新的导航 (explicit=false)
+    ///   覆盖更早的显式折叠, 更晚的显式点击覆盖导航;
+    /// - treeNextExplicitIntent (纯函数, 导出): 显式用户激活的下一条意图 —
+    ///   prior 显式则翻转其 expanded, prior 无/nav 默认则按可见 DOM 推导
+    ///   (!expanded; 行为矩阵见 browser_js_tree_expansion_intent_matrix);
     /// - treeLoadMayCommit (纯函数, 导出): 壳当前恒必需; 带导航所有权时还须
     ///   导航当前; 显式用户调用 (无导航所有权) 只要求壳当前 (行为矩阵见
     ///   browser_js_tree_load_may_commit_matrix);
     /// - loadTreeChildren(li, path, owner): owner 传调用方所有权 — { navGen }
-    ///   (reveal/sync 导航链) 或 { enterGen } (进入链持久化展开); 陈旧导航/
-    ///   进入链只共享缓存结果, 不提交 DOM/展开/持久化; 缓存命中与异步响应都
-    ///   经 installTreeChildren 唯一替换点 (空缓存 → 叶子化); 替换前先清除被
+    ///   (reveal/sync 导航链) 或 { enterGen } (进入链持久化展开); owner 存在
+    ///   时每次调用都发布 nav/默认意图 (expanded=true, explicit=false, 版本
+    ///   更新 — 更新的导航覆盖更早显式折叠); 显式用户调用 (无 owner) 已由
+    ///   toggleTreeNode/ArrowRight 发布显式意图, 绝不覆盖; 陈旧导航/进入链只
+    ///   共享缓存结果, 不提交 DOM/展开/持久化; 缓存命中与异步响应都经
+    ///   installTreeChildren 唯一替换点 (空缓存 → 叶子化); 替换前先清除被
     ///   替换子树内的选中 (clearTreeSelection → aria-activedescendant 同步移除);
-    ///   终态跟随最新意图 (setTreeNodeExpanded 以 desired 为准, 绝不盲目 true),
-    ///   安装方在落地终态后消费意图 (desired + 显式标记, DOM 即权威 — 续接方
-    ///   晚于 owner finally 注册, finally 不得抢先清除意图);
+    ///   终态跟随最新记录 (setTreeNodeExpanded 以 record.expanded 为准, 无记录
+    ///   默认 true, 绝不盲目折叠), 安装方在落地终态后按记录身份消费 (DOM 即
+    ///   权威 — 续接方晚于 owner finally 注册, finally 不得抢先清除意图);
     ///   在途复用: 每个调用方都在共享 Promise 上挂自己的续接 — 发起方所有权
     ///   陈旧时 (如陈旧导航) 响应只写缓存不落 DOM, 本调用方所有权当前则补齐
     ///   安装 (ensureTreeChildrenInstalled), 绝不 bare-return 发起方 Promise;
     ///   清理只由 owner Promise 在 finally 执行: 先比对在途条目身份, 同一
-    ///   owner 块内删除在途条目; 兜底只清无消费方的意图 — 失败响应 (无缓存
-    ///   无安装方) 删 desired + 显式标记; 成功落地但无安装方 (陈旧导航只写
-    ///   缓存) 无显式标记时删默认 nav/reveal desired (后续缓存命中重新置默认
-    ///   展开, 无行为损失), 有显式标记则保留给当前 ownerless 续接方安装时
-    ///   消费 (旧壳 finally 比对失败时不得触碰新壳条目);
+    ///   owner 块内删除在途条目; 失败兜底只删本请求适用记录 — 无缓存 && 当前
+    ///   记录与本请求起始记录身份相同 (请求起始版本 token) 才删除, 绝不删除
+    ///   更新导航/显式点击发布的更新记录; 成功落地但无安装方 (陈旧导航只写
+    ///   缓存, 有缓存) 不删记录 — 后续发布恒新版本, 陈旧 nav 记录不影响任何
+    ///   决策;
     /// - convertTreeLeaf: 空目录响应 → 终端叶子 — treeExpandable='0'、移除
     ///   aria-expanded、清 twist、移除子 role=group、持久化展开全部重复条目
-    ///   过滤并保存、删除意图与显式标记 (未来 click/ArrowRight 经
-    ///   isExpandableDir 短路, 零请求);
-    /// - toggleTreeNode: 在途分支 = 显式用户激活 — 无显式意图按可见 DOM 推导
-    ///   (nav 的隐藏 desired 不参与, 首击可见折叠目录即表达展开), 有显式意图
-    ///   则翻转 (treeExpansionIntent); 写入 desired + 标记显式后恒经
+    ///   过滤并保存、删除意图记录 (未来 click/ArrowRight 经 isExpandableDir
+    ///   短路, 零请求);
+    /// - toggleTreeNode: 在途分支 = 显式用户激活 — 经 treeNextExplicitIntent
+    ///   按最新记录推导 (prior 显式翻转 / prior nav 按可见 DOM 推导, nav 的
+    ///   隐藏意图绝不参与, 首击可见折叠目录即表达展开), 发布显式意图后恒经
     ///   loadTreeChildren 挂 ownerless 续接, 绝不裸 return、绝不发起第二个
-    ///   请求; 无在途展开分支同样标记显式 (用户激活即显式, nav/reveal 默认
-    ///   desired 不算 — 在途期间的后续激活因此翻转而非再推导); 无在途时 DOM
-    ///   即权威, 不写意图残留 (陈旧意图会挡住后续 reveal 的缓存命中展开);
+    ///   请求; 无在途展开分支同样经纯函数 + 发布 (用户激活即显式, nav/reveal
+    ///   默认不算 — 在途期间的后续激活因此翻转而非再推导); 无在途收起时 DOM
+    ///   即权威, 不写意图残留;
+    /// - ArrowRight (键盘显式展开): 发布显式 (true, true) 意图后加载 — 最新
+    ///   用户动作权威 (覆盖既有收起意图);
     /// - enterTreeMode: 进入链 generation (treeGen += 1 后捕获 enterGen), 旧进入
     ///   链 (buildTreeShell().then / reveal.then / 持久化 walk 递归续接 / 选中
     ///   恢复) 全部以 enterGen === treeGen 守卫 — 退出/重进后旧链不得触碰新壳.
@@ -2060,20 +2119,32 @@ mod tests {
         let js = BROWSER_JS;
         for needle in [
             "const treePendingLoads = new Map()",
-            "const treeDesiredExpanded = new Map()",
-            "const treeUserExpansionIntent = new Set()",
-            "function treeExpansionIntent(",
+            "const treeExpansionIntents = new Map()",
+            "let treeExpansionIntentVersion = 0",
+            "function treeNextExplicitIntent(",
+            "function publishTreeExpansionIntent(",
             "function treeLoadMayCommit(",
             "function loadTreeChildren(",
             "function convertTreeLeaf(",
             "function installTreeChildren(",
             "function ensureTreeChildrenInstalled(",
             "treePendingLoads.clear()",
-            "treeDesiredExpanded.clear()",
-            "treeUserExpansionIntent.clear()",
+            "treeExpansionIntents.clear()",
         ] {
             assert!(js.contains(needle), "missing load-dedup seam: {needle}");
         }
+        // 旧 bool map + 显式 Set 已整体移除 (统一为版本化意图记录).
+        for gone in [
+            "treeDesiredExpanded",
+            "treeUserExpansionIntent",
+            "new Set()",
+        ] {
+            assert!(
+                !js.contains(gone),
+                "removed intent seam still present: {gone}"
+            );
+        }
+        // loadTreeChildren: owner 发布 nav/默认意图 → 缓存命中 → 在途复用 → fetch.
         let load_start = js
             .find("function loadTreeChildren(")
             .expect("loadTreeChildren 存在");
@@ -2081,6 +2152,18 @@ mod tests {
             .find("function toggleTreeNode(")
             .expect("toggleTreeNode 位于 loadTreeChildren 之后");
         let load = &js[load_start..load_end];
+        // owner (nav/进入链) 每次请求都发布 nav/默认意图 — 时序即优先级: 更新的
+        // 导航覆盖更早的显式折叠 (绝不因已有意图而跳过发布).
+        let publish_at = load
+            .find("if (owner) publishTreeExpansionIntent(path, true, false)")
+            .expect("owner 发布 nav/默认意图");
+        let cache_at = load
+            .find("if (treeCache.has(path)) {")
+            .expect("缓存命中分支存在");
+        assert!(
+            publish_at < cache_at,
+            "nav/默认意图发布必须先于缓存命中分支 (每次请求都刷新版本)"
+        );
         // 在途复用: 先查在途 → 每个调用方挂自己的续接 (绝不 bare-return 发起方
         // Promise) → 仅无在途才发起 fetch.
         let inflight_at = load
@@ -2100,7 +2183,7 @@ mod tests {
         );
         // 调用方续接: 所有权当前 (treeLoadMayCommit: 壳 + 导航/进入链) 才补齐
         // 安装 — ensureTreeChildrenInstalled (空缓存 → 叶子化; 已安装 → 跳过),
-        // 终态由 installTreeChildren 按最新意图落地; 陈旧发起方 (如陈旧导航)
+        // 终态由 installTreeChildren 按最新意图记录落地; 陈旧发起方 (如陈旧导航)
         // 的响应只写缓存不落 DOM, 续接方所有权当前时补齐.
         let adopt = &load[reuse_at..fetch_at];
         let adopt_commit_at = adopt
@@ -2122,16 +2205,6 @@ mod tests {
                 .count(),
             1,
             "单条加载路径只允许一个 fetch 调用点 (去重契约)"
-        );
-        // 意图显式置 true 只在无既有意图时 (reveal/persist 复用同一入口即表达
-        // 展开, 但绝不覆盖显式/用户意图 — 在途翻转的 false 必须保留).
-        assert!(
-            load.contains("if (!treeDesiredExpanded.has(path))"),
-            "发起加载必须仅在无既有意图时置展开意图"
-        );
-        assert!(
-            load.contains("treeDesiredExpanded.set(path, true)"),
-            "展开意图置位必须存在"
         );
         // 缓存命中分支: 先经提交决策 (陈旧导航只取缓存结果, 不动 DOM), 再经
         // installTreeChildren 唯一替换点.
@@ -2171,15 +2244,20 @@ mod tests {
             gen_at < cache_set_at && cache_set_at < nav_guard_at && nav_guard_at < install_at,
             "异步分支顺序: 壳守卫 → 缓存写入 → 导航守卫 → 唯一替换点"
         );
+        // 请求起始记录捕获: 先于 fetch 发起 (失败兜底的版本 token).
+        let intent_record_at = load
+            .find("const intentRecord = treeExpansionIntents.get(path)")
+            .expect("请求起始记录捕获存在");
+        assert!(
+            intent_record_at < fetch_at,
+            "请求起始记录必须先于 fetch 捕获 (失败兜底只删该记录)"
+        );
         // owner 清理: finally 内先比对在途条目身份, owner 块内删在途条目;
-        // 意图由安装方 (installTreeChildren) 在落地终态后消费 (续接方晚于
-        // finally 注册, finally 不得抢先清除意图 — 否则折叠意图丢失), 兜底
-        // 只清无消费方的意图; 旧壳 finally 比对失败时不得触碰新壳注册的条目
-        // 与意图. 兜底按结果分派: 失败响应 (无缓存, 无安装方) 删 desired +
-        // 显式标记; 成功落地但无安装方 (陈旧导航只写缓存未落 DOM) 时, 无显式
-        // 标记则删默认 nav/reveal desired — 后续缓存命中会重新置默认展开,
-        // 无行为损失; 有显式标记则保留, 由当前 ownerless 续接方安装时经
-        // installTreeChildren 一并消费.
+        // 意图由安装方 (installTreeChildren) 在落地终态后按记录身份消费 (续接方
+        // 晚于 finally 注册, finally 不得抢先清除意图 — 否则折叠意图丢失), 兜底
+        // 只清无消费方的意图: 失败响应 (无缓存) 且当前记录与本请求起始记录身份
+        // 相同才删 — 绝不删除更新导航/显式点击发布的更新记录 (latest wins);
+        // 成功落地但无安装方 (陈旧导航只写缓存, 有缓存) 不删 — 后续发布恒新版本.
         let owner_cmp_at = load
             .find("treePendingLoads.get(path) === pending")
             .expect("owner 身份比对存在");
@@ -2187,32 +2265,22 @@ mod tests {
             .find("treePendingLoads.delete(path)")
             .expect("删除在途条目存在");
         let cache_check_at = load
-            .find("if (!treeCache.has(path)) {")
-            .expect("兜底分派必须限定失败响应 (无缓存) 分支");
-        let desired_del_at = load
-            .find("treeDesiredExpanded.delete(path)")
-            .expect("删除意图条目存在 (失败响应兜底)");
-        let explicit_del_at = load
-            .find("treeUserExpansionIntent.delete(path)")
-            .expect("删除显式标记存在 (失败响应兜底)");
-        let marker_guard_at = load
-            .find("} else if (!treeUserExpansionIntent.has(path)) {")
-            .expect("成功落地无安装方: 无显式标记才删默认 desired (陈旧导航默认意图不留残留)");
+            .find("if (!treeCache.has(path) && treeExpansionIntents.get(path) === intentRecord) {")
+            .expect("兜底必须限定失败响应 (无缓存) + 本请求记录身份");
+        let intent_del_at = load
+            .find("treeExpansionIntents.delete(path)")
+            .expect("删除意图记录存在 (失败响应兜底)");
         assert!(
             finally_at < owner_cmp_at
                 && owner_cmp_at < pending_del_at
                 && pending_del_at < cache_check_at
-                && cache_check_at < desired_del_at
-                && desired_del_at < explicit_del_at
-                && explicit_del_at < marker_guard_at,
-            "owner 清理顺序: finally → 身份比对 → 删在途 → 无缓存兜底删意图+显式标记 → 有缓存无显式标记删默认 desired"
+                && cache_check_at < intent_del_at,
+            "owner 清理顺序: finally → 在途身份比对 → 删在途 → 无缓存+记录身份比对 → 删本请求记录"
         );
-        // 两条 desired 删除路径: 失败响应 (无缓存) 与成功落地无安装方 (陈旧
-        // 导航, 无显式标记) — 默认 nav/reveal desired 绝不残留到壳生命周期.
         assert_eq!(
-            load.matches("treeDesiredExpanded.delete").count(),
-            2,
-            "意图删除两条兜底路径 (失败无缓存 + 成功无安装方无显式标记), 且只出现在 owner 块内"
+            load.matches("treeExpansionIntents.delete(path)").count(),
+            1,
+            "意图记录删除只出现在 owner 失败兜底 (安装方消费在 installTreeChildren)"
         );
         // convertTreeLeaf: 空目录 → 终端叶子契约 (无子项无展开语义, 未来
         // click/ArrowRight 经 isExpandableDir 短路, 零请求).
@@ -2228,8 +2296,7 @@ mod tests {
             "li.removeAttribute('aria-expanded')",
             "twist.textContent = ''",
             "ul.remove()",
-            "treeDesiredExpanded.delete(path)",
-            "treeUserExpansionIntent.delete(path)",
+            "treeExpansionIntents.delete(path)",
         ] {
             assert!(
                 leaf.contains(needle),
@@ -2246,7 +2313,7 @@ mod tests {
             "过滤后必须保存持久化展开"
         );
         // installTreeChildren: 唯一替换点 — 替换前清被替换子树内的选中,
-        // 终态跟随最新意图.
+        // 读最新记录落地终态, 按记录身份消费 (绝不误删更新记录).
         let inst_start = js
             .find("function installTreeChildren(")
             .expect("installTreeChildren 存在");
@@ -2260,71 +2327,95 @@ mod tests {
         let inst_replace_at = inst
             .find("ul.replaceChildren(")
             .expect("唯一替换点替换子项");
-        assert!(
-            inst_clear_at < inst_replace_at,
-            "唯一替换点: 必须先清除被替换子树内的选中再 replaceChildren"
-        );
+        let inst_record_at = inst
+            .find("const record = treeExpansionIntents.get(path)")
+            .expect("安装方读取最新意图记录");
         let inst_set_at = inst
-            .find("setTreeNodeExpanded(li, treeDesiredExpanded.get(path) !== false)")
-            .expect("落地终态先经 setTreeNodeExpanded");
-        let inst_desired_at = inst
-            .find("treeDesiredExpanded.delete(path)")
-            .expect("安装方消费 desired (落地终态后)");
-        let inst_explicit_at = inst
-            .find("treeUserExpansionIntent.delete(path)")
-            .expect("安装方消费显式标记 (落地终态后)");
+            .find("setTreeNodeExpanded(li, record ? record.expanded : true)")
+            .expect("落地终态先经 setTreeNodeExpanded (record.expanded 或默认 true)");
+        let inst_consume_at = inst
+            .find("treeExpansionIntents.get(path) === record")
+            .expect("安装方必须按记录身份比对后消费");
+        let inst_del_at = inst
+            .find("treeExpansionIntents.delete(path)")
+            .expect("安装方消费意图记录 (落地终态后)");
         assert!(
             inst_clear_at < inst_replace_at
-                && inst_replace_at < inst_set_at
-                && inst_set_at < inst_desired_at
-                && inst_desired_at < inst_explicit_at,
-            "唯一替换点: 清选中 → replaceChildren → 终态 setTreeNodeExpanded → 消费 desired → 消费显式标记"
+                && inst_replace_at < inst_record_at
+                && inst_record_at < inst_set_at
+                && inst_set_at < inst_consume_at
+                && inst_consume_at < inst_del_at,
+            "唯一替换点: 清选中 → replaceChildren → 读最新记录 → 终态 setTreeNodeExpanded → 同记录身份消费"
         );
-        // toggleTreeNode: 在途只翻转意图, 不发起第二个请求; 非在途按可见态.
+        // toggleTreeNode: 在途只发布显式意图, 不发起第二个请求; 无在途按可见态.
         let toggle_end = js
             .find("function selectTreeNode(")
             .expect("selectTreeNode 位于 toggleTreeNode 之后");
         let toggle = &js[load_end..toggle_end];
-        // 在途分支 = 显式用户激活: 无显式意图按可见 DOM 推导 (nav 的隐藏
-        // desired 不参与), 有显式意图则翻转 (treeExpansionIntent); 写入
-        // desired + 标记显式后恒经 loadTreeChildren 挂 ownerless 续接 — 响应
-        // 落地时续接方安装, 终态跟随最新意图; 绝不裸 return、绝不发起第二个
-        // 请求; 无在途分支 (展开经 loadTreeChildren / 收起经 setTreeNodeExpanded)
-        // 不得触碰意图 — DOM 直接为权威, 残留意图会挡住后续 reveal 的缓存命中展开.
+        // 在途分支 = 显式用户激活: 经 treeNextExplicitIntent 按最新记录推导
+        // (prior 显式翻转 / prior nav 按可见 DOM 推导), 发布显式意图后恒经
+        // loadTreeChildren 挂 ownerless 续接 — 响应落地时续接方安装, 终态跟随
+        // 最新记录; 绝不裸 return、绝不发起第二个请求.
         let toggle_pending_at = toggle.find("if (pending) {").expect("在途分支存在");
         let toggle_intent_at = toggle
-            .find(
-                "treeExpansionIntent(pending, expanded, desired, treeUserExpansionIntent.has(path))"
-            )
-            .expect("toggle 必须经意图纯函数翻转 (含显式意图判定)");
-        let toggle_set_at = toggle
-            .find("treeDesiredExpanded.set(path, next)")
-            .expect("在途激活写入最新 desired");
-        let toggle_mark_at = toggle
-            .find("treeUserExpansionIntent.add(path)")
-            .expect("在途激活必须标记显式用户意图");
+            .find("treeNextExplicitIntent(treeExpansionIntents.get(path), expanded)")
+            .expect("toggle 必须经意图纯函数推导 (最新记录 + 可见态)");
+        let toggle_publish_at = toggle
+            .find("publishTreeExpansionIntent(path, next.expanded, true)")
+            .expect("toggle 必须发布显式意图 (版本化)");
         let toggle_adopt_at = toggle
             .find("return loadTreeChildren(li, path);")
             .expect("在途激活必须挂 ownerless 续接 (绝不裸 return)");
         assert!(
             toggle_pending_at < toggle_intent_at
-                && toggle_intent_at < toggle_set_at
-                && toggle_set_at < toggle_mark_at
-                && toggle_mark_at < toggle_adopt_at,
-            "在途分支: 意图推导 → 写 desired → 标记显式 → 挂续接 (绝不裸 return / 绝不二次请求)"
+                && toggle_intent_at < toggle_publish_at
+                && toggle_publish_at < toggle_adopt_at,
+            "在途分支: 纯函数推导 → 发布显式意图 → 挂续接 (绝不裸 return / 绝不二次请求)"
         );
+        // 无在途分支: 收起直接改 DOM (意图无消费方, 绝不写入残留 — 陈旧意图会
+        // 挡住后续 reveal 的缓存命中展开); 展开经纯函数 + 发布 (用户激活即显式,
+        // nav/reveal 默认不算 — 在途期间的后续激活因此翻转而非再推导).
         let toggle_nopending_at = toggle.find("if (expanded) {").expect("无在途分支存在");
-        let toggle_after = &toggle[toggle_nopending_at..];
+        let toggle_else_at = toggle.find("} else {").expect("无在途分支存在 else");
+        let toggle_collapse = &toggle[toggle_nopending_at..toggle_else_at];
         assert!(
-            !toggle_after.contains("treeDesiredExpanded"),
-            "无在途分支不得触碰意图 (DOM 直接权威)"
+            !toggle_collapse.contains("treeExpansionIntents"),
+            "无在途收起分支不得触碰意图 (DOM 直接权威)"
         );
-        // 无在途展开分支: 用户激活即显式意图 (nav/reveal 默认 desired 不算) —
-        // 标记后再经 loadTreeChildren; 显式标记使在途期间的后续激活翻转 (第二
-        // 次激活表达收起), 首击永远不会被当成 nav 默认意图翻转.
+        let toggle_expand = &toggle[toggle_else_at..];
         assert!(
-            toggle_after.contains("treeUserExpansionIntent.add(path)"),
-            "无在途展开分支必须标记显式用户意图"
+            toggle_expand.contains("treeNextExplicitIntent("),
+            "无在途展开分支必须经意图纯函数推导"
+        );
+        assert!(
+            toggle_expand.contains("publishTreeExpansionIntent(path, next.expanded, true)"),
+            "无在途展开分支必须发布显式意图"
+        );
+        assert!(
+            toggle_expand.contains("loadTreeChildren(li, path)"),
+            "无在途展开分支必须经 loadTreeChildren 加载"
+        );
+        // ArrowRight (键盘显式展开): 发布显式 (true, true) 意图后加载 — 最新
+        // 用户动作权威 (覆盖既有收起意图); 绝不写 bool map/Set 残留.
+        let kd_start = js
+            .find("function onTreeKeydown(")
+            .expect("onTreeKeydown 存在");
+        let kd_end = js
+            .find("function init(")
+            .expect("init 位于 onTreeKeydown 之后");
+        let kd = &js[kd_start..kd_end];
+        let ar_at = kd.find("case 'ArrowRight':").expect("ArrowRight 分支存在");
+        let ar_end = kd
+            .find("case 'ArrowLeft':")
+            .expect("ArrowLeft 位于 ArrowRight 之后");
+        let ar_branch = &kd[ar_at..ar_end];
+        assert!(
+            ar_branch.contains("publishTreeExpansionIntent(path, true, true)"),
+            "ArrowRight 必须发布显式展开意图"
+        );
+        assert!(
+            ar_branch.contains("loadTreeChildren(treeSelectedEl, path)"),
+            "ArrowRight 必须经 loadTreeChildren 加载"
         );
         // enterTreeMode: 先递增树壳 generation 再捕获 enterGen; 进入链每处异步
         // 边界后 (buildTreeShell().then / reveal.then / walk 递归续接 / 选中恢复)
@@ -2347,7 +2438,8 @@ mod tests {
             enter.matches("enterGen !== treeGen").count() >= 4,
             "进入链每处异步边界后都必须有 enterGen 守卫 (buildTreeShell.then / reveal.then / walk 续接 / 选中恢复)"
         );
-        // exitTreeMode: 清空在途与意图表 (随树缓存整体销毁).
+        // exitTreeMode: 清空在途与意图记录表 (随树缓存整体销毁); 版本计数保留
+        // (跨壳单调, 记录身份比较天然隔离).
         let exit_start = js
             .find("function exitTreeMode()")
             .expect("exitTreeMode 存在");
@@ -2356,17 +2448,16 @@ mod tests {
         let pending_clear_at = exit
             .find("treePendingLoads.clear();")
             .expect("退出清空在途表");
-        let desired_clear_at = exit
-            .find("treeDesiredExpanded.clear();")
-            .expect("退出清空意图表");
-        let explicit_clear_at = exit
-            .find("treeUserExpansionIntent.clear();")
-            .expect("退出清空显式意图表");
+        let intent_clear_at = exit
+            .find("treeExpansionIntents.clear();")
+            .expect("退出清空意图记录表");
         assert!(
-            cache_clear_at < pending_clear_at
-                && pending_clear_at < desired_clear_at
-                && desired_clear_at < explicit_clear_at,
-            "exitTreeMode: 先清树缓存, 再清在途表、意图表与显式意图表"
+            cache_clear_at < pending_clear_at && pending_clear_at < intent_clear_at,
+            "exitTreeMode: 先清树缓存, 再清在途表与意图记录表"
+        );
+        assert!(
+            !exit.contains("treeExpansionIntentVersion = 0"),
+            "版本计数不得在退出时清零 (跨壳单调)"
         );
     }
 
