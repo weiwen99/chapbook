@@ -19,8 +19,9 @@
 //       覆盖更早显式折叠, release 后祖先展开, 子项 current/选中, 恰一次请求
 //   2   当前导航续接方 (re-attach) 在 release 前被更新导航取代: 陈旧续接零
 //       安装/零变异 (e913 settle 重查所有权)
-//   3   跨壳 + 壳 B 在途交互: A release 不得触碰 B 的 pending 身份/请求/
-//       意图; B 按自身最新意图安装一次, 无第三次请求
+//       意图; release A 后、release B 前再次激活 B: 必须复用 B 的 held 请求
+//       (生产 pending map 身份证明, 无第三次请求); B 单次安装由 scoped
+//       MutationObserver 计数 (population/replacement transitions) 证明
 //   4   nav-only 陈旧成功: 缓存存在/在途清除; 后续缓存命中 reveal 展开零额外
 //       请求; 折叠/再展开交互零额外请求 (无陈旧记录残留影响)
 //   C   旧/新壳同路径 (abort no-op): 旧壳响应不得删除新壳在途/意图, 新壳安装一次
@@ -917,70 +918,124 @@ await runScenario('C cross-shell: release A (abort-mocked) leaves B pending/DOM 
 });
 
 /* =====================================================================
- * 3. 跨壳 + 壳 B 在途交互: 壳 A 发起 P (held); 退出/重进壳 B 发起 P (held);
- *    B 在途期间交互 (显式点击翻转: 最新记录 = 收起); 先 release A (abort 伪装
- *    no-op, A 响应真实 resolve) — A 的 finally 不得触碰 B 的 pending 条目
- *    (身份比对) 与更新的意图记录 (记录身份比对); release B -> 恰一次当前壳
- *    安装 (按 B 自身最新意图), 无第三次请求.
+ * 3. 跨壳 + 壳 B 在途交互 (生产 pending 身份证明): 壳 A 发起 P (held);
+ *    退出/重进壳 B 发起 P (held); 在 B 的 P 行 li (父) 上安装 scoped
+ *    MutationObserver — 只计 cb-tree-node 子项的增删 (实际 population/
+ *    replacement 转换), 不计 ul 创建/属性/字符变异; 先 release A (abort
+ *    伪装 no-op, A 响应真实 resolve) — A 的 finally 若无条件删 pending
+ *    (身份守卫被破坏) 会误删 B 的 map 条目; 此后、release B 之前再次激活
+ *    B 的 P: 正确生产在途去重 — 复用 B 已 held 的请求并更新最新意图 (显式
+ *    翻转 -> 收起), 总请求数必须仍为 2 且无第三个 Fetch.requestPaused/
+ *    requestId; 若 A 误删 B map, 本次激活将发起第三次请求 -> 测试失败.
+ *    release B -> 恰一次当前壳安装 (mutation counter == 1), 终态
+ *    children/aria/意图一致, 当前壳正确; 观察器在场景 finally 断开, held
+ *    响应由 runScenario finally 的 Fetch.disable 兜底释放.
  * ===================================================================== */
-await runScenario('3 cross-shell with in-B interaction: A release leaves B pending/intent untouched; B installs its latest intent once', async () => {
+await runScenario('3 cross-shell pending identity: post-A-release B toggle reuses held request (no 3rd request); single install', async () => {
   const { page, pageErrors } = await fresh('dir', { nohost: true, patchAbort: true });
   const holdSet = new Set(['/adir']);
   const held = new Map();
   await holdTreePath(page, holdSet, held);
-
-  // 壳 A: 点击 adir -> 请求 A held
-  await page.click('.cb-mode-toggle');
-  await waitFor(() => page.evaluate("!!document.querySelector('ul#cb-tree-root > li.cb-tree-node')"), 'A-root-attached');
-  await sleep(300);
-  await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
-  await waitHeld(page, held, '/adir', 1, 'A-held');
-  await sleep(200);
-  // 退出 (无 pane -> 不重载; abort 伪装), 重进 -> 壳 B
-  await page.click('.cb-mode-toggle');
-  await waitFor(() => page.evaluate("!document.body.classList.contains('cb-tree-mode')"), 'exited-A');
-  await page.click('.cb-mode-toggle');
-  await waitFor(() => page.evaluate("!!document.querySelector('ul#cb-tree-root > li.cb-tree-node')"), 'B-root-attached');
-  await sleep(300);
-  // 壳 B: 点击 adir -> 请求 B held
-  await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
-  await waitHeld(page, held, '/adir', 2, 'B-held');
-  await sleep(300);
-  // B 在途交互: 再点击 adir (显式翻转: 展开意图 -> 收起意图; 版本更新)
-  await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
-  await sleep(300);
-  const midB = {
-    held: (held.get('/adir') || []).length,
-    paused: pausedCounts['/adir'] || 0,
-    net: netCounts['/adir'] || 0,
-    bReqId: (held.get('/adir') || [])[1],
-  };
-  // 先 release A: A 的 finally 不得删除 B 的 pending 条目或更新的意图
-  await releaseOne(page, held, '/adir');
-  await sleep(600);
-  const afterA = {
-    held: (held.get('/adir') || []).length,
-    sameBReq: (held.get('/adir') || [])[0] === midB.bReqId,
-    paused: pausedCounts['/adir'] || 0,
-    net: netCounts['/adir'] || 0,
-    state: await dirState(page, 'adir'),
-    abortMock: await page.evaluate('window.__abortMock'),
-  };
-  // release B: B 按自身最新意图 (收起) 安装一次
-  await releaseOne(page, held, '/adir');
-  await waitFor(() => page.evaluate("!!document.querySelector('[data-native-path-encoded=\"adir\"] ul.cb-tree-children li')"), 'B-landed');
-  await sleep(400);
-  const finalB = await dirState(page, 'adir');
-  const finalCounts = { paused: pausedCounts['/adir'] || 0, net: netCounts['/adir'] || 0 };
-  rec('3 cross-shell with in-B interaction: A release leaves B pending/intent untouched; B installs its latest intent once',
-    midB.held === 2 && midB.paused === 2 && midB.net === 2 &&
-      afterA.held === 1 && afterA.sameBReq === true && afterA.paused === 2 && afterA.net === 2 &&
-      afterA.state.expandable === '1' && afterA.state.expanded === 'false' && afterA.state.hasUl === false && afterA.state.twist === '▸' &&
-      afterA.abortMock >= 1 &&
-      finalB.children === 2 && finalB.hidden === true && finalB.expanded === 'false' && finalB.twist === '▸' &&
-      finalCounts.paused === 2 && finalCounts.net === 2 && pageErrors.length === 0,
-    'midB=' + JSON.stringify(midB) + ' afterA=' + JSON.stringify(afterA) + ' finalB=' + JSON.stringify(finalB) +
-      ' finalCounts=' + JSON.stringify(finalCounts) + ' errors=' + JSON.stringify(pageErrors));
+  let obsInstalled = false;
+  try {
+    // 壳 A: 点击 adir -> 请求 A held
+    await page.click('.cb-mode-toggle');
+    await waitFor(() => page.evaluate("!!document.querySelector('ul#cb-tree-root > li.cb-tree-node')"), 'A-root-attached');
+    await sleep(300);
+    await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
+    await waitHeld(page, held, '/adir', 1, 'A-held');
+    await sleep(200);
+    // 退出 (无 pane -> 不重载; abort 伪装), 重进 -> 壳 B
+    await page.click('.cb-mode-toggle');
+    await waitFor(() => page.evaluate("!document.body.classList.contains('cb-tree-mode')"), 'exited-A');
+    await page.click('.cb-mode-toggle');
+    await waitFor(() => page.evaluate("!!document.querySelector('ul#cb-tree-root > li.cb-tree-node')"), 'B-root-attached');
+    await sleep(300);
+    // 壳 B: 点击 adir -> 请求 B held (生产 pending map 新条目)
+    await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
+    await waitHeld(page, held, '/adir', 2, 'B-held');
+    await sleep(300);
+    // scoped MutationObserver (B 的 adir li): 只计 cb-tree-node 子项的增删
+    // 批次 = 实际 population/replacement 转换 (一次 install 恰一次
+    // replaceChildren), 不计 ul 创建/aria/twist 等无关变异
+    const obsSetup = await page.evaluate(
+      '(() => { const li = document.querySelector(' + JSON.stringify('[data-native-path-encoded="adir"]') + '); if (!li) return -1; window.__adirInstalls = 0; window.__adirObs = new MutationObserver(function (muts) { for (const m of muts) { const added = m.addedNodes; for (let i = 0; i < added.length; i++) { if (added[i].nodeType === 1 && added[i].classList.contains("cb-tree-node")) { window.__adirInstalls++; return; } } const removed = m.removedNodes; for (let i = 0; i < removed.length; i++) { if (removed[i].nodeType === 1 && removed[i].classList.contains("cb-tree-node")) { window.__adirInstalls++; return; } } } }); window.__adirObs.observe(li, { childList: true, subtree: true }); return 0; })()'
+    );
+    if (obsSetup !== 0) throw new Error('observer install failed: adir li missing in shell B');
+    obsInstalled = true;
+    const installs = () => page.evaluate('window.__adirInstalls');
+    const midB = {
+      held: (held.get('/adir') || []).length,
+      paused: pausedCounts['/adir'] || 0,
+      net: netCounts['/adir'] || 0,
+      bReqId: (held.get('/adir') || [])[1],
+      installs: await installs(),
+    };
+    // 先 release A: A 的 finally 不得删除 B 的 pending 条目或更新的意图,
+    // 也不得在 B 壳安装任何子项 (installs 必须仍为 0)
+    await releaseOne(page, held, '/adir');
+    await sleep(600);
+    const afterA = {
+      held: (held.get('/adir') || []).length,
+      sameBReq: (held.get('/adir') || [])[0] === midB.bReqId,
+      paused: pausedCounts['/adir'] || 0,
+      net: netCounts['/adir'] || 0,
+      state: await dirState(page, 'adir'),
+      abortMock: await page.evaluate('window.__abortMock'),
+      installs: await installs(),
+    };
+    // release B 之前再次激活 B 的 P: 正确生产在途去重 — 复用 B 已 held 的
+    // 请求并更新最新意图 (显式翻转: 展开 -> 收起), 绝不发起第三次请求; 若
+    // A 误删 B 的 pending map 条目, 此激活将触发第三次请求 (paused/net 变
+    // 3, held 变 2) -> 断言失败
+    await page.click('[data-native-path-encoded="adir"] .cb-tree-row');
+    await sleep(300);
+    const afterToggle = {
+      held: (held.get('/adir') || []).length,
+      sameBReq: (held.get('/adir') || [])[0] === midB.bReqId,
+      paused: pausedCounts['/adir'] || 0,
+      net: netCounts['/adir'] || 0,
+      installs: await installs(),
+    };
+    // release B: B 按自身最新意图 (收起) 恰安装一次 (mutation counter == 1)
+    await releaseOne(page, held, '/adir');
+    await waitFor(() => page.evaluate("!!document.querySelector('[data-native-path-encoded=\"adir\"] ul.cb-tree-children li')"), 'B-landed');
+    await sleep(400);
+    const finalB = await dirState(page, 'adir');
+    const finalSel = await selState(page);
+    const finalExpanded = await expandedList(page);
+    const finalCounts = {
+      held: (held.get('/adir') || []).length,
+      paused: pausedCounts['/adir'] || 0,
+      net: netCounts['/adir'] || 0,
+      installs: await installs(),
+    };
+    rec('3 cross-shell pending identity: post-A-release B toggle reuses held request (no 3rd request); single install',
+      midB.held === 2 && midB.paused === 2 && midB.net === 2 && midB.installs === 0 &&
+        afterA.held === 1 && afterA.sameBReq === true && afterA.paused === 2 && afterA.net === 2 &&
+        afterA.state.expandable === '1' && afterA.state.expanded === 'false' && afterA.state.hasUl === false && afterA.state.twist === '▸' &&
+        afterA.abortMock >= 1 && afterA.installs === 0 &&
+        afterToggle.held === 1 && afterToggle.sameBReq === true && afterToggle.paused === 2 && afterToggle.net === 2 && afterToggle.installs === 0 &&
+        finalB.children === 2 && finalB.hidden === true && finalB.expanded === 'false' && finalB.twist === '▸' &&
+        finalSel.selected === 'adir' && finalSel.adLive === true && finalSel.selTrue === 1 &&
+        !(JSON.stringify(finalExpanded) || '').includes('adir') &&
+        finalCounts.held === 0 && finalCounts.paused === 2 && finalCounts.net === 2 && finalCounts.installs === 1 &&
+        pageErrors.length === 0,
+      'midB=' + JSON.stringify(midB) + ' afterA=' + JSON.stringify(afterA) + ' afterToggle=' + JSON.stringify(afterToggle) +
+        ' finalB=' + JSON.stringify(finalB) + ' sel=' + JSON.stringify(finalSel) + ' expanded=' + JSON.stringify(finalExpanded) +
+        ' finalCounts=' + JSON.stringify(finalCounts) + ' errors=' + JSON.stringify(pageErrors));
+  } finally {
+    // 场景内 finally: 断开 scoped MutationObserver (幂等). 被 held 的响应由
+    // runScenario 的 finally 统一释放 (page.close -> Fetch.disable), 绝不遗留
+    // paused 请求/监听/页面.
+    if (obsInstalled) {
+      try {
+        await page.evaluate('window.__adirObs && window.__adirObs.disconnect()');
+      } catch {
+        /* 页面已关闭 */
+      }
+    }
+  }
 });
 
 /* =====================================================================
