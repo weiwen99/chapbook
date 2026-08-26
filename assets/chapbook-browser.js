@@ -1039,7 +1039,7 @@
   function clampTreeWidth(width) {
     return Math.max(TREE_MIN_WIDTH, Math.min(treeWidthMax(), Math.round(width)));
   }
-  // 恢复持久化偏好: 仅正数合法 (0/NaN/负数 → 默认 238), 再按硬边界截断.
+  // 恢复持久化偏好: 仅有限正数合法 (0/NaN/Infinity/负数 → 默认 238), 再按硬边界截断.
   function loadTreePreferredWidth() {
     let saved = 0;
     try {
@@ -1047,7 +1047,7 @@
     } catch (err) {
       /* 持久化读取失败: 用默认值 */
     }
-    return saved > 0 ? clampTreePreferred(saved) : TREE_DEFAULT_WIDTH;
+    return Number.isFinite(saved) && saved > 0 ? clampTreePreferred(saved) : TREE_DEFAULT_WIDTH;
   }
   // 应用树宽到 CSS 变量 (body.cb-tree-mode 列 1) 并同步 resizer ARIA;
   // persist 时按硬边界截断更新持久化偏好 (存储异常忽略, 宽度仍生效).
@@ -1144,6 +1144,7 @@
           return;
       }
       event.preventDefault();
+      event.stopPropagation(); // 阻断冒泡: 分隔器按键不得落入全局树键
       setTreeWidth(next, true);
     });
     document.body.append(treeResizer);
@@ -1830,6 +1831,9 @@
 
   function onTreeKeydown(event) {
     if (event.ctrlKey || event.metaKey || event.altKey) return;
+    // 分隔器按键由 resizer 自行处理并阻断冒泡; 未来分隔器子控件 (如折叠按钮)
+    // 的按键同样不得落入全局树键 (defaultPrevented 兜底).
+    if (event.defaultPrevented || event.target.closest('.cb-tree-resizer')) return;
     // Escape 先于 editable 守卫 (镜像目录模式): 聚焦树搜索框时先失焦, 否则清除选中
     if (event.key === 'Escape') {
       const input = $('#cb-tree-search-q');

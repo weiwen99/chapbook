@@ -555,6 +555,27 @@ mod tests {
         ] {
             assert!(js.contains(needle), "missing tree-resize seam: {needle}");
         }
+        // 键盘步进必须阻断冒泡: stopPropagation 位于 resizer keydown 处理器内且
+        // 在应用宽度之前 — 分隔器按键不得冒泡成全局树键 (展开/收起/选中).
+        let resizer_kd = js
+            .find("treeResizer.addEventListener('keydown',")
+            .expect("resizer keydown 处理器存在");
+        let stop_at = js
+            .find("event.stopPropagation();")
+            .expect("resizer 键盘步进阻断冒泡");
+        let apply_at = js
+            .find("setTreeWidth(next, true)")
+            .expect("键盘步进应用宽度");
+        assert!(
+            resizer_kd < stop_at && stop_at < apply_at,
+            "resizer 键盘处理必须先阻断冒泡再应用宽度"
+        );
+        // onTreeKeydown 防御性守卫: 已 preventDefault 或源自分隔器
+        // (.cb-tree-resizer) 的按键不得触发任何全局树键.
+        assert!(
+            js.contains("event.defaultPrevented || event.target.closest('.cb-tree-resizer')"),
+            "onTreeKeydown 必须忽略分隔器/已处理按键"
+        );
     }
 
     /// 任务 3 跟进: 持久化偏好与生效宽分离. 锁定 treePreferredWidth 只受硬边界
@@ -584,10 +605,10 @@ mod tests {
             js.contains("localStorage.setItem(TREE_WIDTH_KEY, String(treePreferredWidth))"),
             "localStorage 只存硬边界截断的偏好"
         );
-        // 无效保存值 → 默认 238: 仅正数合法, 再按硬边界截断
+        // 无效保存值 → 默认 238: 仅有限正数合法 (Infinity 同样非法), 再按硬边界截断
         assert!(
-            js.contains("saved > 0 ? clampTreePreferred(saved) : TREE_DEFAULT_WIDTH"),
-            "无效保存值 (0/NaN/负数) 必须回退默认 238"
+            js.contains("Number.isFinite(saved) && saved > 0 ? clampTreePreferred(saved) : TREE_DEFAULT_WIDTH"),
+            "无效保存值 (Infinity/NaN/0/负数) 必须回退默认 238"
         );
         // 跨回宽屏重放: setTreeWidth(treePreferredWidth, false) 必须位于
         // installDrawerMql 与 uninstallDrawerMql 之间的 drawer change handler
