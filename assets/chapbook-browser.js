@@ -679,6 +679,13 @@
   let treeRootUl = null; // 根 <ul>
   // 已加载子项缓存: encoded dir path (无前导斜杠) -> 子节点 <li> 数组
   const treeCache = new Map();
+  // 在途目录加载去重: path -> 在途 Promise. 同一目录只允许一个在途请求
+  // (重复激活返回同一 Promise, 绝不二次 fetch); 条目只由 owner Promise 的
+  // finally 清理, 退出树模式整体清空.
+  const treePendingLoads = new Map();
+  // 目录展开意图: path -> desired boolean. 在途加载期间再次激活可翻转意图
+  // (加载完成前表达收起); 响应落地时终态跟随意图, 绝不盲目展开.
+  const treeDesiredExpanded = new Map();
   let treeSelectedEl = null;
   // 稳定节点 id 计数器: 仅保证当前壳内唯一/稳定 (ARIA 活动后代公告锚点);
   // 每次建壳复位 (退出树模式后旧节点随壳销毁, id 可安全复用).
@@ -794,11 +801,12 @@
     li.id = 'cb-tree-item-' + (++treeItemSeq); // 稳定 id: ARIA 活动后代公告锚点
     li.setAttribute('role', 'treeitem');
     li.setAttribute('aria-selected', 'false');
-    if (isDir) li.setAttribute('aria-expanded', 'false');
     const href = typeof entry.href === 'string' ? entry.href : null;
     const relPath = treePathFromHref(href);
     // 可展开 = 目录 && 服务端 expandable && 有合法 href (环/非 UTF-8 目录恒不可展开)
     const expandable = isDir && entry.expandable === true && relPath !== null;
+    // aria-expanded 只挂可展开目录: 终端目录没有子项, 不得向 AT 伪装可展开
+    if (expandable) li.setAttribute('aria-expanded', 'false');
     li.dataset.treeDir = isDir ? '1' : '0';
     li.dataset.treeExpandable = expandable ? '1' : '0';
     if (relPath !== null) {
@@ -869,7 +877,7 @@
     const ul = li.querySelector(':scope > ul.cb-tree-children');
     if (ul) ul.hidden = !expanded;
     if (isExpandableDir(li)) setTwist(li, expanded);
-    if (isDirNode(li)) li.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    if (isExpandableDir(li)) li.setAttribute('aria-expanded', expanded ? 'true' : 'false');
     const path = encodedPathOf(li);
     if (path === null) return;
     const idx = treeExpandedPaths.indexOf(path);
@@ -894,40 +902,83 @@
       });
   }
 
-  // 懒加载目录子项; 失败静默 (网络/服务端错误不留半展开态).
+  // 展开意图纯函数 (DOM 无关 seam): 在途加载期间 (pending) 再次激活表达翻转
+  // 意图 — true→false 即加载完成前收起, false→true 即重新表达展开; 无在途时
+  // 按当前可见态翻转 (展开→收起 / 收起→展开). 返回最新 desired 意图.
+  function treeExpansionIntent(pending, expanded, desired) {
+    if (pending) return desired === true ? false : true;
+    return expanded ? false : true;
+  }
+
+  // 懒加载目录子项; 失败静默 (网络/服务端错误不留半展开态). 同一目录路径只
+  // 允许一个在途请求: 重复激活返回同一 Promise, 绝不二次 fetch; 在途期间的
+  // 最新意图 (treeDesiredExpanded) 决定响应落地时的终态, 绝不盲目展开.
   function loadTreeChildren(li, path) {
     const gen = treeGen;
     if (treeCache.has(path)) {
       const ul = childrenUlFor(li);
+      // 被替换子树内的选中节点即将脱离 DOM: 先清除选中与 aria-activedescendant
+      if (treeSelectedEl && ul.contains(treeSelectedEl)) {
+        clearTreeSelection();
+      }
       ul.replaceChildren(...treeCache.get(path));
       setTreeNodeExpanded(li, true);
+      treeDesiredExpanded.set(path, true);
       return Promise.resolve();
     }
-    return fetchTreeEntries(path)
-      .then(function (entries) {
+    const inFlight = treePendingLoads.get(path);
+    if (inFlight) {
+      treeDesiredExpanded.set(path, true); // 在途: 复用同一请求, 刷新展开意图
+      return inFlight;
+    }
+    treeDesiredExpanded.set(path, true); // reveal/persist 复用同一入口即表达展开
+    const pending = fetchTreeEntries(path).then(
+      function (entries) {
         if (gen !== treeGen) return; // 旧壳在途响应: 不得触碰新壳 DOM/缓存
         const nodes = entries.map(buildTreeNode);
         treeCache.set(path, nodes);
         const ul = childrenUlFor(li);
+        // 被替换子树内的选中节点即将脱离 DOM: 先清除选中与 aria-activedescendant
+        if (treeSelectedEl && ul.contains(treeSelectedEl)) {
+          clearTreeSelection();
+        }
         ul.replaceChildren(...nodes);
-        setTreeNodeExpanded(li, true);
-      })
-      .catch(function () {
+        // 终态跟随最新意图 (在途期间可被翻转表达收起), 绝不盲目 true
+        setTreeNodeExpanded(li, treeDesiredExpanded.get(path) !== false);
+      },
+      function () {
         /* 加载失败: 不标记展开, 下次点击重试 */
-      });
+      }
+    );
+    treePendingLoads.set(path, pending);
+    pending.finally(function () {
+      // 条目只由 owner Promise 清理: 先比对在途条目身份 (恒为本 Promise),
+      // 再删在途与意图条目 — 重复激活复用同一 pending, 绝不误删
+      if (treePendingLoads.get(path) === pending) {
+        treePendingLoads.delete(path);
+      }
+      treeDesiredExpanded.delete(path);
+    });
+    return pending;
   }
 
   function toggleTreeNode(li) {
     if (!isExpandableDir(li)) return;
     const ul = li.querySelector(':scope > ul.cb-tree-children');
-    const expanded = !!ul && !ul.hidden;
-    if (expanded) {
-      setTreeNodeExpanded(li, false);
-      return;
-    }
     const path = encodedPathOf(li);
     if (path === null) return;
-    loadTreeChildren(li, path);
+    const expanded = !!ul && !ul.hidden;
+    const pending = treePendingLoads.has(path);
+    const desired = pending && treeDesiredExpanded.has(path)
+      ? treeDesiredExpanded.get(path)
+      : expanded;
+    treeDesiredExpanded.set(path, treeExpansionIntent(pending, expanded, desired));
+    if (pending) return; // 在途: 只翻转意图, 绝不发起第二个请求
+    if (expanded) {
+      setTreeNodeExpanded(li, false);
+    } else {
+      loadTreeChildren(li, path);
+    }
   }
 
   function selectTreeNode(li) {
@@ -1120,12 +1171,15 @@
     const gen = treeGen;
     treeNav = document.createElement('nav');
     treeNav.className = 'cb-tree';
+    treeNav.id = 'cb-tree-nav'; // 稳定 id: 抽屉唤起按钮 aria-controls 锚点
     treeNav.setAttribute('aria-label', '目录树');
     treeNav.append(treeSearchForm());
     treeItemSeq = 0; // 新壳: id 计数器复位 (id 仅需壳内稳定唯一, 见声明)
     treeRootUl = document.createElement('ul');
     treeRootUl.className = 'cb-tree-root';
+    treeRootUl.id = 'cb-tree-root'; // 稳定 id: 树根 (单 tab 停靠点) 身份锚点
     treeRootUl.setAttribute('role', 'tree');
+    treeRootUl.setAttribute('aria-label', '目录树');
     treeRootUl.tabIndex = 0; // 单 tab 停靠点; 活动后代经 aria-activedescendant 公告
     treeNav.append(treeRootUl);
     document.body.prepend(treeNav);
@@ -1238,6 +1292,8 @@
     treeOpenBtn.type = 'button';
     treeOpenBtn.className = 'cb-tree-open';
     treeOpenBtn.setAttribute('aria-label', '打开目录树');
+    treeOpenBtn.setAttribute('aria-controls', 'cb-tree-nav');
+    treeOpenBtn.setAttribute('aria-expanded', 'false');
     treeOpenBtn.title = '打开目录树';
     treeOpenBtn.textContent = '☰ 目录';
     treeOpenBtn.addEventListener('click', openTreeDrawer);
@@ -2081,6 +2137,8 @@
     treeNav = null;
     treeRootUl = null;
     treeCache.clear();
+    treePendingLoads.clear(); // 在途加载与意图随壳销毁 (旧壳响应已由 treeGen 作废)
+    treeDesiredExpanded.clear();
     clearTreeSelection();
     // SPA 期间 pane 内容已被 fragment 替换: 离开树模式重载当前 URL 恢复完整页.
     // 仅在真实离开树模式时 (init 时 treeMode 为 false 则 pane 不存在, 不重载).
@@ -2122,6 +2180,38 @@
     document.body.append(btn);
   }
 
+  // 树键范围纯函数 (DOM 无关 seam): 返回 'escape-search' | 'focus-search' |
+  // 'tree' | null.
+  // - Escape 只在搜索框聚焦 (blur/收抽屉) 或树根聚焦 (清选中/收抽屉) 时处理,
+  //   其余焦点一律放行原生;
+  // - '/' 是刻意全局快捷: 非可编辑/交互即聚焦树搜索; 搜索框内 (可编辑) 原样
+  //   输入 '/' 字符;
+  // - Arrow/Enter/Backspace/Page 仅树根聚焦时属于树: pane/链接/按钮/切换/
+  //   body 聚焦一律 null — 不阻断原生滚动/激活;
+  // - 可编辑守卫晚于 Escape (搜索框聚焦的 Escape 优先), 早于 '/' 与导航键.
+  function treeKeyScope(key, editable, rootFocused, searchFocused) {
+    if (key === 'Escape') {
+      if (searchFocused) return 'escape-search';
+      if (rootFocused) return 'tree';
+      return null;
+    }
+    if (editable) return null;
+    if (key === '/') return 'focus-search';
+    if (
+      key === 'ArrowUp' ||
+      key === 'ArrowDown' ||
+      key === 'ArrowLeft' ||
+      key === 'ArrowRight' ||
+      key === 'Enter' ||
+      key === 'Backspace' ||
+      key === 'PageUp' ||
+      key === 'PageDown'
+    ) {
+      return rootFocused ? 'tree' : null;
+    }
+    return null;
+  }
+
   function onTreeKeydown(event) {
     if (event.ctrlKey || event.metaKey || event.altKey) return;
     // 分隔器按键由 resizer 自行处理并阻断冒泡; 未来分隔器子控件 (如折叠按钮)
@@ -2130,19 +2220,40 @@
     // 恢复按钮 (body 直系子级, 不在 resizer 内): Enter/Space 只触发恢复, 不得
     // 落入全局树键 (折叠按钮在 resizer 内, 已被上一条守卫覆盖).
     if (event.target.closest('.cb-tree-restore')) return;
-    // Escape 先于 editable 守卫 (镜像目录模式): 聚焦树搜索框时先失焦, 否则清除选中
-    if (event.key === 'Escape') {
-      const input = $('#cb-tree-search-q');
-      if (document.activeElement === input) {
-        input.blur();
-      } else {
-        clearTreeSelection();
+    const searchInput = $('#cb-tree-search-q');
+    const scope = treeKeyScope(
+      event.key,
+      isEditableTarget(event.target),
+      !!treeRootUl && document.activeElement === treeRootUl,
+      document.activeElement === searchInput
+    );
+    if (scope === null) return; // 非树范围按键: 不取消默认, 放行原生行为
+    if (scope === 'escape-search') {
+      // 窄屏抽屉: 先收抽屉 (closeTreeDrawer 把焦点归还唤起按钮), 再失焦 —
+      // 顺序颠倒会让 blur 先把焦点丢给 body, 抽屉关闭后的焦点归还落空;
+      // 宽屏 (抽屉未开) 仅失焦.
+      if (document.body.classList.contains('cb-drawer-open')) {
+        closeTreeDrawer();
       }
-      closeTreeDrawer(); // 窄屏抽屉: Esc 收起 (宽屏 no-op)
+      if (searchInput && document.activeElement === searchInput) {
+        searchInput.blur();
+      }
       event.preventDefault();
       return;
     }
-    if (isEditableTarget(event.target)) return;
+    if (scope === 'focus-search') {
+      if (searchInput) searchInput.focus();
+      event.preventDefault();
+      return;
+    }
+    // scope === 'tree': Escape 清选中并收抽屉; 其余为树导航键 (rootFocused
+    // 已由 helper 保证)
+    if (event.key === 'Escape') {
+      clearTreeSelection();
+      closeTreeDrawer();
+      event.preventDefault();
+      return;
+    }
     switch (event.key) {
       case 'PageUp':
         // Page 滚动只响应聚焦的树根: 根 ul 存在且为事件目标或活动元素; 焦点在
@@ -2221,12 +2332,6 @@
         event.preventDefault();
         break;
       }
-      case '/': {
-        const input = $('#cb-tree-search-q');
-        if (input) input.focus();
-        event.preventDefault();
-        break;
-      }
       default:
         break;
     }
@@ -2285,6 +2390,8 @@
       canStartTreeResize: canStartTreeResize,
       ownsTreeResize: ownsTreeResize,
       collapseFocusTarget: collapseFocusTarget,
+      treeKeyScope: treeKeyScope,
+      treeExpansionIntent: treeExpansionIntent,
     };
   }
 })();

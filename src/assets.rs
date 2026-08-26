@@ -1433,19 +1433,31 @@ mod tests {
             dbl_guard.contains("event.preventDefault();") && dbl_guard.contains("return;"),
             "dblclick 树行: 阻断默认并返回, 不得再导航"
         );
-        // ARIA 树根: 建壳时根 ul role=tree + tabindex=0; nav 保留地标且无 tabIndex.
+        // ARIA 树根: 建壳时根 ul role=tree + aria-label + tabindex=0; nav 保留
+        // 地标且无 tabIndex; 树壳与树根都有稳定 id (抽屉按钮 aria-controls 锚点).
         let shell_at = js
             .find("function buildTreeShell(")
             .expect("buildTreeShell 存在");
         let role_at = js
             .find("treeRootUl.setAttribute('role', 'tree')")
             .expect("根 ul role=tree");
+        let label_at = js
+            .find("treeRootUl.setAttribute('aria-label', '目录树')")
+            .expect("根 ul aria-label 存在");
         let tab_at = js
             .find("treeRootUl.tabIndex = 0")
             .expect("根 ul tabindex=0");
         assert!(
-            shell_at < role_at && role_at < tab_at,
-            "建壳时先设 role=tree 再设 tabindex=0"
+            shell_at < role_at && role_at < label_at && label_at < tab_at,
+            "建壳时先设 role=tree → aria-label → tabindex=0"
+        );
+        assert!(
+            js.contains("treeNav.id = 'cb-tree-nav'"),
+            "树壳必须携带稳定 id (aria-controls 锚点)"
+        );
+        assert!(
+            js.contains("treeRootUl.id = 'cb-tree-root'"),
+            "树根必须携带稳定 id"
         );
         assert!(
             js.contains("treeNav.setAttribute('aria-label', '目录树')"),
@@ -1476,10 +1488,19 @@ mod tests {
             "li.id = 'cb-tree-item-' + (++treeItemSeq)",
             "li.setAttribute('role', 'treeitem')",
             "li.setAttribute('aria-selected', 'false')",
-            "li.setAttribute('aria-expanded', 'false')",
         ] {
             assert!(build.contains(needle), "buildTreeNode 缺少 seam: {needle}");
         }
+        // aria-expanded 只挂可展开目录 (有子项可展开): 终端目录 (不可展开) 不得
+        // 携带 aria-expanded — 不向 AT 伪装可展开性.
+        assert!(
+            build.contains("if (expandable) li.setAttribute('aria-expanded', 'false')"),
+            "buildTreeNode: aria-expanded 必须仅限可展开目录"
+        );
+        assert!(
+            !build.contains("if (isDir) li.setAttribute('aria-expanded'"),
+            "终端目录不得携带 aria-expanded"
+        );
         // 子 ul role=group; 展开态同步 aria-expanded.
         let child_at = js
             .find("function childrenUlFor(")
@@ -1500,8 +1521,8 @@ mod tests {
             .expect("fetchTreeEntries 位于 setTreeNodeExpanded 之后");
         let expand = &js[expand_at..expand_end];
         assert!(
-            expand.contains("li.setAttribute('aria-expanded', expanded ? 'true' : 'false')"),
-            "setTreeNodeExpanded 同步 aria-expanded"
+            expand.contains("if (isExpandableDir(li)) li.setAttribute('aria-expanded', expanded ? 'true' : 'false')"),
+            "setTreeNodeExpanded 只同步可展开目录的 aria-expanded"
         );
         // 选中: 旧节点 aria-selected=false, 新节点 true, 根 aria-activedescendant
         // 指向新 id; 清除: 旧节点置 false, 根移除 aria-activedescendant.
@@ -1551,6 +1572,36 @@ mod tests {
             open.contains("focusTarget.focus({ preventScroll: true })"),
             "openTreeDrawer 程序化聚焦 (preventScroll)"
         );
+        // 抽屉唤起按钮: 创建即带稳定 aria-controls (树壳稳定 id) 与
+        // aria-expanded='false'; open/close 同步 'true'/'false'.
+        let open_btn_at = js
+            .find("treeOpenBtn = document.createElement('button')")
+            .expect("抽屉唤起按钮创建存在");
+        let open_btn_click_at = js
+            .find("treeOpenBtn.addEventListener('click', openTreeDrawer)")
+            .expect("唤起按钮 click 监听存在");
+        assert!(open_btn_at < open_btn_click_at, "唤起按钮先创建再挂 click");
+        let open_btn = &js[open_btn_at..open_btn_click_at];
+        assert!(
+            open_btn.contains("treeOpenBtn.setAttribute('aria-controls', 'cb-tree-nav')"),
+            "唤起按钮必须带 aria-controls (树壳稳定 id)"
+        );
+        assert!(
+            open_btn.contains("treeOpenBtn.setAttribute('aria-expanded', 'false')"),
+            "唤起按钮创建时必须显式 aria-expanded='false'"
+        );
+        assert!(
+            open.contains("treeOpenBtn.setAttribute('aria-expanded', 'true')"),
+            "openTreeDrawer 必须同步 aria-expanded='true'"
+        );
+        let close_fn_end = js
+            .find("function installDrawerMql(")
+            .expect("installDrawerMql 位于 closeTreeDrawer 之后");
+        let close_fn = &js[close_drawer_at..close_fn_end];
+        assert!(
+            close_fn.contains("treeOpenBtn.setAttribute('aria-expanded', 'false')"),
+            "closeTreeDrawer 必须同步 aria-expanded='false'"
+        );
         // PageUp/PageDown: 仅聚焦树根时滚动树列 80% 视口高并阻断默认 — 焦点门卫
         // (根 ul 存在且为事件目标或活动元素) 必须先于 scrollBy 与 preventDefault;
         // 焦点在 pane/链接/切换按钮/body 时不得滚动树列也不得阻断默认 (放行原生滚动).
@@ -1596,5 +1647,398 @@ mod tests {
                 "{label}: 焦点门卫必须先于 scrollBy 与 preventDefault"
             );
         }
+    }
+
+    /// 任务 5 质量收尾: 树键范围纯函数在 QuickJS 中真实执行. 行为矩阵:
+    /// - Escape: 搜索框聚焦 → 'escape-search' (失焦/先收抽屉), 即使树根同聚焦
+    ///   (搜索优先); 树根聚焦 → 'tree' (清选中/收抽屉); 其余 (pane/按钮/切换/
+    ///   body) → null;
+    /// - '/': 非可编辑即 'focus-search' (刻意全局快捷, 聚焦树搜索); 可编辑
+    ///   (搜索框内输入) → null (原样输入 '/' 字符);
+    /// - Arrow/Enter/Backspace/PageUp/PageDown: 仅树根聚焦 → 'tree'; pane/
+    ///   按钮/body 聚焦 → null (不阻断原生滚动/激活); 可编辑目标 → null;
+    /// - 未知键一律 null.
+    #[test]
+    fn browser_js_tree_key_scope_matrix() {
+        let ctx = quick_js::Context::new().expect("quick-js context");
+        // CommonJS 钩子 shim: 与 Node 的 module.exports 语义一致 (浏览器无 module).
+        ctx.eval("globalThis.module = { exports: {} };")
+            .expect("CommonJS module shim");
+        ctx.eval(BROWSER_JS).expect("eval BROWSER_JS");
+        // 'escape-search': Escape 且搜索框聚焦 (可编辑与否均可, 搜索优先于树根).
+        for expr in [
+            "treeKeyScope('Escape', true, false, true)",
+            "treeKeyScope('Escape', false, false, true)",
+            "treeKeyScope('Escape', true, true, true)",
+        ] {
+            let got = ctx
+                .eval(&format!("module.exports.{expr}"))
+                .expect("treeKeyScope must not throw");
+            assert_eq!(
+                got.as_str(),
+                Some("escape-search"),
+                "{expr}: expected escape-search, got {got:?}"
+            );
+        }
+        // 'tree': 树根聚焦的 Escape 与全部树导航键.
+        for expr in [
+            "treeKeyScope('Escape', false, true, false)",
+            "treeKeyScope('ArrowDown', false, true, false)",
+            "treeKeyScope('ArrowUp', false, true, false)",
+            "treeKeyScope('ArrowLeft', false, true, false)",
+            "treeKeyScope('ArrowRight', false, true, false)",
+            "treeKeyScope('Enter', false, true, false)",
+            "treeKeyScope('Backspace', false, true, false)",
+            "treeKeyScope('PageUp', false, true, false)",
+            "treeKeyScope('PageDown', false, true, false)",
+        ] {
+            let got = ctx
+                .eval(&format!("module.exports.{expr}"))
+                .expect("treeKeyScope must not throw");
+            assert_eq!(
+                got.as_str(),
+                Some("tree"),
+                "{expr}: expected tree, got {got:?}"
+            );
+        }
+        // 'focus-search': '/' 且非可编辑 (树根聚焦 / pane / 按钮 / body).
+        for expr in [
+            "treeKeyScope('/', false, false, false)",
+            "treeKeyScope('/', false, true, false)",
+        ] {
+            let got = ctx
+                .eval(&format!("module.exports.{expr}"))
+                .expect("treeKeyScope must not throw");
+            assert_eq!(
+                got.as_str(),
+                Some("focus-search"),
+                "{expr}: expected focus-search, got {got:?}"
+            );
+        }
+        // null: pane/按钮/body 聚焦的 Escape 与导航键 (不阻断默认); 可编辑目标
+        // 的导航键与 '/' (原样输入); 未知键.
+        for expr in [
+            "treeKeyScope('Escape', false, false, false)",
+            "treeKeyScope('ArrowDown', false, false, false)",
+            "treeKeyScope('ArrowUp', false, false, false)",
+            "treeKeyScope('ArrowLeft', false, false, false)",
+            "treeKeyScope('ArrowRight', false, false, false)",
+            "treeKeyScope('Enter', false, false, false)",
+            "treeKeyScope('Backspace', false, false, false)",
+            "treeKeyScope('PageUp', false, false, false)",
+            "treeKeyScope('PageDown', false, false, false)",
+            "treeKeyScope('Escape', true, false, false)",
+            "treeKeyScope('/', true, false, false)",
+            "treeKeyScope('/', true, false, true)",
+            "treeKeyScope('ArrowDown', true, true, false)",
+            "treeKeyScope('ArrowDown', true, true, true)",
+            "treeKeyScope('j', false, true, false)",
+        ] {
+            let got = ctx
+                .eval(&format!("module.exports.{expr}"))
+                .expect("treeKeyScope must not throw");
+            assert!(
+                matches!(got, quick_js::JsValue::Null),
+                "{expr}: expected null, got {got:?}"
+            );
+        }
+    }
+
+    /// 任务 5 质量收尾: 展开意图纯函数在 QuickJS 中真实执行. 行为矩阵:
+    /// - 在途 (pending): 第二次激活翻转意图 — true→false (加载完成前表达收起),
+    ///   false→true (重新表达展开), 意图缺失按展开处理 (undefined → true);
+    /// - 无在途: 按当前可见态翻转 — 展开→收起 (false), 收起→展开 (true),
+    ///   desired 参数不影响非在途判定 (可见态权威);
+    /// - 返回的意图直接决定响应落地时的 hidden/expanded 终态 (绝不盲目 true).
+    #[test]
+    fn browser_js_tree_expansion_intent_matrix() {
+        let ctx = quick_js::Context::new().expect("quick-js context");
+        // CommonJS 钩子 shim: 与 Node 的 module.exports 语义一致 (浏览器无 module).
+        ctx.eval("globalThis.module = { exports: {} };")
+            .expect("CommonJS module shim");
+        ctx.eval(BROWSER_JS).expect("eval BROWSER_JS");
+        // pending: 翻转意图.
+        for (expr, expected) in [
+            ("treeExpansionIntent(true, false, true)", false),
+            ("treeExpansionIntent(true, false, false)", true),
+            ("treeExpansionIntent(true, false)", true),
+        ] {
+            let got = ctx
+                .eval(&format!("module.exports.{expr}"))
+                .expect("treeExpansionIntent must not throw");
+            assert!(
+                matches!(got, quick_js::JsValue::Bool(b) if b == expected),
+                "{expr}: expected {expected}, got {got:?}"
+            );
+        }
+        // 非在途: 按当前可见态翻转.
+        for (expr, expected) in [
+            ("treeExpansionIntent(false, true, true)", false),
+            ("treeExpansionIntent(false, true, false)", false),
+            ("treeExpansionIntent(false, true)", false),
+            ("treeExpansionIntent(false, false, false)", true),
+            ("treeExpansionIntent(false, false, true)", true),
+            ("treeExpansionIntent(false, false)", true),
+        ] {
+            let got = ctx
+                .eval(&format!("module.exports.{expr}"))
+                .expect("treeExpansionIntent must not throw");
+            assert!(
+                matches!(got, quick_js::JsValue::Bool(b) if b == expected),
+                "{expr}: expected {expected}, got {got:?}"
+            );
+        }
+    }
+
+    /// 任务 5 质量收尾: 树键范围 helper 必须被生产 onTreeKeydown 使用.
+    /// - helper 内顺序: Escape 分支先于 editable 守卫 (搜索框聚焦的 Escape
+    ///   优先), editable 守卫先于 '/' 与导航键 (搜索框内 '/' 原样输入);
+    /// - onTreeKeydown: 以 helper 决策为总闸 — scope === null 直接返回 (绝不
+    ///   preventDefault); 'escape-search' 分支: 窄屏抽屉打开时先 closeTreeDrawer
+    ///   (焦点归还唤起按钮) 再 blur, 宽屏仅 blur; 'focus-search' 聚焦树搜索框;
+    ///   Escape 的 tree 范围清选中并收抽屉; switch 不再重复处理 '/' (已由
+    ///   focus-search 分支接管);
+    /// - helper 经 CommonJS 钩子导出 (浏览器无全局污染).
+    #[test]
+    fn browser_js_tree_key_scope_seam_is_locked() {
+        let js = BROWSER_JS;
+        let helper_start = js
+            .find("function treeKeyScope(")
+            .expect("treeKeyScope 存在");
+        let helper_end = js
+            .find("function onTreeKeydown(")
+            .expect("onTreeKeydown 位于 treeKeyScope 之后");
+        let helper = &js[helper_start..helper_end];
+        let esc_at = helper
+            .find("if (key === 'Escape') {")
+            .expect("helper Escape 分支存在");
+        let editable_at = helper
+            .find("if (editable) return null;")
+            .expect("helper editable 守卫存在");
+        let slash_at = helper
+            .find("if (key === '/') return 'focus-search';")
+            .expect("helper '/' 分支存在");
+        assert!(
+            esc_at < editable_at && editable_at < slash_at,
+            "helper 顺序: Escape 先于 editable 守卫, editable 先于 '/'"
+        );
+        assert!(
+            helper.contains("key === 'PageDown'"),
+            "helper 必须覆盖 Page 键"
+        );
+        assert!(
+            js.contains("treeKeyScope: treeKeyScope"),
+            "treeKeyScope 必须经 CommonJS 钩子导出"
+        );
+        // onTreeKeydown: 总闸顺序 — helper 决策 → null 返回 → escape-search →
+        // 先收抽屉 (窄屏) → 后失焦 → preventDefault.
+        let kd_start = js
+            .find("function onTreeKeydown(")
+            .expect("onTreeKeydown 存在");
+        let kd_end = js
+            .find("function init(")
+            .expect("init 位于 onTreeKeydown 之后");
+        let kd = &js[kd_start..kd_end];
+        let scope_at = kd
+            .find("const scope = treeKeyScope(")
+            .expect("onTreeKeydown 必须经 helper 决策");
+        let null_at = kd
+            .find("if (scope === null) return;")
+            .expect("null 范围直接返回 (不取消默认)");
+        let esc_scope_at = kd
+            .find("if (scope === 'escape-search') {")
+            .expect("escape-search 分支存在");
+        let drawer_guard_at = kd
+            .find("document.body.classList.contains('cb-drawer-open')")
+            .expect("窄屏抽屉判定存在");
+        let close_at = kd
+            .find("closeTreeDrawer();")
+            .expect("escape-search 先收抽屉");
+        let blur_at = kd
+            .find("searchInput.blur();")
+            .expect("escape-search 失焦搜索框");
+        let pd_at = kd
+            .find("event.preventDefault();")
+            .expect("handled 分支阻断默认");
+        assert!(
+            scope_at < null_at
+                && null_at < esc_scope_at
+                && esc_scope_at < drawer_guard_at
+                && drawer_guard_at < close_at
+                && close_at < blur_at
+                && blur_at < pd_at,
+            "onTreeKeydown 顺序: helper 决策 → null 返回 → escape-search → 窄屏先收抽屉 → 后失焦 → preventDefault"
+        );
+        // 分支顺序: escape-search → focus-search → tree 范围 Escape.
+        let focus_at = kd
+            .find("if (scope === 'focus-search') {")
+            .expect("focus-search 分支存在");
+        let tree_esc_at = kd
+            .find("if (event.key === 'Escape') {")
+            .expect("tree 范围 Escape 分支存在");
+        assert!(
+            esc_scope_at < focus_at && focus_at < tree_esc_at,
+            "分支顺序: escape-search → focus-search → tree 范围 Escape"
+        );
+        assert!(
+            kd.contains("searchInput.focus()"),
+            "focus-search 必须聚焦树搜索框"
+        );
+        assert!(
+            kd.contains("case 'ArrowDown':"),
+            "Arrow 键仍在 tree 范围处理"
+        );
+        assert!(
+            !kd.contains("case '/':"),
+            "'/' 已由 focus-search 分支接管, switch 不得重复"
+        );
+    }
+
+    /// 任务 5: 懒加载并发去重 + 意图终态 seam. 行为导向源不变量:
+    /// - 模块状态: treePendingLoads (path → 在途 Promise) 与 treeDesiredExpanded
+    ///   (path → 最新意图) 声明, 退出树模式整体清空;
+    /// - loadTreeChildren: 缓存命中与异步响应两条替换路径都必须先清除被替换
+    ///   子树内的选中 (clearTreeSelection → aria-activedescendant 同步移除);
+    ///   在途查询 → 复用同一 Promise (绝不二次 fetch) → 仅当无在途才发起;
+    ///   响应落地先经旧壳 generation 守卫, 再写缓存/DOM;
+    ///   终态跟随最新意图 (setTreeNodeExpanded 以 desired 为准, 绝不盲目 true);
+    ///   清理只由 owner Promise 在 finally 执行: 先比对在途条目身份再删除,
+    ///   意图条目一并删除;
+    /// - toggleTreeNode: 在途只翻转意图 (treeExpansionIntent), 直接返回,
+    ///   绝不发起第二个请求; 非在途按当前可见态展开/收起;
+    /// - reveal/persist 复用 loadTreeChildren 入口, 显式置 desired=true (展开
+    ///   意图, 见 loadTreeChildren 内 treeDesiredExpanded.set(path, true)).
+    #[test]
+    fn browser_js_tree_load_dedup_seam_is_locked() {
+        let js = BROWSER_JS;
+        for needle in [
+            "const treePendingLoads = new Map()",
+            "const treeDesiredExpanded = new Map()",
+            "function treeExpansionIntent(",
+            "function loadTreeChildren(",
+            "treePendingLoads.clear()",
+            "treeDesiredExpanded.clear()",
+        ] {
+            assert!(js.contains(needle), "missing load-dedup seam: {needle}");
+        }
+        let load_start = js
+            .find("function loadTreeChildren(")
+            .expect("loadTreeChildren 存在");
+        let load_end = js
+            .find("function toggleTreeNode(")
+            .expect("toggleTreeNode 位于 loadTreeChildren 之后");
+        let load = &js[load_start..load_end];
+        // 在途复用: 先查在途 → 返回同一 Promise → 仅无在途才发起 fetch.
+        let inflight_at = load
+            .find("const inFlight = treePendingLoads.get(path)")
+            .expect("在途查询存在");
+        let reuse_at = load.find("return inFlight;").expect("在途复用同一 Promise");
+        let fetch_at = load
+            .find("const pending = fetchTreeEntries(path)")
+            .expect("发起加载存在");
+        assert!(
+            inflight_at < reuse_at && reuse_at < fetch_at,
+            "必须先在途去重 (复用同一 Promise), 再发起 fetch"
+        );
+        assert_eq!(
+            load.matches("fetchTreeEntries(path)").count(),
+            1,
+            "单条加载路径只允许一个 fetch 调用点 (去重契约)"
+        );
+        // 意图显式置 true (reveal/persist 复用同一入口即表达展开).
+        assert!(
+            load.contains("treeDesiredExpanded.set(path, true)"),
+            "发起加载必须显式置展开意图"
+        );
+        // 缓存命中分支: 替换前先清被替换子树内的选中.
+        let cache_start = load
+            .find("if (treeCache.has(path)) {")
+            .expect("缓存命中分支存在");
+        let cache_end = load
+            .find("return Promise.resolve();")
+            .expect("缓存分支返回存在");
+        let cache_branch = &load[cache_start..cache_end];
+        let cache_clear_at = cache_branch
+            .find("clearTreeSelection();")
+            .expect("缓存分支替换前清除选中");
+        let cache_replace_at = cache_branch
+            .find("ul.replaceChildren(...treeCache.get(path))")
+            .expect("缓存分支替换子项");
+        assert!(
+            cache_clear_at < cache_replace_at,
+            "缓存分支: 必须先清除被替换子树内的选中再 replaceChildren"
+        );
+        // 异步分支: 旧壳守卫 → 缓存写入 → 清除选中 → 替换 → 意图终态.
+        let finally_at = load
+            .find(".finally(function () {")
+            .expect("owner finally 清理存在");
+        let async_branch = &load[fetch_at..finally_at];
+        let gen_at = async_branch
+            .find("if (gen !== treeGen) return;")
+            .expect("旧壳 generation 守卫存在");
+        let cache_set_at = async_branch
+            .find("treeCache.set(path, nodes)")
+            .expect("缓存写入存在");
+        let async_clear_at = async_branch
+            .find("clearTreeSelection();")
+            .expect("异步分支替换前清除选中");
+        let async_replace_at = async_branch
+            .find("ul.replaceChildren(...nodes)")
+            .expect("异步分支替换子项");
+        let intent_at = async_branch
+            .find("setTreeNodeExpanded(li, treeDesiredExpanded.get(path) !== false)")
+            .expect("终态必须跟随最新意图");
+        assert!(
+            gen_at < cache_set_at
+                && cache_set_at < async_clear_at
+                && async_clear_at < async_replace_at
+                && async_replace_at < intent_at,
+            "异步分支顺序: 旧壳守卫 → 缓存写入 → 清选中 → 替换 → 意图终态"
+        );
+        // owner 清理: finally 内先比对条目身份, 再删在途与意图.
+        let owner_cmp_at = load
+            .find("treePendingLoads.get(path) === pending")
+            .expect("owner 身份比对存在");
+        let pending_del_at = load
+            .find("treePendingLoads.delete(path)")
+            .expect("删除在途条目存在");
+        let desired_del_at = load
+            .find("treeDesiredExpanded.delete(path)")
+            .expect("删除意图条目存在");
+        assert!(
+            finally_at < owner_cmp_at
+                && owner_cmp_at < pending_del_at
+                && pending_del_at < desired_del_at,
+            "owner 清理顺序: finally → 身份比对 → 删在途 → 删意图"
+        );
+        // toggleTreeNode: 在途只翻转意图, 不发起第二个请求; 非在途按可见态.
+        let toggle_end = js
+            .find("function selectTreeNode(")
+            .expect("selectTreeNode 位于 toggleTreeNode 之后");
+        let toggle = &js[load_end..toggle_end];
+        assert!(
+            toggle.contains("treeExpansionIntent(pending, expanded, desired)"),
+            "toggle 必须经意图纯函数翻转"
+        );
+        assert!(
+            toggle.contains("if (pending) return;"),
+            "在途 toggle 必须直接返回 (绝不发起第二个请求)"
+        );
+        // exitTreeMode: 清空在途与意图表 (随树缓存整体销毁).
+        let exit_start = js
+            .find("function exitTreeMode()")
+            .expect("exitTreeMode 存在");
+        let exit = &js[exit_start..];
+        let cache_clear_at = exit.find("treeCache.clear()").expect("退出清空树缓存");
+        let pending_clear_at = exit
+            .find("treePendingLoads.clear();")
+            .expect("退出清空在途表");
+        let desired_clear_at = exit
+            .find("treeDesiredExpanded.clear();")
+            .expect("退出清空意图表");
+        assert!(
+            cache_clear_at < pending_clear_at && pending_clear_at < desired_clear_at,
+            "exitTreeMode: 先清树缓存, 再清在途表与意图表"
+        );
     }
 }
