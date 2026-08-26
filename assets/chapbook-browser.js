@@ -949,7 +949,9 @@
 
   // 唯一子项替换点: 把缓存子项安装进 li (缓存命中与异步响应共用). 空缓存 →
   // 叶子化; 替换前先清除被替换子树内的选中 (aria-activedescendant 同步移除);
-  // 终态跟随最新意图 (在途期间可翻转表达收起), 绝不盲目 true.
+  // 终态跟随最新意图 (在途期间可翻转表达收起), 绝不盲目 true; 落地终态后消费
+  // 意图 (DOM 即权威) — 续接方晚于 owner finally 注册, 意图必须由安装方清理,
+  // 否则 finally 抢先清除会让续接方读到已清除的意图.
   function installTreeChildren(li, path) {
     const cached = treeCache.get(path);
     if (!cached) return;
@@ -963,6 +965,7 @@
     }
     ul.replaceChildren(...cached);
     setTreeNodeExpanded(li, treeDesiredExpanded.get(path) !== false);
+    treeDesiredExpanded.delete(path); // 意图已消费: DOM 即权威, 不留残留
   }
 
   // 共享在途结果的续接方提交: 响应可能因发起方所有权陈旧只写缓存未动 DOM —
@@ -979,8 +982,10 @@
   // 允许一个在途请求: 重复激活复用同一 Promise, 绝不二次 fetch; 每个调用方
   // 都在共享 Promise 上挂自己的续接 — 发起方所有权陈旧时 (如陈旧导航) 响应
   // 只写缓存不落 DOM, 本调用方所有权当前则补齐安装, 终态跟随最新意图
-  // (treeDesiredExpanded), 绝不盲目展开; 响应落地后 finally 在 owner 块内
-  // 清除在途条目与意图 (DOM 即权威; 旧壳 finally 不得删新壳条目).
+  // (treeDesiredExpanded), 绝不盲目展开; 响应落地后安装方 (installTreeChildren)
+  // 在落地终态后消费意图 (DOM 即权威), finally 在 owner 块内清除在途条目,
+  // 失败响应 (无安装方) 才由 finally 兜底清除意图 (旧壳 finally 不得删新壳
+  // 条目; 续接方晚于 finally 注册, 意图不得被 finally 抢先清除).
   // owner 传调用方所有权: { navGen } (reveal/sync 导航链) 或 { enterGen }
   // (进入链持久化展开) — 响应落地时导航/进入链已过期则只共享缓存结果, 不
   // 提交 DOM/展开/持久化; 无 owner (显式用户调用) 可采纳共享在途结果.
@@ -1008,9 +1013,10 @@
       }
       // 每个调用方都挂自己的续接: 发起方所有权陈旧时 (如陈旧导航) 响应只写缓存
       // 不落 DOM — 本调用方所有权当前则补齐安装, 终态跟随最新意图 (缓存结果
-      // 共享); 绝不 bare-return 发起方的 Promise.
+      // 共享); 绝不 bare-return 发起方的 Promise. 所有权在响应落地时重查:
+      // 调用时的快照 (navCurrent/壳代) 会过期 — 跨导航/跨壳后不得提交.
       return inFlight.then(function (entries) {
-        if (!treeLoadMayCommit(enterGen === undefined || enterGen === treeGen, navRequired, navCurrent)) {
+        if (!treeLoadMayCommit(gen === treeGen, navRequired, paneNavGuard.isCurrent(navGen))) {
           return entries;
         }
         ensureTreeChildrenInstalled(li, path); // 空缓存 → 叶子化; 已安装 → 跳过
@@ -1037,11 +1043,15 @@
     treePendingLoads.set(path, pending);
     pending.finally(function () {
       // 清理只由 owner Promise 执行: 先比对在途条目身份 (恒为本 Promise) —
-      // 旧壳/旧链的 finally 不得删除新壳注册的条目与意图; 响应落地后 DOM 即
-      // 权威, 意图一并清除 (续接方已在 finally 前按最新意图安装/隐藏).
+      // 旧壳/旧链的 finally 不得删除新壳注册的条目与意图. 成功响应已由安装方
+      // (installTreeChildren) 在落地终态后消费意图; 此处只在失败响应 (无缓存,
+      // 无安装方) 时兜底删除 — 续接方 (inFlight.then) 注册晚于本 finally,
+      // 若在此无条件删除意图, 续接方将读到已清除的意图 (折叠意图丢失).
       if (treePendingLoads.get(path) === pending) {
         treePendingLoads.delete(path);
-        treeDesiredExpanded.delete(path);
+        if (!treeCache.has(path)) {
+          treeDesiredExpanded.delete(path);
+        }
       }
     });
     return pending;
@@ -1056,7 +1066,7 @@
     const pending = treePendingLoads.has(path);
     if (pending) {
       // 在途: 只翻转意图 (treeExpansionIntent), 绝不发起第二个请求 — 响应
-      // 落地时终态跟随意图, 随后 finally 清除意图, DOM 成为权威.
+      // 落地时终态跟随意图, 安装方消费意图后 DOM 成为权威.
       const desired = treeDesiredExpanded.has(path)
         ? treeDesiredExpanded.get(path)
         : expanded;

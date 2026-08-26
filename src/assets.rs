@@ -2131,24 +2131,29 @@ mod tests {
             gen_at < cache_set_at && cache_set_at < nav_guard_at && nav_guard_at < install_at,
             "异步分支顺序: 壳守卫 → 缓存写入 → 导航守卫 → 唯一替换点"
         );
-        // owner 清理: finally 内先比对在途条目身份, 同一 owner 块内先删在途
-        // 条目再删意图 (响应落地后 DOM 即权威; 续接方已在 finally 前按最新
-        // 意图安装/隐藏). 意图删除只允许出现在 owner 块内, 绝不无条件删除 —
-        // 旧壳 finally 比对失败时不得触碰新壳注册的条目与意图.
+        // owner 清理: finally 内先比对在途条目身份, owner 块内删在途条目;
+        // 意图由安装方 (installTreeChildren) 在落地终态后消费 (续接方晚于
+        // finally 注册, finally 不得抢先清除意图 — 否则折叠意图丢失), 失败
+        // 响应 (无缓存无安装方) 才由 finally 兜底删除; 旧壳 finally 比对失败
+        // 时不得触碰新壳注册的条目与意图.
         let owner_cmp_at = load
             .find("treePendingLoads.get(path) === pending")
             .expect("owner 身份比对存在");
         let pending_del_at = load
             .find("treePendingLoads.delete(path)")
             .expect("删除在途条目存在");
+        let cache_check_at = load
+            .find("if (!treeCache.has(path)) {")
+            .expect("意图兜底删除必须限定失败响应 (无缓存)");
         let desired_del_at = load
             .find("treeDesiredExpanded.delete(path)")
-            .expect("删除意图条目存在 (响应落地后 DOM 即权威)");
+            .expect("删除意图条目存在 (失败响应兜底)");
         assert!(
             finally_at < owner_cmp_at
                 && owner_cmp_at < pending_del_at
-                && pending_del_at < desired_del_at,
-            "owner 清理顺序: finally → 身份比对 → 删在途 → 删意图 (同一 owner 块)"
+                && pending_del_at < cache_check_at
+                && cache_check_at < desired_del_at,
+            "owner 清理顺序: finally → 身份比对 → 删在途 → 无缓存才兜底删意图"
         );
         assert_eq!(
             load.matches("treeDesiredExpanded.delete").count(),
