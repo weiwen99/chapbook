@@ -1551,7 +1551,10 @@ mod tests {
             open.contains("focusTarget.focus({ preventScroll: true })"),
             "openTreeDrawer 程序化聚焦 (preventScroll)"
         );
-        // PageUp/PageDown: 滚动树列 80% 视口高并阻断默认, PageUp 先于 PageDown.
+        // PageUp/PageDown: 仅聚焦树根时滚动树列 80% 视口高并阻断默认 — 焦点门卫
+        // (根 ul 存在且为事件目标或活动元素) 必须先于 scrollBy 与 preventDefault;
+        // 焦点在 pane/链接/切换按钮/body 时不得滚动树列也不得阻断默认 (放行原生滚动).
+        // PageUp 先于 PageDown; Arrow 语义不变 (Page 门卫不得用于 Arrow).
         let kd_at = js
             .find("function onTreeKeydown(")
             .expect("onTreeKeydown 存在");
@@ -1561,13 +1564,37 @@ mod tests {
         let kd = &js[kd_at..kd_end];
         let pu_at = kd.find("case 'PageUp':").expect("PageUp 分支存在");
         let pd_at = kd.find("case 'PageDown':").expect("PageDown 分支存在");
-        assert!(pu_at < pd_at, "PageUp 先于 PageDown");
+        let arrow_at = kd.find("case 'ArrowDown':").expect("ArrowDown 分支存在");
+        assert!(
+            pu_at < pd_at && pd_at < arrow_at,
+            "PageUp 先于 PageDown, 均先于 ArrowDown"
+        );
         for needle in [
             "treeNav.scrollBy({ top: -Math.round(treeNav.clientHeight * 0.8) })",
             "treeNav.scrollBy({ top: Math.round(treeNav.clientHeight * 0.8) })",
             "event.preventDefault();",
         ] {
             assert!(kd.contains(needle), "onTreeKeydown 缺少 seam: {needle}");
+        }
+        // 逐分支切片: 焦点门卫 → scrollBy → preventDefault 的顺序必须保持, 且
+        // 门卫同时含树根存在检查与树根焦点检查 (否则聚焦别处时不得滚动/阻断).
+        let focus_gate = "(event.target === treeRootUl || document.activeElement === treeRootUl)";
+        for (body, label) in [
+            (&kd[pu_at..pd_at], "PageUp"),
+            (&kd[pd_at..arrow_at], "PageDown"),
+        ] {
+            let root_at = body
+                .find("treeRootUl &&")
+                .expect("{label} 缺少树根存在门卫 (treeRootUl &&)");
+            let gate_at = body.find(focus_gate).expect("{label} 缺少焦点门卫");
+            let scroll_at = body.find("treeNav.scrollBy").expect("{label} 缺少滚动调用");
+            let prevent_at = body
+                .find("event.preventDefault();")
+                .expect("{label} 缺少默认阻断");
+            assert!(
+                root_at < gate_at && gate_at < scroll_at && scroll_at < prevent_at,
+                "{label}: 焦点门卫必须先于 scrollBy 与 preventDefault"
+            );
         }
     }
 }

@@ -2145,16 +2145,28 @@
     if (isEditableTarget(event.target)) return;
     switch (event.key) {
       case 'PageUp':
-        if (treeNav) {
-          treeNav.scrollBy({ top: -Math.round(treeNav.clientHeight * 0.8) });
+        // Page 滚动只响应聚焦的树根: 根 ul 存在且为事件目标或活动元素; 焦点在
+        // pane/链接/切换按钮/body 时放行原生滚动 (不滚动树列、不阻断默认).
+        if (
+          treeRootUl &&
+          (event.target === treeRootUl || document.activeElement === treeRootUl)
+        ) {
+          if (treeNav) {
+            treeNav.scrollBy({ top: -Math.round(treeNav.clientHeight * 0.8) });
+          }
+          event.preventDefault();
         }
-        event.preventDefault();
         break;
       case 'PageDown':
-        if (treeNav) {
-          treeNav.scrollBy({ top: Math.round(treeNav.clientHeight * 0.8) });
+        if (
+          treeRootUl &&
+          (event.target === treeRootUl || document.activeElement === treeRootUl)
+        ) {
+          if (treeNav) {
+            treeNav.scrollBy({ top: Math.round(treeNav.clientHeight * 0.8) });
+          }
+          event.preventDefault();
         }
-        event.preventDefault();
         break;
       case 'ArrowDown':
         moveTreeSelection(1);
