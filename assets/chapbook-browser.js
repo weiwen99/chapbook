@@ -660,6 +660,10 @@
   const MODE_KEY = 'cb-mode';
   const TREE_EXPANDED_KEY = 'cb-tree-expanded';
   const TREE_SELECTED_KEY = 'cb-tree-selected';
+  const TREE_WIDTH_KEY = 'cb-tree-width'; // 树宽持久化键 (px)
+  const TREE_DEFAULT_WIDTH = 238;
+  const TREE_MIN_WIDTH = 160;
+  const TREE_MAX_WIDTH = 480;
 
   let treeMode = false;
   let treeNav = null; // nav.cb-tree 外壳
@@ -675,6 +679,9 @@
   let treeOpenBtn = null; // 唤起按钮 (仅窄屏可见)
   let drawerMql = null; // 窄屏 media query (跨回宽屏时清理打开态)
   let drawerMqlHandler = null;
+  // 树宽 (宽屏列 1): resizer 常驻调整; 窄屏抽屉内 resizer 隐藏, 宽度值不生效.
+  let treeWidth = TREE_DEFAULT_WIDTH;
+  let treeResizer = null; // 列 2 调整器元素 (随树壳创建/销毁)
   function loadJsonArray(key, fallback) {
     try {
       const value = JSON.parse(localStorage.getItem(key) || 'null');
@@ -1016,6 +1023,30 @@
     });
   }
 
+  // 树宽上限: 视口一半封顶 (极窄视口下两栏仍各得其所), 且不超 480px.
+  function treeWidthMax() {
+    return Math.min(TREE_MAX_WIDTH, Math.floor(window.innerWidth * 0.5));
+  }
+  function clampTreeWidth(width) {
+    return Math.max(TREE_MIN_WIDTH, Math.min(treeWidthMax(), Math.round(width)));
+  }
+  // 应用树宽到 CSS 变量 (body.cb-tree-mode 列 1) 并同步 resizer ARIA;
+  // persist 时写 localStorage (存储异常忽略, 宽度仍生效).
+  function setTreeWidth(width, persist) {
+    treeWidth = clampTreeWidth(width);
+    document.body.style.setProperty('--cb-tree-width', treeWidth + 'px');
+    if (treeResizer) {
+      treeResizer.setAttribute('aria-valuemax', String(treeWidthMax()));
+      treeResizer.setAttribute('aria-valuenow', String(treeWidth));
+    }
+    if (persist) {
+      try {
+        localStorage.setItem(TREE_WIDTH_KEY, String(treeWidth));
+      } catch (err) {
+        /* 持久化失败忽略 */
+      }
+    }
+  }
   function buildTreeShell() {
     const gen = treeGen;
     treeNav = document.createElement('nav');
@@ -1027,6 +1058,72 @@
     treeRootUl.className = 'cb-tree-root';
     treeNav.append(treeRootUl);
     document.body.prepend(treeNav);
+    // 列 2 树宽调整器 (宽屏常驻; 窄屏抽屉内 display:none, 无行为): ARIA
+    // separator + 指针拖拽 (捕获) + 键盘 ±16/Home/End 步进. 属性值随
+    // treeWidth 同步 (setTreeWidth 已先于外壳就位执行/或在外壳内保持).
+    treeResizer = document.createElement('div');
+    treeResizer.className = 'cb-tree-resizer';
+    treeResizer.tabIndex = 0;
+    treeResizer.setAttribute('role', 'separator');
+    treeResizer.setAttribute('aria-orientation', 'vertical');
+    treeResizer.setAttribute('aria-label', '调整目录树宽度');
+    treeResizer.setAttribute('aria-valuemin', String(TREE_MIN_WIDTH));
+    treeResizer.setAttribute('aria-valuemax', String(treeWidthMax()));
+    treeResizer.setAttribute('aria-valuenow', String(treeWidth));
+    treeResizer.addEventListener('pointerdown', function (event) {
+      // 未来的折叠按钮 (.cb-tree-collapse 子控件) 不触发拖拽: 先于捕获返回.
+      if (event.target.closest('.cb-tree-collapse')) return;
+      const startX = event.clientX;
+      const startWidth = treeWidth;
+      try {
+        treeResizer.setPointerCapture(event.pointerId);
+      } catch (err) {
+        /* 指针捕获失败: 仍按未捕获拖拽处理, 保持窗口内可调整 */
+      }
+      document.body.classList.add('cb-tree-resizing');
+      if (event.cancelable) event.preventDefault();
+      const onMove = function (moveEvent) {
+        setTreeWidth(startWidth + moveEvent.clientX - startX, false);
+        if (moveEvent.cancelable) moveEvent.preventDefault();
+      };
+      const onEnd = function () {
+        treeResizer.removeEventListener('pointermove', onMove);
+        treeResizer.removeEventListener('pointerup', onEnd);
+        treeResizer.removeEventListener('pointercancel', onEnd);
+        try {
+          treeResizer.releasePointerCapture(event.pointerId);
+        } catch (err) {
+          /* 捕获已隐式释放: 忽略 */
+        }
+        document.body.classList.remove('cb-tree-resizing');
+        setTreeWidth(treeWidth, true); // finish (up/cancel): 持久化最终宽度
+      };
+      treeResizer.addEventListener('pointermove', onMove);
+      treeResizer.addEventListener('pointerup', onEnd);
+      treeResizer.addEventListener('pointercancel', onEnd);
+    });
+    treeResizer.addEventListener('keydown', function (event) {
+      let next = null;
+      switch (event.key) {
+        case 'ArrowLeft':
+          next = treeWidth - 16;
+          break;
+        case 'ArrowRight':
+          next = treeWidth + 16;
+          break;
+        case 'Home':
+          next = TREE_MIN_WIDTH;
+          break;
+        case 'End':
+          next = treeWidthMax();
+          break;
+        default:
+          return;
+      }
+      event.preventDefault();
+      setTreeWidth(next, true);
+    });
+    document.body.append(treeResizer);
     // 窄屏抽屉配套: 遮罩 + 唤起按钮 (宽屏 display:none, 无行为).
     // 遮罩点击收起; 按钮点击唤起 — 都走独立监听, 不干扰目录模式全局 handler.
     treeScrim = document.createElement('div');
@@ -1548,6 +1645,15 @@
     }
     closeTreeDrawer(); // 新壳抽屉默认收起 (宽屏 no-op)
     document.body.classList.add('cb-tree-mode');
+    // 树宽: 恢复持久化宽度 (解析失败/0 → 默认 238), 立即应用 CSS 变量;
+    // 此时 resizer 未建, setTreeWidth 只写变量 — 建壳时按 treeWidth 初始化 ARIA.
+    let savedTreeWidth = 0;
+    try {
+      savedTreeWidth = Number(localStorage.getItem(TREE_WIDTH_KEY));
+    } catch (err) {
+      /* 持久化读取失败: 用默认值 */
+    }
+    setTreeWidth(savedTreeWidth || TREE_DEFAULT_WIDTH, false);
     // 目录模式预览面板在树模式不存在: 关闭并作废在途预览 (媒体/迟到响应不得残留)
     closePanel();
     // Q17 能力边界: 树模式不仅门禁事件路径, 更清空 JS 内存中的 token 并移除
@@ -1639,6 +1745,14 @@
     }
     closeTreeDrawer();
     uninstallDrawerMql();
+    // 树宽调整器与 CSS 变量随壳销毁: 残留变量会污染再进入时的默认列 (变量
+    // 只在树模式被 JS 重新写入, 但避免 dir 宿主残留样式差异).
+    if (treeResizer) {
+      treeResizer.remove();
+      treeResizer = null;
+    }
+    document.body.style.removeProperty('--cb-tree-width');
+    document.body.classList.remove('cb-tree-resizing');
     if (treeScrim) treeScrim.remove();
     treeScrim = null;
     if (treeOpenBtn) treeOpenBtn.remove();

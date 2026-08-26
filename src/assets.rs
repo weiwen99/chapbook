@@ -538,4 +538,22 @@ mod tests {
             "commitPane: 布局就位后才装 TOC spy"
         );
     }
+
+    /// 任务 3: 树宽调整 seam. 常量/状态与行为函数名锁定: 拖拽指针捕获、键盘
+    /// ±16 步进、ARIA separator 契约, 以及 pointerdown 对未来 .cb-tree-collapse
+    /// 子控件的忽略守卫全部就位 (contains 级契约, 行为矩阵见 Chromium 验收).
+    #[test]
+    fn browser_js_tree_resize_seams_are_locked() {
+        let js = BROWSER_JS;
+        for needle in [
+            "TREE_WIDTH_KEY = 'cb-tree-width'",
+            "function clampTreeWidth(",
+            "function setTreeWidth(",
+            "role', 'separator'",
+            "setPointerCapture",
+            "aria-valuenow",
+        ] {
+            assert!(js.contains(needle), "missing tree-resize seam: {needle}");
+        }
+    }
 }

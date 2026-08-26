@@ -210,25 +210,53 @@ html:has(> body.cb-doc-page) {
   color: var(--cb-accent);
 }
 
-/* 树模式布局: 左树右内容, 各自独立滚动 */
+/* 树模式布局: 左树 + 8px 调整器 + 右内容, 各自独立滚动. 列 1 宽由 JS 变量
+ * --cb-tree-width 驱动 (默认 238px); 8px 调整器列即列间全部间隙 — 无额外 margin. */
 body.cb-tree-mode {
   display: grid;
-  grid-template-columns: 17rem minmax(0, 1fr);
+  grid-template-columns: var(--cb-tree-width, 238px) 8px minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
 }
-body.cb-tree-mode > *:not(.cb-tree):not(.cb-mode-toggle) {
-  grid-column: 2;
+body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer):not(.cb-mode-toggle) {
+  grid-column: 3;
   min-width: 0;
 }
+/* 树列: 滚动条隐藏 (wheel/PageDown 等滚动作不受影响), 可见宽度全给内容 */
 body.cb-tree-mode .cb-tree {
   grid-column: 1;
   grid-row: 1 / -1;
   overflow-y: auto;
+  scrollbar-width: none; /* Firefox */
   border-right: 1px solid var(--cb-border);
   background: var(--cb-soft-bg);
   font-size: 0.85em;
   padding: 0.4rem 0.25rem;
+}
+body.cb-tree-mode .cb-tree::-webkit-scrollbar {
+  display: none; /* Chromium/Safari */
+}
+/* 树宽调整器: 整列 8px (列间唯一间隙); ::before 是 2px 视觉把手 (left 3px) */
+.cb-tree-resizer {
+  grid-column: 2;
+  grid-row: 1 / -1;
+  position: relative;
+  cursor: col-resize;
+  touch-action: none;
+}
+.cb-tree-resizer::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  background: var(--cb-border);
+}
+/* 拖拽期间: 全局 col-resize 光标 + 禁文本选择 (指针已捕获, 双保险) */
+body.cb-tree-resizing {
+  cursor: col-resize;
+  user-select: none;
 }
 /* 树模式下目录模式的顶栏/面包屑/预览面板隐藏 (树自身提供搜索与定位) */
 body.cb-tree-mode .cb-topbar,
@@ -321,8 +349,12 @@ body.cb-tree-mode [data-cb-action="native"] {
   body.cb-tree-mode {
     grid-template-columns: minmax(0, 1fr);
   }
-  body.cb-tree-mode > *:not(.cb-tree):not(.cb-mode-toggle) {
+  body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer):not(.cb-mode-toggle) {
     grid-column: 1;
+  }
+  /* 窄屏抽屉: resizer 隐藏, --cb-tree-width 不参与 (树宽由抽屉宽度决定) */
+  body.cb-tree-mode .cb-tree-resizer {
+    display: none;
   }
   /* 树: off-canvas, 默认移出左缘; 打开时滑入 */
   body.cb-tree-mode .cb-tree {
@@ -432,10 +464,8 @@ body.cb-tree-mode.cb-doc-page {
 }
 
 /* 宿主无关的树壳度量 (设计门 P1): dir 宿主 root 80% 与 doc 宿主 root 16px
- * 不同 — 树壳几何与字号用固定 px, 两宿主一致 */
-body.cb-tree-mode {
-  grid-template-columns: 218px minmax(0, 1fr);
-}
+ * 不同 — 树宽由 JS --cb-tree-width 变量驱动 (两宿主同源, 默认 238px),
+ * 字号用固定 px, 两宿主一致 */
 body.cb-tree-mode .cb-tree {
   font-size: 12.8px;
 }
