@@ -851,9 +851,25 @@ mod tests {
             !css.contains("float: right"),
             "TOC must not float over document text: {css}"
         );
+        // 旧 fixed rail (完整页) 的组合/拆分选择器不允许回归: 早期版本同时使用
+        // `.cb-doc-page:has(#TOC)` (纯组合器) 与 `.cb-doc-page #TOC` (后代), 以及
+        // `#table-of-contents` 变体, 且旧期望文本带 `position: fixed` 后缀 — 这里按
+        // 选择器字符串本身敏感地锁死 (哪怕只少一个空格/换行也会命中).
         assert!(
-            !css.contains(".cb-doc-page #TOC {\n    position: fixed"),
-            "old fixed rail must be gone: {css}"
+            !css.contains(".cb-doc-page:has(#TOC)"),
+            "legacy full-page fixed rail selector `.cb-doc-page:has(#TOC)` must stay gone: {css}"
+        );
+        assert!(
+            !css.contains(".cb-doc-page:has(#table-of-contents)"),
+            "legacy full-page fixed rail selector `.cb-doc-page:has(#table-of-contents)` must stay gone: {css}"
+        );
+        assert!(
+            !css.contains(".cb-doc-page #TOC"),
+            "legacy full-page fixed rail selector `.cb-doc-page #TOC` must stay gone: {css}"
+        );
+        assert!(
+            !css.contains(".cb-doc-page #table-of-contents"),
+            "legacy full-page fixed rail selector `.cb-doc-page #table-of-contents` must stay gone: {css}"
         );
         assert!(!css.contains("body:has(#TOC)"), "css: {css}");
         assert!(!css.contains("\nhtml {"), "css: {css}");
