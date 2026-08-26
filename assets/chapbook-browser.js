@@ -664,6 +664,7 @@
   const TREE_DEFAULT_WIDTH = 238;
   const TREE_MIN_WIDTH = 160;
   const TREE_MAX_WIDTH = 480;
+  const TREE_DRAWER_MQL = '(width < 64rem)'; // 窄屏抽屉断点 (与 CSS 媒体查询同源)
 
   let treeMode = false;
   let treeNav = null; // nav.cb-tree 外壳
@@ -680,6 +681,9 @@
   let drawerMql = null; // 窄屏 media query (跨回宽屏时清理打开态)
   let drawerMqlHandler = null;
   // 树宽 (宽屏列 1): resizer 常驻调整; 窄屏抽屉内 resizer 隐藏, 宽度值不生效.
+  // treePreferredWidth 是持久化偏好: 仅硬边界 [160,480] 截断, 绝不被窄屏 50vw
+  // 上限改写; treeWidth 是当前生效宽 (宽屏 = 偏好按视口约束, 窄屏抽屉忽略).
+  let treePreferredWidth = TREE_DEFAULT_WIDTH;
   let treeWidth = TREE_DEFAULT_WIDTH;
   let treeResizer = null; // 列 2 调整器元素 (随树壳创建/销毁)
   function loadJsonArray(key, fallback) {
@@ -1027,11 +1031,26 @@
   function treeWidthMax() {
     return Math.min(TREE_MAX_WIDTH, Math.floor(window.innerWidth * 0.5));
   }
+  // 持久化偏好只受硬边界约束 [160,480], 绝不受窄屏 50vw 上限影响.
+  function clampTreePreferred(width) {
+    return Math.max(TREE_MIN_WIDTH, Math.min(TREE_MAX_WIDTH, Math.round(width)));
+  }
+  // 生效宽: 偏好再按当前视口约束 (宽屏恒等于偏好; 窄屏抽屉忽略该值).
   function clampTreeWidth(width) {
     return Math.max(TREE_MIN_WIDTH, Math.min(treeWidthMax(), Math.round(width)));
   }
+  // 恢复持久化偏好: 仅正数合法 (0/NaN/负数 → 默认 238), 再按硬边界截断.
+  function loadTreePreferredWidth() {
+    let saved = 0;
+    try {
+      saved = Number(localStorage.getItem(TREE_WIDTH_KEY));
+    } catch (err) {
+      /* 持久化读取失败: 用默认值 */
+    }
+    return saved > 0 ? clampTreePreferred(saved) : TREE_DEFAULT_WIDTH;
+  }
   // 应用树宽到 CSS 变量 (body.cb-tree-mode 列 1) 并同步 resizer ARIA;
-  // persist 时写 localStorage (存储异常忽略, 宽度仍生效).
+  // persist 时按硬边界截断更新持久化偏好 (存储异常忽略, 宽度仍生效).
   function setTreeWidth(width, persist) {
     treeWidth = clampTreeWidth(width);
     document.body.style.setProperty('--cb-tree-width', treeWidth + 'px');
@@ -1040,8 +1059,9 @@
       treeResizer.setAttribute('aria-valuenow', String(treeWidth));
     }
     if (persist) {
+      treePreferredWidth = clampTreePreferred(width);
       try {
-        localStorage.setItem(TREE_WIDTH_KEY, String(treeWidth));
+        localStorage.setItem(TREE_WIDTH_KEY, String(treePreferredWidth));
       } catch (err) {
         /* 持久化失败忽略 */
       }
@@ -1075,6 +1095,7 @@
       if (event.target.closest('.cb-tree-collapse')) return;
       const startX = event.clientX;
       const startWidth = treeWidth;
+      let dragWidth = startWidth; // 未截断的目标宽: 结束时按硬边界持久化
       try {
         treeResizer.setPointerCapture(event.pointerId);
       } catch (err) {
@@ -1083,7 +1104,8 @@
       document.body.classList.add('cb-tree-resizing');
       if (event.cancelable) event.preventDefault();
       const onMove = function (moveEvent) {
-        setTreeWidth(startWidth + moveEvent.clientX - startX, false);
+        dragWidth = startWidth + moveEvent.clientX - startX;
+        setTreeWidth(dragWidth, false);
         if (moveEvent.cancelable) moveEvent.preventDefault();
       };
       const onEnd = function () {
@@ -1093,10 +1115,11 @@
         try {
           treeResizer.releasePointerCapture(event.pointerId);
         } catch (err) {
-          /* 捕获已隐式释放: 忽略 */
+          /* 指针捕获已隐式释放: 忽略 */
         }
         document.body.classList.remove('cb-tree-resizing');
-        setTreeWidth(treeWidth, true); // finish (up/cancel): 持久化最终宽度
+        // finish (up/cancel): 持久化偏好按硬边界截断, 绝不写入 50vw 截断值
+        setTreeWidth(dragWidth, true);
       };
       treeResizer.addEventListener('pointermove', onMove);
       treeResizer.addEventListener('pointerup', onEnd);
@@ -1181,11 +1204,15 @@
     }
   }
 
-  // 窄屏 media query 监听: 跨回宽屏时清理打开态, 防止再次收窄时抽屉残留打开
+  // 窄屏 media query 监听: 跨回宽屏时清理打开态并重放持久化偏好 (窄屏阶段
+  // 从未改写偏好, 恢复 CSS 变量与 ARIA); 收窄本身不得触碰偏好/生效宽.
   function installDrawerMql() {
-    drawerMql = window.matchMedia('(width < 64rem)');
+    drawerMql = window.matchMedia(TREE_DRAWER_MQL);
     drawerMqlHandler = function (e) {
-      if (!e.matches) closeTreeDrawer();
+      if (!e.matches) {
+        closeTreeDrawer();
+        setTreeWidth(treePreferredWidth, false);
+      }
     };
     if (drawerMql.addEventListener) {
       drawerMql.addEventListener('change', drawerMqlHandler);
@@ -1645,15 +1672,14 @@
     }
     closeTreeDrawer(); // 新壳抽屉默认收起 (宽屏 no-op)
     document.body.classList.add('cb-tree-mode');
-    // 树宽: 恢复持久化宽度 (解析失败/0 → 默认 238), 立即应用 CSS 变量;
-    // 此时 resizer 未建, setTreeWidth 只写变量 — 建壳时按 treeWidth 初始化 ARIA.
-    let savedTreeWidth = 0;
-    try {
-      savedTreeWidth = Number(localStorage.getItem(TREE_WIDTH_KEY));
-    } catch (err) {
-      /* 持久化读取失败: 用默认值 */
+    // 树宽: 恢复持久化偏好 (仅硬边界 [160,480] 截断, 解析失败/0 → 默认 238).
+    // 宽屏立即按偏好应用 (此时 resizer 未建, setTreeWidth 只写变量 — 建壳时按
+    // treeWidth 初始化 ARIA); 窄屏抽屉忽略宽度, 偏好原样保留, 跨回宽屏时由
+    // drawer media handler 重放.
+    treePreferredWidth = loadTreePreferredWidth();
+    if (!window.matchMedia(TREE_DRAWER_MQL).matches) {
+      setTreeWidth(treePreferredWidth, false);
     }
-    setTreeWidth(savedTreeWidth || TREE_DEFAULT_WIDTH, false);
     // 目录模式预览面板在树模式不存在: 关闭并作废在途预览 (媒体/迟到响应不得残留)
     closePanel();
     // Q17 能力边界: 树模式不仅门禁事件路径, 更清空 JS 内存中的 token 并移除

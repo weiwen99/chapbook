@@ -556,4 +556,63 @@ mod tests {
             assert!(js.contains(needle), "missing tree-resize seam: {needle}");
         }
     }
+
+    /// 任务 3 跟进: 持久化偏好与生效宽分离. 锁定 treePreferredWidth 只受硬边界
+    /// [160,480] 约束 (clampTreePreferred), 生效宽 treeWidth 再叠加 50vw 视口
+    /// 上限; persist 只写硬边界截断的偏好 (绝不写入窄屏截断值); 窄屏进入不改写
+    /// 偏好, 跨回宽屏时 drawer media handler 重放偏好恢复 CSS 变量与 ARIA.
+    #[test]
+    fn browser_js_tree_preferred_width_survives_drawer_breakpoint() {
+        let js = BROWSER_JS;
+        for needle in [
+            "function clampTreePreferred(",
+            "function loadTreePreferredWidth(",
+            "let treePreferredWidth = TREE_DEFAULT_WIDTH",
+            "const TREE_DRAWER_MQL = '(width < 64rem)'",
+        ] {
+            assert!(
+                js.contains(needle),
+                "missing preferred-width seam: {needle}"
+            );
+        }
+        // persist 分支: 偏好按硬边界截断后写入 localStorage, 而非 50vw 截断的生效宽
+        assert!(
+            js.contains("treePreferredWidth = clampTreePreferred(width)"),
+            "persist 必须以硬边界截断更新偏好"
+        );
+        assert!(
+            js.contains("localStorage.setItem(TREE_WIDTH_KEY, String(treePreferredWidth))"),
+            "localStorage 只存硬边界截断的偏好"
+        );
+        // 无效保存值 → 默认 238: 仅正数合法, 再按硬边界截断
+        assert!(
+            js.contains("saved > 0 ? clampTreePreferred(saved) : TREE_DEFAULT_WIDTH"),
+            "无效保存值 (0/NaN/负数) 必须回退默认 238"
+        );
+        // 跨回宽屏重放: setTreeWidth(treePreferredWidth, false) 必须位于
+        // installDrawerMql 与 uninstallDrawerMql 之间的 drawer change handler
+        let install_at = js
+            .find("function installDrawerMql()")
+            .expect("installDrawerMql 存在");
+        let uninstall_at = js
+            .find("function uninstallDrawerMql()")
+            .expect("uninstallDrawerMql 存在");
+        let replay_at = js
+            .find("setTreeWidth(treePreferredWidth, false)")
+            .expect("宽屏重放调用存在");
+        assert!(
+            install_at < replay_at && replay_at < uninstall_at,
+            "偏好重放必须位于 drawer mql handler 内"
+        );
+        // 窄屏进入不改写偏好: 进入时仅在非窄屏 (mql 不匹配) 下应用偏好
+        assert!(
+            js.contains("matchMedia(TREE_DRAWER_MQL).matches"),
+            "窄屏进入不得应用/改写宽度偏好"
+        );
+        // 拖拽/键盘持久化走同一 persist 通道 (硬边界), 而不是把生效宽原样存回
+        assert!(
+            js.contains("setTreeWidth(dragWidth, true)"),
+            "拖拽结束时持久化未截断的目标宽"
+        );
+    }
 }
