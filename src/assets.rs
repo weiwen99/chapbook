@@ -951,4 +951,184 @@ mod tests {
             "resize 处理器只卸载一次"
         );
     }
+    /// 任务 4: 手动折叠 (宽屏左树收起) seam. 行为导向源不变量:
+    /// - 键/状态/函数 seam 存在: TREE_COLLAPSED_KEY, treeCollapsePreferred,
+    ///   applyTreeCollapsed, installTreeCollapseMql, cb-tree-collapsed, cb-tree-restore;
+    /// - applyTreeCollapsed: 生效态 = 偏好 && 非窄屏 (窄屏抽屉恒展开), 折叠类
+    ///   toggle + 树 inert/aria-hidden + resizer hidden + 恢复按钮 hidden 同步;
+    ///   折叠且焦点在树内时移交恢复按钮 (inert 前必须移出);
+    /// - 持久化只写两态 '1'/'0'; 恢复按钮点击只写偏好 false;
+    /// - mql install/uninstall 同一 handler 引用 add/remove (含 legacy 回退),
+    ///   uninstall 清空引用;
+    /// - 折叠按钮 (resizer 子控件): 点击 stopPropagation → 偏好 true, 绝不触碰
+    ///   宽度/宽度存储; resizer keydown 同样跳过该子控件;
+    /// - enter: 读偏好 (=== '1') → install → apply; exit: uninstall + 清类 +
+    ///   移除按钮, 绝不写 localStorage (偏好保留).
+    #[test]
+    fn browser_js_tree_collapse_seams_are_locked() {
+        let js = BROWSER_JS;
+        for needle in [
+            "const TREE_COLLAPSED_KEY = 'cb-tree-collapsed'",
+            "let treeCollapsePreferred = false",
+            "function applyTreeCollapsed(",
+            "function installTreeCollapseMql(",
+            "cb-tree-collapsed",
+            "cb-tree-restore",
+        ] {
+            assert!(js.contains(needle), "missing tree-collapse seam: {needle}");
+        }
+        // applyTreeCollapsed 切片 (止于 setTreeCollapsePreference): 生效态计算、
+        // 折叠类/inert/aria-hidden/resizer/恢复按钮同步、焦点移交.
+        let apply_start = js
+            .find("function applyTreeCollapsed(")
+            .expect("applyTreeCollapsed 存在");
+        let apply_end = js
+            .find("function setTreeCollapsePreference(")
+            .expect("setTreeCollapsePreference 位于 applyTreeCollapsed 之后");
+        let apply = &js[apply_start..apply_end];
+        for needle in [
+            "treeCollapsed = treeCollapsePreferred && !narrow",
+            "classList.toggle('cb-tree-collapsed', treeCollapsed)",
+            "treeNav.inert = treeCollapsed",
+            "setAttribute('aria-hidden', treeCollapsed ? 'true' : 'false')",
+            "treeResizer.hidden = treeCollapsed",
+            "treeRestoreBtn.hidden = !treeCollapsed",
+            "treeRestoreBtn.focus({ preventScroll: true })",
+        ] {
+            assert!(
+                apply.contains(needle),
+                "applyTreeCollapsed 必须包含 {needle}"
+            );
+        }
+        // setTreeCollapsePreference: persist 只写两态 '1'/'0', 随后立即重算生效态.
+        let pref_start = apply_end;
+        let pref_end = js
+            .find("function installTreeCollapseMql(")
+            .expect("installTreeCollapseMql 位于 setTreeCollapsePreference 之后");
+        let pref = &js[pref_start..pref_end];
+        assert!(
+            pref.contains("localStorage.setItem(TREE_COLLAPSED_KEY, preferred ? '1' : '0')"),
+            "持久化只写 '1'/'0' 两态"
+        );
+        assert!(
+            pref.contains("applyTreeCollapsed();"),
+            "设置偏好后必须立即重算生效态"
+        );
+        // mql install/uninstall: 同一 handler 引用 add/remove, 含 legacy 回退,
+        // uninstall 清空引用 (幂等, 不残留).
+        let inst_start = pref_end;
+        let inst_end = js
+            .find("function uninstallTreeCollapseMql()")
+            .expect("uninstallTreeCollapseMql 存在");
+        let inst = &js[inst_start..inst_end];
+        for needle in [
+            "treeCollapseMql = window.matchMedia(TREE_DRAWER_MQL)",
+            "treeCollapseMqlHandler = applyTreeCollapsed",
+            "addEventListener('change', treeCollapseMqlHandler)",
+            "addListener(treeCollapseMqlHandler)",
+        ] {
+            assert!(
+                inst.contains(needle),
+                "installTreeCollapseMql 必须包含 {needle}"
+            );
+        }
+        let uninst = &js[inst_end..];
+        assert!(
+            uninst.contains("removeEventListener('change', treeCollapseMqlHandler)"),
+            "uninstall 必须移除同一 change 监听"
+        );
+        assert!(
+            uninst.contains("removeListener(treeCollapseMqlHandler)"),
+            "uninstall 必须移除 legacy 监听"
+        );
+        assert!(
+            uninst.contains("treeCollapseMql = null;"),
+            "uninstall 必须清空 mql 引用"
+        );
+        assert!(
+            uninst.contains("treeCollapseMqlHandler = null;"),
+            "uninstall 必须清空 handler 引用"
+        );
+        // 折叠按钮 (resizer 子控件) click: 先阻断冒泡再写偏好 true, 绝不触碰
+        // 宽度或其存储键; resizer keydown 对同一子控件同样放行 (不步进).
+        let click_start = js
+            .find("treeCollapseBtn.addEventListener('click',")
+            .expect("折叠按钮 click 处理器存在");
+        let click_end = js
+            .find("treeResizer.append(treeCollapseBtn)")
+            .expect("折叠按钮 append 存在");
+        let click = &js[click_start..click_end];
+        assert!(
+            click.contains("event.stopPropagation();"),
+            "折叠点击必须先阻断冒泡"
+        );
+        assert!(
+            click.contains("setTreeCollapsePreference(true, true)"),
+            "折叠点击写入偏好 true 并持久化"
+        );
+        assert!(!click.contains("setTreeWidth"), "折叠点击绝不触碰宽度");
+        assert!(!click.contains("TREE_WIDTH_KEY"), "折叠点击绝不写宽度存储");
+        let kd_start = js
+            .find("treeResizer.addEventListener('keydown',")
+            .expect("resizer keydown 处理器存在");
+        let kd_end = js
+            .find("document.body.append(treeResizer)")
+            .expect("resizer append 存在");
+        let kd = &js[kd_start..kd_end];
+        assert!(
+            kd.contains("event.target.closest('.cb-tree-collapse')"),
+            "resizer keydown 必须跳过折叠按钮子控件"
+        );
+        // 恢复按钮: 点击写偏好 false.
+        let restore_click = js
+            .find("treeRestoreBtn.addEventListener('click',")
+            .expect("恢复按钮 click 处理器存在");
+        assert!(
+            js[restore_click..].contains("setTreeCollapsePreference(false, true)"),
+            "恢复点击写入偏好 false 并持久化"
+        );
+        // enter: 读偏好 (=== '1') → install → apply; exit: uninstall + 清类 +
+        // 移除恢复按钮, 绝不触碰 localStorage (偏好原样保留).
+        let enter_start = js
+            .find("function enterTreeMode()")
+            .expect("enterTreeMode 存在");
+        let enter_end = js
+            .find("function exitTreeMode()")
+            .expect("exitTreeMode 位于 enterTreeMode 之后");
+        let enter = &js[enter_start..enter_end];
+        let load_at = enter
+            .find("localStorage.getItem(TREE_COLLAPSED_KEY) === '1'")
+            .expect("enter 恢复折叠偏好");
+        let inst_call = enter
+            .find("installTreeCollapseMql();")
+            .expect("enter 安装折叠 mql");
+        let apply_call = enter
+            .find("applyTreeCollapsed();")
+            .expect("enter 应用折叠态");
+        assert!(
+            load_at < inst_call && inst_call < apply_call,
+            "enter: 先读偏好, 再装 mql, 最后应用生效态"
+        );
+        let exit_start = enter_end;
+        let exit_end = js
+            .find("function applyTreeMode()")
+            .expect("applyTreeMode 位于 exitTreeMode 之后");
+        let exit = &js[exit_start..exit_end];
+        assert!(
+            exit.contains("uninstallTreeCollapseMql();"),
+            "exit 卸载折叠 mql"
+        );
+        assert!(
+            exit.contains("document.body.classList.remove('cb-tree-collapsed')"),
+            "exit 清除生效折叠类"
+        );
+        assert!(
+            exit.contains("treeRestoreBtn.remove()"),
+            "exit 移除恢复按钮"
+        );
+        assert!(
+            !exit.contains("localStorage"),
+            "exit 绝不写折叠键 (偏好保留)"
+        );
+    }
 }

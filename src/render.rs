@@ -1055,7 +1055,8 @@ mod tests {
         assert!(css.contains(".cb-doc #TOC a:hover"), "css: {css}");
         assert!(css.contains(".cb-doc .katex-display"), "css: {css}");
         // filter/perspective 全局禁止 (树壳也不使用). transform 仅允许树模式外壳
-        // 区内窄屏抽屉的 .cb-tree 位移规则; 文档内容区恒禁止.
+        // 区内的平移位移: 窄屏抽屉 .cb-tree 位移 + 折叠/恢复按钮居中
+        // (translateX/translateY/translate, 无 rotate/scale/matrix); 文档内容区恒禁止.
         assert!(!css.contains("filter"), "css: {css}");
         assert!(!css.contains("perspective"), "css: {css}");
         let (doc_part, shell_part) = css
@@ -1066,7 +1067,7 @@ mod tests {
             let trimmed = line.trim_start();
             if trimmed.contains("transform") && !trimmed.starts_with('*') {
                 assert!(
-                    trimmed.contains("translateX") || trimmed.contains("transition: transform"),
+                    trimmed.contains("translate") || trimmed.contains("transition: transform"),
                     "unexpected transform: {line}"
                 );
             }

@@ -701,6 +701,16 @@
   // 在途拖拽手势的 pointerId (单 owner): 无手势时为 null. move/end/收尾只认
   // 该 id; 捕获失败或退出树模式时干净复位.
   let treeResizePointerId = null;
+  // 手动折叠 (宽屏左树收起): 偏好与生效态分离. treeCollapsePreferred 是持久化
+  // 偏好 (仅 '1' 折叠); treeCollapsed 是当前生效态 — 窄屏抽屉恒展开, 宽屏 =
+  // 偏好 (跨断点由 mql handler 重放). 折叠期间树/调整器隐藏, 左缘恢复按钮
+  // (treeRestoreBtn) 悬浮常驻.
+  const TREE_COLLAPSED_KEY = 'cb-tree-collapsed';
+  let treeCollapsePreferred = false;
+  let treeCollapsed = false;
+  let treeRestoreBtn = null; // 左缘恢复按钮 (仅折叠生效时可见)
+  let treeCollapseMql = null; // 断点感知: 窄屏强制展开, 宽屏重放偏好
+  let treeCollapseMqlHandler = null;
   function loadJsonArray(key, fallback) {
     try {
       const value = JSON.parse(localStorage.getItem(key) || 'null');
@@ -1154,6 +1164,8 @@
       treeResizer.addEventListener('lostpointercapture', onEnd);
     });
     treeResizer.addEventListener('keydown', function (event) {
+      // 折叠按钮 (子控件) 的按键 (Enter/Space 触发 click) 不得被当成宽度步进.
+      if (event.target.closest('.cb-tree-collapse')) return;
       let next = null;
       switch (event.key) {
         case 'ArrowLeft':
@@ -1175,6 +1187,19 @@
       event.stopPropagation(); // 阻断冒泡: 分隔器按键不得落入全局树键
       setTreeWidth(next, true);
     });
+    // 折叠按钮: resizer 子控件. pointerdown 守卫 (closest('.cb-tree-collapse'))
+    // 已排除拖拽, keydown 守卫已排除步进. 点击只改折叠偏好, 绝不触碰宽度.
+    const treeCollapseBtn = document.createElement('button');
+    treeCollapseBtn.type = 'button';
+    treeCollapseBtn.className = 'cb-tree-collapse';
+    treeCollapseBtn.setAttribute('aria-label', '收起目录树');
+    treeCollapseBtn.title = '收起目录树';
+    treeCollapseBtn.textContent = '‹';
+    treeCollapseBtn.addEventListener('click', function (event) {
+      event.stopPropagation(); // 不落入 document 全局 click (native action 等)
+      setTreeCollapsePreference(true, true);
+    });
+    treeResizer.append(treeCollapseBtn);
     document.body.append(treeResizer);
     // 窄屏抽屉配套: 遮罩 + 唤起按钮 (宽屏 display:none, 无行为).
     // 遮罩点击收起; 按钮点击唤起 — 都走独立监听, 不干扰目录模式全局 handler.
@@ -1191,7 +1216,21 @@
     treeOpenBtn.textContent = '☰ 目录';
     treeOpenBtn.addEventListener('click', openTreeDrawer);
     document.body.append(treeOpenBtn);
+    // 左缘恢复按钮 (仅折叠生效时可见): 点击恢复偏好, 立即重放生效态.
+    treeRestoreBtn = document.createElement('button');
+    treeRestoreBtn.type = 'button';
+    treeRestoreBtn.className = 'cb-tree-restore';
+    treeRestoreBtn.setAttribute('aria-label', '展开目录树');
+    treeRestoreBtn.title = '展开目录树';
+    treeRestoreBtn.textContent = '›';
+    treeRestoreBtn.hidden = true; // applyTreeCollapsed 在壳就位后同步
+    treeRestoreBtn.addEventListener('click', function (event) {
+      event.stopPropagation(); // 不落入 document 全局 click
+      setTreeCollapsePreference(false, true);
+    });
+    document.body.append(treeRestoreBtn);
     installDrawerMql();
+    applyTreeCollapsed(); // 壳就位: 同步生效态到新元素 (inert/hidden/类)
     return fetchTreeEntries('').then(function (entries) {
       if (gen !== treeGen) return;
       const nodes = entries.map(buildTreeNode);
@@ -1276,6 +1315,70 @@
       window.removeEventListener('resize', treeViewportResizeHandler);
     }
     treeViewportResizeHandler = null;
+  }
+  /* ---------- 手动折叠 (宽屏左树收起) ---------- */
+
+  // 生效态 = 偏好 && 非窄屏 (窄屏抽屉恒展开, 偏好原样保留). 折叠时树列与
+  // 调整器隐藏 (inert + aria-hidden 双保险), 左缘恢复按钮常驻; 焦点若在树内
+  // 则先移交恢复按钮 (inert 元素不可聚焦, 必须提前移出).
+  function applyTreeCollapsed() {
+    const narrow = treeCollapseMql
+      ? treeCollapseMql.matches
+      : window.matchMedia(TREE_DRAWER_MQL).matches;
+    treeCollapsed = treeCollapsePreferred && !narrow;
+    document.body.classList.toggle('cb-tree-collapsed', treeCollapsed);
+    if (treeNav) {
+      treeNav.inert = treeCollapsed;
+      treeNav.setAttribute('aria-hidden', treeCollapsed ? 'true' : 'false');
+    }
+    if (treeResizer) treeResizer.hidden = treeCollapsed;
+    if (treeRestoreBtn) treeRestoreBtn.hidden = !treeCollapsed;
+    if (
+      treeCollapsed &&
+      treeRestoreBtn &&
+      treeNav &&
+      treeNav.contains(document.activeElement)
+    ) {
+      treeRestoreBtn.focus({ preventScroll: true });
+    }
+  }
+
+  // 折叠偏好: persist 只写两态 '1'/'0' (仅按钮交互写入; 窄屏抽屉交互不触碰
+  // 该键), 随后立即重算生效态.
+  function setTreeCollapsePreference(preferred, persist) {
+    treeCollapsePreferred = preferred;
+    if (persist) {
+      try {
+        localStorage.setItem(TREE_COLLAPSED_KEY, preferred ? '1' : '0');
+      } catch (err) {
+        /* 持久化失败忽略 */
+      }
+    }
+    applyTreeCollapsed();
+  }
+
+  // 断点感知: 收窄到抽屉时强制展开生效态 (偏好保留), 跨回宽屏时重放偏好.
+  // 与 drawer mql 同断点同源; add/remove 走同一 handler 引用.
+  function installTreeCollapseMql() {
+    treeCollapseMql = window.matchMedia(TREE_DRAWER_MQL);
+    treeCollapseMqlHandler = applyTreeCollapsed;
+    if (treeCollapseMql.addEventListener) {
+      treeCollapseMql.addEventListener('change', treeCollapseMqlHandler);
+    } else if (treeCollapseMql.addListener) {
+      treeCollapseMql.addListener(treeCollapseMqlHandler);
+    }
+  }
+
+  function uninstallTreeCollapseMql() {
+    if (treeCollapseMql && treeCollapseMqlHandler) {
+      if (treeCollapseMql.removeEventListener) {
+        treeCollapseMql.removeEventListener('change', treeCollapseMqlHandler);
+      } else if (treeCollapseMql.removeListener) {
+        treeCollapseMql.removeListener(treeCollapseMqlHandler);
+      }
+    }
+    treeCollapseMql = null;
+    treeCollapseMqlHandler = null;
   }
 
   /* ---------- SPA 内容区导航 (树模式) ---------- */
@@ -1725,6 +1828,16 @@
     if (!window.matchMedia(TREE_DRAWER_MQL).matches) {
       setTreeWidth(treePreferredWidth, false);
     }
+    // 折叠偏好: 仅 '1' 视为折叠 (缺省/损坏 → 展开). 先装 mql 再应用 — apply
+    // 以当前窄屏状态为准 (窄屏恒展开, 偏好保留到跨回宽屏重放).
+    treeCollapsePreferred = false;
+    try {
+      treeCollapsePreferred = localStorage.getItem(TREE_COLLAPSED_KEY) === '1';
+    } catch (err) {
+      /* 持久化读取失败: 默认展开 */
+    }
+    installTreeCollapseMql();
+    applyTreeCollapsed();
     // 宽屏视口 resize 重钳制: 宽度状态就绪后安装一次 (生效宽随 50vw 上限浮动)
     installTreeViewportResizeHandler();
     // 目录模式预览面板在树模式不存在: 关闭并作废在途预览 (媒体/迟到响应不得残留)
@@ -1819,6 +1932,8 @@
     closeTreeDrawer();
     uninstallDrawerMql();
     uninstallTreeViewportResizeHandler();
+    uninstallTreeCollapseMql();
+    document.body.classList.remove('cb-tree-collapsed');
     // 在途拖拽手势先安全复位: 移除 resizer 会隐式释放捕获并触发
     // lostpointercapture — owner 此刻已复位, 幂等收尾重入直接返回, 不重复清理.
     if (treeResizePointerId !== null) {
@@ -1837,6 +1952,8 @@
     treeScrim = null;
     if (treeOpenBtn) treeOpenBtn.remove();
     treeOpenBtn = null;
+    if (treeRestoreBtn) treeRestoreBtn.remove();
+    treeRestoreBtn = null;
     if (treeNav) treeNav.remove();
     treeNav = null;
     treeRootUl = null;
@@ -1887,6 +2004,9 @@
     // 分隔器按键由 resizer 自行处理并阻断冒泡; 未来分隔器子控件 (如折叠按钮)
     // 的按键同样不得落入全局树键 (defaultPrevented 兜底).
     if (event.defaultPrevented || event.target.closest('.cb-tree-resizer')) return;
+    // 恢复按钮 (body 直系子级, 不在 resizer 内): Enter/Space 只触发恢复, 不得
+    // 落入全局树键 (折叠按钮在 resizer 内, 已被上一条守卫覆盖).
+    if (event.target.closest('.cb-tree-restore')) return;
     // Escape 先于 editable 守卫 (镜像目录模式): 聚焦树搜索框时先失焦, 否则清除选中
     if (event.key === 'Escape') {
       const input = $('#cb-tree-search-q');
