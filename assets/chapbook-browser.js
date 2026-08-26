@@ -509,9 +509,10 @@
     // 不产生第二次动作 (第二次 click 直接返回; dblclick 分支同样阻断)
     const treeRow = event.target.closest('.cb-tree-row');
     if (treeRow) {
-      if (event.detail > 1) return;
+      if (event.detail > 1) return; // 双击连击: 单击已处理, 不产生第二次动作
       const li = treeRow.closest('li.cb-tree-node');
       if (!li) return;
+      focusTreeRootUl(); // 先落焦点: active-descendant 公告 + 键盘可立即接管
       selectTreeNode(li);
       if (isDirNode(li)) toggleTreeNode(li); else navigateTreeNode(li);
       closeTreeDrawer(); return; // 窄屏抽屉: 选择条目后收起 (宽屏 no-op)
@@ -819,11 +820,13 @@
     const twist = document.createElement('span');
     twist.className = 'cb-tree-twist';
     if (expandable) twist.textContent = '▸';
+    twist.setAttribute('aria-hidden', 'true'); // 装饰字形: 可访问名只来自文件名 bdi
     row.append(twist);
 
     const icon = document.createElement('span');
     icon.className = 'cb-tree-icon';
     icon.textContent = isDir ? '📁' : '📄';
+    icon.setAttribute('aria-hidden', 'true'); // 装饰字形: 可访问名只来自文件名 bdi
     row.append(icon);
 
     if (!isDir) {
@@ -832,6 +835,7 @@
       const dot = name.lastIndexOf('.');
       const ext = dot > 0 ? name.slice(dot + 1) : '';
       badge.textContent = ext ? ext.slice(0, 5).toUpperCase() : 'FILE';
+      badge.setAttribute('aria-hidden', 'true'); // 扩展名徽标是装饰: 不进入可访问名
       row.append(badge);
     }
 
@@ -933,9 +937,11 @@
     const twist = li.querySelector(':scope > .cb-tree-row .cb-tree-twist');
     if (twist) twist.textContent = '';
     if (ul) ul.remove(); // 子 role=group 一并移除: 叶子不得携带 group 语义
-    const idx = treeExpandedPaths.indexOf(path);
-    if (idx >= 0) {
-      treeExpandedPaths.splice(idx, 1);
+    const before = treeExpandedPaths.length;
+    treeExpandedPaths = treeExpandedPaths.filter(function (p) {
+      return p !== path;
+    });
+    if (treeExpandedPaths.length !== before) {
       saveJsonArray(TREE_EXPANDED_KEY, treeExpandedPaths);
     }
     treeDesiredExpanded.delete(path);
@@ -970,8 +976,11 @@
   }
 
   // 懒加载目录子项; 失败静默 (网络/服务端错误不留半展开态). 同一目录路径只
-  // 允许一个在途请求: 重复激活返回同一 Promise, 绝不二次 fetch; 在途期间的
-  // 最新意图 (treeDesiredExpanded) 决定响应落地时的终态, 绝不盲目展开.
+  // 允许一个在途请求: 重复激活复用同一 Promise, 绝不二次 fetch; 每个调用方
+  // 都在共享 Promise 上挂自己的续接 — 发起方所有权陈旧时 (如陈旧导航) 响应
+  // 只写缓存不落 DOM, 本调用方所有权当前则补齐安装, 终态跟随最新意图
+  // (treeDesiredExpanded), 绝不盲目展开; 响应落地后 finally 在 owner 块内
+  // 清除在途条目与意图 (DOM 即权威; 旧壳 finally 不得删新壳条目).
   // owner 传调用方所有权: { navGen } (reveal/sync 导航链) 或 { enterGen }
   // (进入链持久化展开) — 响应落地时导航/进入链已过期则只共享缓存结果, 不
   // 提交 DOM/展开/持久化; 无 owner (显式用户调用) 可采纳共享在途结果.
@@ -997,7 +1006,16 @@
       if (!treeDesiredExpanded.has(path)) {
         treeDesiredExpanded.set(path, true); // 在途: 复用同一请求, 刷新展开意图
       }
-      return inFlight;
+      // 每个调用方都挂自己的续接: 发起方所有权陈旧时 (如陈旧导航) 响应只写缓存
+      // 不落 DOM — 本调用方所有权当前则补齐安装, 终态跟随最新意图 (缓存结果
+      // 共享); 绝不 bare-return 发起方的 Promise.
+      return inFlight.then(function (entries) {
+        if (!treeLoadMayCommit(enterGen === undefined || enterGen === treeGen, navRequired, navCurrent)) {
+          return entries;
+        }
+        ensureTreeChildrenInstalled(li, path); // 空缓存 → 叶子化; 已安装 → 跳过
+        return entries;
+      });
     }
     if (!treeDesiredExpanded.has(path)) {
       treeDesiredExpanded.set(path, true); // reveal/persist 复用同一入口即表达展开
@@ -1018,11 +1036,12 @@
     );
     treePendingLoads.set(path, pending);
     pending.finally(function () {
-      // 条目只由 owner Promise 清理: 先比对在途条目身份 (恒为本 Promise),
-      // 再删在途条目 — 重复激活复用同一 pending, 绝不误删; 意图 (desired)
-      // 属壳级状态, 持久到退出树模式/叶子化才清除, finally 绝不删除.
+      // 清理只由 owner Promise 执行: 先比对在途条目身份 (恒为本 Promise) —
+      // 旧壳/旧链的 finally 不得删除新壳注册的条目与意图; 响应落地后 DOM 即
+      // 权威, 意图一并清除 (续接方已在 finally 前按最新意图安装/隐藏).
       if (treePendingLoads.get(path) === pending) {
         treePendingLoads.delete(path);
+        treeDesiredExpanded.delete(path);
       }
     });
     return pending;
@@ -1035,11 +1054,17 @@
     if (path === null) return;
     const expanded = !!ul && !ul.hidden;
     const pending = treePendingLoads.has(path);
-    const desired = pending && treeDesiredExpanded.has(path)
-      ? treeDesiredExpanded.get(path)
-      : expanded;
-    treeDesiredExpanded.set(path, treeExpansionIntent(pending, expanded, desired));
-    if (pending) return; // 在途: 只翻转意图, 绝不发起第二个请求
+    if (pending) {
+      // 在途: 只翻转意图 (treeExpansionIntent), 绝不发起第二个请求 — 响应
+      // 落地时终态跟随意图, 随后 finally 清除意图, DOM 成为权威.
+      const desired = treeDesiredExpanded.has(path)
+        ? treeDesiredExpanded.get(path)
+        : expanded;
+      treeDesiredExpanded.set(path, treeExpansionIntent(pending, expanded, desired));
+      return;
+    }
+    // 无在途: 意图无消费方, 绝不写入残留 (陈旧意图会挡住后续 reveal 的缓存
+    // 命中展开) — DOM 直接为权威.
     if (expanded) {
       setTreeNodeExpanded(li, false);
     } else {
@@ -1075,6 +1100,17 @@
     }
     treeSelectedEl = null;
     if (treeRootUl) treeRootUl.removeAttribute('aria-activedescendant');
+  }
+
+  // 树根聚焦 (preventScroll): 指针选中树行后焦点落树根 — active-descendant 由根
+  // 公告, 键盘导航立即接管; 老环境不支持 focus options 时退化为普通 focus.
+  function focusTreeRootUl() {
+    if (!treeRootUl) return;
+    try {
+      treeRootUl.focus({ preventScroll: true });
+    } catch (err) {
+      treeRootUl.focus();
+    }
   }
 
   function visibleTreeNodes() {
@@ -1395,12 +1431,26 @@
     document.body.append(treeRestoreBtn);
     installDrawerMql();
     applyTreeCollapsed(); // 壳就位: 同步生效态到新元素 (inert/hidden/类)
-    return fetchTreeEntries('').then(function (entries) {
-      if (gen !== treeGen) return;
-      const nodes = entries.map(buildTreeNode);
-      treeCache.set('', nodes);
-      treeRootUl.replaceChildren(...nodes);
-    });
+    return fetchTreeEntries('').then(
+      function (entries) {
+        if (gen !== treeGen) return;
+        const nodes = entries.map(buildTreeNode);
+        treeCache.set('', nodes);
+        treeRootUl.replaceChildren(...nodes);
+      },
+      function () {
+        // 根加载失败: 旧壳忽略; 当前壳清空根并显示纯文本错误 (role=alert),
+        // 链路 resolve — 无未处理拒绝; 重进/重试由新壳全新请求.
+        if (gen !== treeGen) return;
+        treeCache.delete('');
+        treeRootUl.replaceChildren();
+        const err = document.createElement('div');
+        err.className = 'cb-tree-error';
+        err.setAttribute('role', 'alert');
+        err.textContent = '无法加载目录树';
+        treeRootUl.append(err);
+      }
+    );
   }
 
   /* ---------- 窄屏抽屉 (<64rem): off-canvas transform + 遮罩; 宽屏恒 no-op ---------- */
@@ -2402,8 +2452,8 @@
         if (treeSelectedEl) {
           const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
           if (isDirNode(treeSelectedEl) && ul && !ul.hidden) {
-            const path = encodedPathOf(treeSelectedEl);
-            if (path !== null) treeDesiredExpanded.set(path, false); // 显式收起意图
+            // 可见 ul 即已加载 (无在途): 直接改 DOM, 意图无消费方, 不留残留
+            // (陈旧意图会挡住后续 reveal 的缓存命中展开).
             setTreeNodeExpanded(treeSelectedEl, false);
           } else {
             const row = treeSelectedEl.closest('ul');
