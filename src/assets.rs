@@ -578,6 +578,202 @@ mod tests {
         );
     }
 
+    /// 任务 3 质量收尾: 拖拽手势所有权纯函数在 QuickJS 中真实执行. 行为矩阵:
+    /// 无在途手势时主指针左键可开始 (isPrimary 省略视同主指针); 右键/中键/
+    /// 副指针 (isPrimary=false)/已有 owner 一律拒绝; move/end 只认持有手势的
+    /// pointerId (owner 匹配 true, 其他 pointerId 或无 owner false).
+    #[test]
+    fn browser_js_tree_resize_pointer_ownership_matrix() {
+        let ctx = quick_js::Context::new().expect("quick-js context");
+        // CommonJS 钩子 shim: 与 Node 的 module.exports 语义一致 (浏览器无 module).
+        ctx.eval("globalThis.module = { exports: {} };")
+            .expect("CommonJS module shim");
+        ctx.eval(BROWSER_JS).expect("eval BROWSER_JS");
+        // 期望 true: 主指针左键且无 owner 可开始; owner 的 move/end 通行.
+        for expr in [
+            "canStartTreeResize({button:0,isPrimary:true}, null)",
+            "canStartTreeResize({button:0}, null)",
+            "ownsTreeResize({pointerId:7}, 7)",
+        ] {
+            let js = format!("module.exports.{expr}");
+            let got = ctx.eval(&js).expect("ownership helper must not throw");
+            assert!(
+                matches!(got, quick_js::JsValue::Bool(true)),
+                "{expr}: expected true, got {got:?}"
+            );
+        }
+        // 期望 false: 右键/中键/副指针/已有 owner 不可开始; 非 owner 指针或
+        // 无 owner 的 move/end 不可通行.
+        for expr in [
+            "canStartTreeResize({button:2,isPrimary:true}, null)",
+            "canStartTreeResize({button:1,isPrimary:true}, null)",
+            "canStartTreeResize({button:0,isPrimary:false}, null)",
+            "canStartTreeResize({button:0,isPrimary:true}, 7)",
+            "canStartTreeResize({button:2,isPrimary:true}, 7)",
+            "ownsTreeResize({pointerId:7}, null)",
+            "ownsTreeResize({pointerId:8}, 7)",
+            "ownsTreeResize({pointerId:7}, 8)",
+        ] {
+            let js = format!("module.exports.{expr}");
+            let got = ctx.eval(&js).expect("ownership helper must not throw");
+            assert!(
+                matches!(got, quick_js::JsValue::Bool(false)),
+                "{expr}: expected false, got {got:?}"
+            );
+        }
+    }
+
+    /// 任务 3 质量收尾: 拖拽手势单 owner + 捕获失败干净回退的源码切片.
+    /// pointerdown 顺序: 折叠守卫 → 主指针守卫 → setPointerCapture → 激活 id
+    /// 赋值 → class 添加; 捕获失败在 class 添加前 return (不留 class/监听/
+    /// 持久化状态). move/end 均经 ownsTreeResize 过滤 (多指不得移动/结束在途
+    /// 手势); 幂等收尾 onEnd 顺序: owns 守卫 → 复位 id → 移除全部监听 (含
+    /// lostpointercapture) → 移除 class → 释放捕获 → 持久化一次 (id 先复位,
+    /// releasePointerCapture 触发的 lostpointercapture 重入直接返回).
+    #[test]
+    fn browser_js_tree_resize_gesture_ownership_is_locked() {
+        let js = BROWSER_JS;
+        // 模块状态 + 纯函数 seam (行为由 QuickJS 矩阵测试验证).
+        for needle in [
+            "let treeResizePointerId = null",
+            "function canStartTreeResize(",
+            "function ownsTreeResize(",
+        ] {
+            assert!(
+                js.contains(needle),
+                "missing gesture-ownership seam: {needle}"
+            );
+        }
+        // pointerdown 切片: 折叠守卫 < 主指针守卫 < 捕获 < 激活 id < class.
+        let pd_start = js
+            .find("treeResizer.addEventListener('pointerdown',")
+            .expect("resizer pointerdown 处理器存在");
+        let pd = &js[pd_start..];
+        let collapse_at = pd
+            .find("closest('.cb-tree-collapse')")
+            .expect("pointerdown 折叠按钮守卫存在");
+        let can_start_at = pd
+            .find("canStartTreeResize(event, treeResizePointerId)")
+            .expect("pointerdown 主指针守卫存在");
+        let capture_at = pd
+            .find("setPointerCapture(event.pointerId)")
+            .expect("pointerdown 指针捕获存在");
+        let owner_at = pd
+            .find("treeResizePointerId = pointerId")
+            .expect("pointerdown 激活手势 id 赋值存在");
+        let class_at = pd
+            .find("classList.add('cb-tree-resizing')")
+            .expect("pointerdown 拖拽 class 添加存在");
+        assert!(
+            collapse_at < can_start_at
+                && can_start_at < capture_at
+                && capture_at < owner_at
+                && owner_at < class_at,
+            "pointerdown 顺序: 折叠守卫 → 主指针守卫 → 捕获 → 激活 id → class"
+        );
+        // 捕获失败必须干净返回: catch 内 return, 且先于 class 添加.
+        let catch_at = pd
+            .find("} catch (err) {")
+            .expect("pointerdown 捕获异常分支存在");
+        let catch_return = pd[catch_at..]
+            .find("return;")
+            .expect("捕获失败干净返回存在");
+        assert!(
+            catch_at < class_at && catch_return < class_at,
+            "setPointerCapture 失败必须在 class 添加前返回"
+        );
+        // onMove 定义在 onEnd 之前, 且只认 owner: 非 owner 指针的 move 不得改宽.
+        let on_move_at = pd
+            .find("const onMove = function (moveEvent) {")
+            .expect("onMove 函数存在");
+        let on_end_at = pd
+            .find("const onEnd = function (endEvent) {")
+            .expect("onEnd 收尾函数存在");
+        assert!(on_move_at < on_end_at, "onMove 必须先于 onEnd 定义");
+        let on_move_body = &pd[on_move_at..on_end_at];
+        assert!(
+            on_move_body.contains("ownsTreeResize(moveEvent, treeResizePointerId)"),
+            "onMove 必须经 ownsTreeResize 过滤"
+        );
+        // 监听挂载: move/up/cancel/lostpointercapture 齐全且挂载于启动之后.
+        for needle in [
+            "addEventListener('pointermove', onMove)",
+            "addEventListener('pointerup', onEnd)",
+            "addEventListener('pointercancel', onEnd)",
+            "addEventListener('lostpointercapture', onEnd)",
+        ] {
+            let at = pd
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"));
+            assert!(at > class_at, "{needle} 必须晚于手势启动");
+        }
+        // onEnd 幂等收尾切片: owns 守卫 → 复位 id → 移除全部监听 → 移除 class
+        // → 释放捕获 → 持久化一次.
+        let on_end = &pd[on_end_at..];
+        let owns_at = on_end
+            .find("ownsTreeResize(endEvent, treeResizePointerId)")
+            .expect("onEnd 必须校验手势所有权");
+        let reset_at = on_end
+            .find("treeResizePointerId = null")
+            .expect("onEnd 必须复位激活 id");
+        let rm_move = on_end
+            .find("removeEventListener('pointermove', onMove)")
+            .expect("onEnd 移除 pointermove");
+        let rm_up = on_end
+            .find("removeEventListener('pointerup', onEnd)")
+            .expect("onEnd 移除 pointerup");
+        let rm_cancel = on_end
+            .find("removeEventListener('pointercancel', onEnd)")
+            .expect("onEnd 移除 pointercancel");
+        let rm_lost = on_end
+            .find("removeEventListener('lostpointercapture', onEnd)")
+            .expect("onEnd 移除 lostpointercapture");
+        let class_rm = on_end
+            .find("classList.remove('cb-tree-resizing')")
+            .expect("onEnd 移除拖拽 class");
+        let release_at = on_end
+            .find("releasePointerCapture(pointerId)")
+            .expect("onEnd 释放指针捕获");
+        let persist_at = on_end
+            .find("setTreeWidth(dragWidth, true)")
+            .expect("onEnd 持久化偏好");
+        assert!(
+            owns_at < reset_at
+                && reset_at < rm_move
+                && rm_move < rm_up
+                && rm_up < rm_cancel
+                && rm_cancel < rm_lost
+                && rm_lost < class_rm
+                && class_rm < release_at
+                && release_at < persist_at,
+            "onEnd 顺序: owns 守卫 → 复位 id → 移除全部监听 → 移除 class → 释放 → 持久化一次"
+        );
+        assert_eq!(
+            on_end.matches("setTreeWidth(dragWidth, true)").count(),
+            1,
+            "onEnd 只持久化一次"
+        );
+        // exitTreeMode: 在途手势先安全复位 (移除 resizer 前清空 owner 与 class,
+        // 元素移除隐式释放捕获触发的 lostpointercapture 重入此刻已无 owner).
+        let exit_start = js
+            .find("function exitTreeMode()")
+            .expect("exitTreeMode 存在");
+        let exit = &js[exit_start..];
+        let exit_reset = exit
+            .find("treeResizePointerId = null")
+            .expect("exitTreeMode 复位在途手势");
+        let exit_class_rm = exit
+            .find("classList.remove('cb-tree-resizing')")
+            .expect("exitTreeMode 移除拖拽 class");
+        let resizer_rm = exit
+            .find("treeResizer.remove()")
+            .expect("exitTreeMode 移除 resizer");
+        assert!(
+            exit_reset < resizer_rm && exit_class_rm < resizer_rm,
+            "exitTreeMode 必须先在移除 resizer 前复位在途手势"
+        );
+    }
+
     /// 任务 3 跟进: 持久化偏好与生效宽分离. 锁定 treePreferredWidth 只受硬边界
     /// [160,480] 约束 (clampTreePreferred), 生效宽 treeWidth 再叠加 50vw 视口
     /// 上限; persist 只写硬边界截断的偏好 (绝不写入窄屏截断值); 窄屏进入不改写

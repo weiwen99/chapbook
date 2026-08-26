@@ -162,6 +162,15 @@
     return res.text();
   }
 
+  // 树宽拖拽手势所有权: 仅主指针左键可在无在途手势时开始 (右键/中键/副指针/
+  // 多指一律拒绝); move/end 只认持有手势的 pointerId, 其他指针不得移动或
+  // 结束在途拖拽. isPrimary 省略视同主指针 (合成事件/键盘可达).
+  function canStartTreeResize(event, activePointerId) {
+    return activePointerId === null && event.button === 0 && event.isPrimary !== false;
+  }
+  function ownsTreeResize(event, activePointerId) {
+    return activePointerId !== null && event.pointerId === activePointerId;
+  }
 
   /* ---------- DOM 状态与渲染 ---------- */
 
@@ -689,6 +698,9 @@
   let treePreferredWidth = TREE_DEFAULT_WIDTH;
   let treeWidth = TREE_DEFAULT_WIDTH;
   let treeResizer = null; // 列 2 调整器元素 (随树壳创建/销毁)
+  // 在途拖拽手势的 pointerId (单 owner): 无手势时为 null. move/end/收尾只认
+  // 该 id; 捕获失败或退出树模式时干净复位.
+  let treeResizePointerId = null;
   function loadJsonArray(key, fallback) {
     try {
       const value = JSON.parse(localStorage.getItem(key) || 'null');
@@ -1094,39 +1106,52 @@
     treeResizer.setAttribute('aria-valuemax', String(treeWidthMax()));
     treeResizer.setAttribute('aria-valuenow', String(treeWidth));
     treeResizer.addEventListener('pointerdown', function (event) {
-      // 未来的折叠按钮 (.cb-tree-collapse 子控件) 不触发拖拽: 先于捕获返回.
+      // 未来的折叠按钮 (.cb-tree-collapse 子控件) 不触发拖拽: 先于一切返回.
       if (event.target.closest('.cb-tree-collapse')) return;
-      const startX = event.clientX;
-      const startWidth = treeWidth;
-      let dragWidth = startWidth; // 未截断的目标宽: 结束时按硬边界持久化
+      // 仅主指针左键可开始; 已有在途手势时拒绝 (副键/多指不抢手势).
+      if (!canStartTreeResize(event, treeResizePointerId)) return;
+      // 先捕获后启动: 捕获失败 (异常/禁用) 干净返回, 不留 class/监听/持久化.
       try {
         treeResizer.setPointerCapture(event.pointerId);
       } catch (err) {
-        /* 指针捕获失败: 仍按未捕获拖拽处理, 保持窗口内可调整 */
+        return;
       }
+      const pointerId = event.pointerId;
+      const startX = event.clientX;
+      const startWidth = treeWidth;
+      let dragWidth = startWidth; // 未截断的目标宽: 结束时按硬边界持久化
+      treeResizePointerId = pointerId;
       document.body.classList.add('cb-tree-resizing');
       if (event.cancelable) event.preventDefault();
       const onMove = function (moveEvent) {
+        if (!ownsTreeResize(moveEvent, treeResizePointerId)) return;
         dragWidth = startWidth + moveEvent.clientX - startX;
         setTreeWidth(dragWidth, false);
         if (moveEvent.cancelable) moveEvent.preventDefault();
       };
-      const onEnd = function () {
+      // 幂等收尾: 任意结束信号 (up/cancel/lostpointercapture) 只清理一次.
+      // 先复位 owner 再释放捕获 — releasePointerCapture 触发的
+      // lostpointercapture 重入此刻已无 owner, 直接返回, 不重复清理/持久化.
+      const onEnd = function (endEvent) {
+        if (!ownsTreeResize(endEvent, treeResizePointerId)) return;
+        treeResizePointerId = null;
         treeResizer.removeEventListener('pointermove', onMove);
         treeResizer.removeEventListener('pointerup', onEnd);
         treeResizer.removeEventListener('pointercancel', onEnd);
+        treeResizer.removeEventListener('lostpointercapture', onEnd);
+        document.body.classList.remove('cb-tree-resizing');
         try {
-          treeResizer.releasePointerCapture(event.pointerId);
+          treeResizer.releasePointerCapture(pointerId);
         } catch (err) {
           /* 指针捕获已隐式释放: 忽略 */
         }
-        document.body.classList.remove('cb-tree-resizing');
         // finish (up/cancel): 持久化偏好按硬边界截断, 绝不写入 50vw 截断值
         setTreeWidth(dragWidth, true);
       };
       treeResizer.addEventListener('pointermove', onMove);
       treeResizer.addEventListener('pointerup', onEnd);
       treeResizer.addEventListener('pointercancel', onEnd);
+      treeResizer.addEventListener('lostpointercapture', onEnd);
     });
     treeResizer.addEventListener('keydown', function (event) {
       let next = null;
@@ -1794,6 +1819,12 @@
     closeTreeDrawer();
     uninstallDrawerMql();
     uninstallTreeViewportResizeHandler();
+    // 在途拖拽手势先安全复位: 移除 resizer 会隐式释放捕获并触发
+    // lostpointercapture — owner 此刻已复位, 幂等收尾重入直接返回, 不重复清理.
+    if (treeResizePointerId !== null) {
+      treeResizePointerId = null;
+      document.body.classList.remove('cb-tree-resizing');
+    }
     // 树宽调整器与 CSS 变量随壳销毁: 残留变量会污染再进入时的默认列 (变量
     // 只在树模式被 JS 重新写入, 但避免 dir 宿主残留样式差异).
     if (treeResizer) {
@@ -1984,6 +2015,8 @@
       panelTargetForSelection: panelTargetForSelection,
       createGenerationGuard: createGenerationGuard,
       canonicalTransportKey: canonicalTransportKey,
+      canStartTreeResize: canStartTreeResize,
+      ownsTreeResize: ownsTreeResize,
     };
   }
 })();
