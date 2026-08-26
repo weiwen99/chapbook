@@ -1803,11 +1803,15 @@ mod tests {
         }
     }
 
-    /// 任务 5 质量收尾: 展开意图纯函数在 QuickJS 中真实执行. 行为矩阵:
-    /// - 在途 (pending): 第二次激活翻转意图 — true→false (加载完成前表达收起),
-    ///   false→true (重新表达展开), 意图缺失按展开处理 (undefined → true);
+    /// 任务 5 质量收尾: 展开意图纯函数在 QuickJS 中真实执行. 行为矩阵 (显式
+    /// 用户意图与 nav/默认意图分离):
+    /// - 在途 (pending) + 无显式用户意图 (hasExplicitIntent 缺省): 按当前
+    ///   可见态推导 — 可见折叠 (expanded=false) 即表达展开 (true), nav 的
+    ///   隐藏 desired 绝不参与 (首击可见折叠目录必须展开, 无需第三次点击);
+    /// - 在途 + 有显式用户意图: 翻转当前 desired — true→false (加载完成前
+    ///   收起), false→true (重新表达展开), 意图缺失按展开处理 (undefined → true);
     /// - 无在途: 按当前可见态翻转 — 展开→收起 (false), 收起→展开 (true),
-    ///   desired 参数不影响非在途判定 (可见态权威);
+    ///   desired/hasExplicitIntent 不影响非在途判定 (可见态权威);
     /// - 返回的意图直接决定响应落地时的 hidden/expanded 终态 (绝不盲目 true).
     #[test]
     fn browser_js_tree_expansion_intent_matrix() {
@@ -1816,11 +1820,14 @@ mod tests {
         ctx.eval("globalThis.module = { exports: {} };")
             .expect("CommonJS module shim");
         ctx.eval(BROWSER_JS).expect("eval BROWSER_JS");
-        // pending: 翻转意图.
+        // 在途 + 无显式意图 (nav/默认 desired 不参与): 按可见态推导.
         for (expr, expected) in [
-            ("treeExpansionIntent(true, false, true)", false),
+            ("treeExpansionIntent(true, false, true)", true),
             ("treeExpansionIntent(true, false, false)", true),
             ("treeExpansionIntent(true, false)", true),
+            ("treeExpansionIntent(true, true, true)", false),
+            ("treeExpansionIntent(true, true, false)", false),
+            ("treeExpansionIntent(true, true)", false),
         ] {
             let got = ctx
                 .eval(&format!("module.exports.{expr}"))
@@ -1830,13 +1837,31 @@ mod tests {
                 "{expr}: expected {expected}, got {got:?}"
             );
         }
-        // 非在途: 按当前可见态翻转.
+        // 在途 + 显式用户意图: 翻转当前 desired.
         for (expr, expected) in [
+            ("treeExpansionIntent(true, false, true, true)", false),
+            ("treeExpansionIntent(true, false, false, true)", true),
+            ("treeExpansionIntent(true, false, undefined, true)", true),
+            ("treeExpansionIntent(true, true, true, true)", false),
+            ("treeExpansionIntent(true, true, false, true)", true),
+        ] {
+            let got = ctx
+                .eval(&format!("module.exports.{expr}"))
+                .expect("treeExpansionIntent must not throw");
+            assert!(
+                matches!(got, quick_js::JsValue::Bool(b) if b == expected),
+                "{expr}: expected {expected}, got {got:?}"
+            );
+        }
+        // 非在途: 按当前可见态翻转 (意图与显式标记均无关).
+        for (expr, expected) in [
+            ("treeExpansionIntent(false, true, true, true)", false),
+            ("treeExpansionIntent(false, true, false, false)", false),
             ("treeExpansionIntent(false, true, true)", false),
-            ("treeExpansionIntent(false, true, false)", false),
             ("treeExpansionIntent(false, true)", false),
+            ("treeExpansionIntent(false, false, false, true)", true),
+            ("treeExpansionIntent(false, false, true, false)", true),
             ("treeExpansionIntent(false, false, false)", true),
-            ("treeExpansionIntent(false, false, true)", true),
             ("treeExpansionIntent(false, false)", true),
         ] {
             let got = ctx
@@ -1992,9 +2017,10 @@ mod tests {
 
     /// 任务 5 收尾 + 异步生命周期隔离: 懒加载并发去重 + 意图终态 seam.
     /// 行为导向源不变量:
-    /// - 模块状态: treePendingLoads (path → 在途 Promise) 与 treeDesiredExpanded
-    ///   (path → 最新意图) 声明, 退出树模式整体清空; 意图只在退出/叶子化/
-    ///   owner finally 清除;
+    /// - 模块状态: treePendingLoads (path → 在途 Promise)、treeDesiredExpanded
+    ///   (path → 最新意图) 与 treeUserExpansionIntent (path → 显式用户意图
+    ///   集合) 声明, 退出树模式整体清空; 意图只在退出/叶子化/安装方消费/
+    ///   owner finally 失败兜底清除;
     /// - treeLoadMayCommit (纯函数, 导出): 壳当前恒必需; 带导航所有权时还须
     ///   导航当前; 显式用户调用 (无导航所有权) 只要求壳当前 (行为矩阵见
     ///   browser_js_tree_load_may_commit_matrix);
@@ -2003,20 +2029,26 @@ mod tests {
     ///   进入链只共享缓存结果, 不提交 DOM/展开/持久化; 缓存命中与异步响应都
     ///   经 installTreeChildren 唯一替换点 (空缓存 → 叶子化); 替换前先清除被
     ///   替换子树内的选中 (clearTreeSelection → aria-activedescendant 同步移除);
-    ///   终态跟随最新意图 (setTreeNodeExpanded 以 desired 为准, 绝不盲目 true);
+    ///   终态跟随最新意图 (setTreeNodeExpanded 以 desired 为准, 绝不盲目 true),
+    ///   安装方在落地终态后消费意图 (desired + 显式标记, DOM 即权威 — 续接方
+    ///   晚于 owner finally 注册, finally 不得抢先清除意图);
     ///   在途复用: 每个调用方都在共享 Promise 上挂自己的续接 — 发起方所有权
     ///   陈旧时 (如陈旧导航) 响应只写缓存不落 DOM, 本调用方所有权当前则补齐
     ///   安装 (ensureTreeChildrenInstalled), 绝不 bare-return 发起方 Promise;
     ///   清理只由 owner Promise 在 finally 执行: 先比对在途条目身份, 同一
-    ///   owner 块内删除在途条目与意图 (响应落地后 DOM 即权威; 旧壳 finally
-    ///   不得删新壳条目), 意图删除绝不无条件出现在 owner 块之外;
+    ///   owner 块内删除在途条目; 失败响应 (无缓存无安装方) 才由 finally 兜底
+    ///   删除意图与显式标记 (旧壳 finally 比对失败时不得触碰新壳条目);
     /// - convertTreeLeaf: 空目录响应 → 终端叶子 — treeExpandable='0'、移除
     ///   aria-expanded、清 twist、移除子 role=group、持久化展开全部重复条目
-    ///   过滤并保存、删除意图 (未来 click/ArrowRight 经 isExpandableDir
-    ///   短路, 零请求);
-    /// - toggleTreeNode: 在途只翻转意图 (treeExpansionIntent), 直接返回,
-    ///   绝不发起第二个请求; 无在途时 DOM 即权威, 不写意图残留 (陈旧意图会
-    ///   挡住后续 reveal 的缓存命中展开);
+    ///   过滤并保存、删除意图与显式标记 (未来 click/ArrowRight 经
+    ///   isExpandableDir 短路, 零请求);
+    /// - toggleTreeNode: 在途分支 = 显式用户激活 — 无显式意图按可见 DOM 推导
+    ///   (nav 的隐藏 desired 不参与, 首击可见折叠目录即表达展开), 有显式意图
+    ///   则翻转 (treeExpansionIntent); 写入 desired + 标记显式后恒经
+    ///   loadTreeChildren 挂 ownerless 续接, 绝不裸 return、绝不发起第二个
+    ///   请求; 无在途展开分支同样标记显式 (用户激活即显式, nav/reveal 默认
+    ///   desired 不算 — 在途期间的后续激活因此翻转而非再推导); 无在途时 DOM
+    ///   即权威, 不写意图残留 (陈旧意图会挡住后续 reveal 的缓存命中展开);
     /// - enterTreeMode: 进入链 generation (treeGen += 1 后捕获 enterGen), 旧进入
     ///   链 (buildTreeShell().then / reveal.then / 持久化 walk 递归续接 / 选中
     ///   恢复) 全部以 enterGen === treeGen 守卫 — 退出/重进后旧链不得触碰新壳.
@@ -2026,6 +2058,7 @@ mod tests {
         for needle in [
             "const treePendingLoads = new Map()",
             "const treeDesiredExpanded = new Map()",
+            "const treeUserExpansionIntent = new Set()",
             "function treeExpansionIntent(",
             "function treeLoadMayCommit(",
             "function loadTreeChildren(",
@@ -2034,6 +2067,7 @@ mod tests {
             "function ensureTreeChildrenInstalled(",
             "treePendingLoads.clear()",
             "treeDesiredExpanded.clear()",
+            "treeUserExpansionIntent.clear()",
         ] {
             assert!(js.contains(needle), "missing load-dedup seam: {needle}");
         }
@@ -2053,8 +2087,10 @@ mod tests {
             .find("return inFlight.then(function (entries) {")
             .expect("在途复用同一 Promise 并挂调用方续接");
         let fetch_at = load
-            .find("const pending = fetchTreeEntries(path)")
-            .expect("发起加载存在");
+            .find(
+                "const pending = fetchTreeEntries(path, treeAbort ? treeAbort.signal : undefined)",
+            )
+            .expect("发起加载存在 (必须传本壳 signal)");
         assert!(
             inflight_at < reuse_at && reuse_at < fetch_at,
             "必须先在途去重 (复用同一 Promise, 挂调用方续接), 再发起 fetch"
@@ -2079,7 +2115,8 @@ mod tests {
             "在途续接绝不重复写缓存 (共享发起方结果)"
         );
         assert_eq!(
-            load.matches("fetchTreeEntries(path)").count(),
+            load.matches("fetchTreeEntries(path, treeAbort ? treeAbort.signal : undefined)")
+                .count(),
             1,
             "单条加载路径只允许一个 fetch 调用点 (去重契约)"
         );
@@ -2148,12 +2185,16 @@ mod tests {
         let desired_del_at = load
             .find("treeDesiredExpanded.delete(path)")
             .expect("删除意图条目存在 (失败响应兜底)");
+        let explicit_del_at = load
+            .find("treeUserExpansionIntent.delete(path)")
+            .expect("删除显式标记存在 (失败响应兜底)");
         assert!(
             finally_at < owner_cmp_at
                 && owner_cmp_at < pending_del_at
                 && pending_del_at < cache_check_at
-                && cache_check_at < desired_del_at,
-            "owner 清理顺序: finally → 身份比对 → 删在途 → 无缓存才兜底删意图"
+                && cache_check_at < desired_del_at
+                && desired_del_at < explicit_del_at,
+            "owner 清理顺序: finally → 身份比对 → 删在途 → 无缓存才兜底删意图 + 显式标记"
         );
         assert_eq!(
             load.matches("treeDesiredExpanded.delete").count(),
@@ -2175,6 +2216,7 @@ mod tests {
             "twist.textContent = ''",
             "ul.remove()",
             "treeDesiredExpanded.delete(path)",
+            "treeUserExpansionIntent.delete(path)",
         ] {
             assert!(
                 leaf.contains(needle),
@@ -2209,36 +2251,67 @@ mod tests {
             inst_clear_at < inst_replace_at,
             "唯一替换点: 必须先清除被替换子树内的选中再 replaceChildren"
         );
+        let inst_set_at = inst
+            .find("setTreeNodeExpanded(li, treeDesiredExpanded.get(path) !== false)")
+            .expect("落地终态先经 setTreeNodeExpanded");
+        let inst_desired_at = inst
+            .find("treeDesiredExpanded.delete(path)")
+            .expect("安装方消费 desired (落地终态后)");
+        let inst_explicit_at = inst
+            .find("treeUserExpansionIntent.delete(path)")
+            .expect("安装方消费显式标记 (落地终态后)");
         assert!(
-            inst.contains("treeDesiredExpanded.get(path) !== false"),
-            "终态必须跟随最新意图 (绝不盲目 true)"
+            inst_clear_at < inst_replace_at
+                && inst_replace_at < inst_set_at
+                && inst_set_at < inst_desired_at
+                && inst_desired_at < inst_explicit_at,
+            "唯一替换点: 清选中 → replaceChildren → 终态 setTreeNodeExpanded → 消费 desired → 消费显式标记"
         );
         // toggleTreeNode: 在途只翻转意图, 不发起第二个请求; 非在途按可见态.
         let toggle_end = js
             .find("function selectTreeNode(")
             .expect("selectTreeNode 位于 toggleTreeNode 之后");
         let toggle = &js[load_end..toggle_end];
-        // 意图只在在途分支写入: 翻转 (treeExpansionIntent) 后直接返回, 绝不
-        // 发起第二个请求; 无在途分支 (展开经 loadTreeChildren / 收起经
-        // setTreeNodeExpanded) 不得触碰意图 — DOM 直接为权威, 残留意图会挡住
-        // 后续 reveal 的缓存命中展开.
+        // 在途分支 = 显式用户激活: 无显式意图按可见 DOM 推导 (nav 的隐藏
+        // desired 不参与), 有显式意图则翻转 (treeExpansionIntent); 写入
+        // desired + 标记显式后恒经 loadTreeChildren 挂 ownerless 续接 — 响应
+        // 落地时续接方安装, 终态跟随最新意图; 绝不裸 return、绝不发起第二个
+        // 请求; 无在途分支 (展开经 loadTreeChildren / 收起经 setTreeNodeExpanded)
+        // 不得触碰意图 — DOM 直接为权威, 残留意图会挡住后续 reveal 的缓存命中展开.
         let toggle_pending_at = toggle.find("if (pending) {").expect("在途分支存在");
         let toggle_intent_at = toggle
-            .find("treeExpansionIntent(pending, expanded, desired)")
-            .expect("toggle 必须经意图纯函数翻转");
-        let pending_ret_at = toggle_intent_at
-            + toggle[toggle_intent_at..]
-                .find("return;")
-                .expect("在途 toggle 翻转意图后直接返回");
+            .find(
+                "treeExpansionIntent(pending, expanded, desired, treeUserExpansionIntent.has(path))"
+            )
+            .expect("toggle 必须经意图纯函数翻转 (含显式意图判定)");
+        let toggle_set_at = toggle
+            .find("treeDesiredExpanded.set(path, next)")
+            .expect("在途激活写入最新 desired");
+        let toggle_mark_at = toggle
+            .find("treeUserExpansionIntent.add(path)")
+            .expect("在途激活必须标记显式用户意图");
+        let toggle_adopt_at = toggle
+            .find("return loadTreeChildren(li, path);")
+            .expect("在途激活必须挂 ownerless 续接 (绝不裸 return)");
         assert!(
-            toggle_pending_at < toggle_intent_at && toggle_intent_at < pending_ret_at,
-            "在途分支: 意图翻转先于直接返回 (绝不发起第二个请求)"
+            toggle_pending_at < toggle_intent_at
+                && toggle_intent_at < toggle_set_at
+                && toggle_set_at < toggle_mark_at
+                && toggle_mark_at < toggle_adopt_at,
+            "在途分支: 意图推导 → 写 desired → 标记显式 → 挂续接 (绝不裸 return / 绝不二次请求)"
         );
         let toggle_nopending_at = toggle.find("if (expanded) {").expect("无在途分支存在");
         let toggle_after = &toggle[toggle_nopending_at..];
         assert!(
             !toggle_after.contains("treeDesiredExpanded"),
             "无在途分支不得触碰意图 (DOM 直接权威)"
+        );
+        // 无在途展开分支: 用户激活即显式意图 (nav/reveal 默认 desired 不算) —
+        // 标记后再经 loadTreeChildren; 显式标记使在途期间的后续激活翻转 (第二
+        // 次激活表达收起), 首击永远不会被当成 nav 默认意图翻转.
+        assert!(
+            toggle_after.contains("treeUserExpansionIntent.add(path)"),
+            "无在途展开分支必须标记显式用户意图"
         );
         // enterTreeMode: 先递增树壳 generation 再捕获 enterGen; 进入链每处异步
         // 边界后 (buildTreeShell().then / reveal.then / walk 递归续接 / 选中恢复)
@@ -2273,16 +2346,23 @@ mod tests {
         let desired_clear_at = exit
             .find("treeDesiredExpanded.clear();")
             .expect("退出清空意图表");
+        let explicit_clear_at = exit
+            .find("treeUserExpansionIntent.clear();")
+            .expect("退出清空显式意图表");
         assert!(
-            cache_clear_at < pending_clear_at && pending_clear_at < desired_clear_at,
-            "exitTreeMode: 先清树缓存, 再清在途表与意图表"
+            cache_clear_at < pending_clear_at
+                && pending_clear_at < desired_clear_at
+                && desired_clear_at < explicit_clear_at,
+            "exitTreeMode: 先清树缓存, 再清在途表、意图表与显式意图表"
         );
     }
 
     /// 任务 5 收尾: 树根加载失败契约. buildTreeShell 的根 JSON 请求带拒绝
-    /// 处理 (then 双参): 旧壳 (gen !== treeGen) 忽略; 当前壳清空根、挂纯文本
-    /// role=alert 错误 (textContent, 绝不 innerHTML), 链路 resolve — 无未处理
-    /// 拒绝; 重进/重试由新壳全新请求恢复.
+    /// 处理 (then 双参): 壳退出中止 (AbortError) 与旧壳 (gen !== treeGen)
+    /// 一律静默忽略 — 无可见陈旧 alert、无未处理拒绝; 当前壳清空根、把纯文本
+    /// role=alert 错误 (textContent, 绝不 innerHTML) 挂为 nav 内 treeRootUl
+    /// 的兄弟 (绝不直接挂进 role=tree 的 ul), 链路 resolve; 成功分支清除
+    /// 既有错误元素 (重试/成功即清理); 重进/重试由新壳全新请求恢复.
     #[test]
     fn browser_js_tree_root_fetch_failure_seam_is_locked() {
         let js = BROWSER_JS;
@@ -2294,14 +2374,14 @@ mod tests {
             .expect("buildTreeShell 位于抽屉段之前");
         let shell = &js[shell_at..drawer_at];
         let root_at = shell
-            .find("return fetchTreeEntries('').then(")
+            .find("return fetchTreeEntries(''")
             .expect("根加载存在 (then 双参: 成功 + 失败)");
         let success_at = shell
             .find("treeRootUl.replaceChildren(...nodes)")
             .expect("根加载成功替换子项");
         let fail_fn_at = shell[success_at..]
-            .find("function () {")
-            .expect("根加载失败处理函数存在");
+            .find("function (err) {")
+            .expect("根加载失败处理函数存在 (带 err 参数, AbortError 守卫)");
         let fail_fn_at = success_at + fail_fn_at;
         assert!(
             root_at < success_at && success_at < fail_fn_at,
@@ -2309,19 +2389,145 @@ mod tests {
         );
         let fail = &shell[fail_fn_at..];
         for needle in [
+            "err.name === 'AbortError'",
             "if (gen !== treeGen) return;",
             "treeCache.delete('')",
             "treeRootUl.replaceChildren()",
-            "err.className = 'cb-tree-error'",
-            "err.setAttribute('role', 'alert')",
-            "err.textContent = '无法加载目录树'",
-            "treeRootUl.append(err)",
+            "errEl.className = 'cb-tree-error'",
+            "errEl.setAttribute('role', 'alert')",
+            "errEl.textContent = '无法加载目录树'",
+            "treeNav.append(errEl)",
         ] {
             assert!(fail.contains(needle), "根失败处理缺少契约: {needle}");
         }
+        // AbortError 守卫必须先于一切 (中止请求绝无可见 alert), 再是旧壳守卫.
+        let abort_at = fail.find("AbortError").expect("AbortError 守卫存在");
+        let gen_guard_at = fail
+            .find("if (gen !== treeGen) return;")
+            .expect("旧壳守卫存在");
+        let alert_at = fail
+            .find("treeNav.append(errEl)")
+            .expect("alert 挂到 nav (ul role=tree 的兄弟)");
+        assert!(
+            abort_at < gen_guard_at && gen_guard_at < alert_at,
+            "根失败顺序: AbortError 静默 → 旧壳忽略 → 当前壳才挂 alert"
+        );
+        assert!(
+            !fail.contains("treeRootUl.append"),
+            "alert 绝不挂进 role=tree 的根 ul (必须是 nav 内兄弟)"
+        );
         assert!(
             !fail.contains("innerHTML"),
             "根失败错误只经 textContent (绝不 innerHTML)"
+        );
+        // 成功分支: 清除既有 .cb-tree-error (重试/成功即清理).
+        let success = &shell[root_at..success_at];
+        assert!(
+            success.contains("prevErr.remove()") && success.contains(".cb-tree-error"),
+            "成功分支必须清除既有根错误元素"
+        );
+    }
+
+    /// 任务 5 收尾: 树请求按壳中止 + 同步守卫顺序. 每壳一个 AbortController:
+    /// 进入时创建 (先于 root/子项请求), 退出时 abort 并置空 — 在途树请求以
+    /// AbortError 收尾, 失败处理器静默吞掉; fetchTreeEntries 接收 signal 并
+    /// 仅在存在时附加 (root 与子项两个调用点都传); syncTreeToPath 必须先查
+    /// paneNavGuard 当前性再执行 clearTreeCurrent 变异 (陈旧导航零 mutation).
+    #[test]
+    fn browser_js_tree_shell_abort_and_sync_guard_seam_is_locked() {
+        let js = BROWSER_JS;
+        assert!(
+            js.contains("let treeAbort = null"),
+            "树壳级 AbortController 状态必须声明"
+        );
+        // enterTreeMode: 先递增壳 generation, 再创建本壳 AbortController.
+        let enter_at = js
+            .find("function enterTreeMode()")
+            .expect("enterTreeMode 存在");
+        let enter_end = js
+            .find("function exitTreeMode()")
+            .expect("exitTreeMode 位于 enterTreeMode 之后");
+        let enter = &js[enter_at..enter_end];
+        let enter_gen_at = enter
+            .find("const enterGen = treeGen")
+            .expect("进入链捕获 enterGen");
+        let abort_create_at = enter
+            .find("treeAbort = new AbortController()")
+            .expect("进入时必须创建本壳 AbortController");
+        assert!(
+            enter_gen_at < abort_create_at,
+            "enterTreeMode: 创建 AbortController 必须先于 root/子项请求"
+        );
+        // exitTreeMode: 先递增壳 generation, 再 abort + 置空.
+        let exit_at = js
+            .find("function exitTreeMode()")
+            .expect("exitTreeMode 存在");
+        let exit = &js[exit_at..];
+        let exit_gen_at = exit.find("treeGen += 1").expect("退出递增壳 generation");
+        let abort_at = exit
+            .find("treeAbort.abort()")
+            .expect("退出必须中止本壳在途树请求");
+        let abort_null_at = exit
+            .find("treeAbort = null")
+            .expect("退出后置空 AbortController");
+        assert!(
+            exit_gen_at < abort_at && abort_at < abort_null_at,
+            "exitTreeMode: 递增 → abort → 置空"
+        );
+        // fetchTreeEntries: 接收 signal, 仅在存在时附加 (两个调用点都传).
+        let fetch_at = js
+            .find("function fetchTreeEntries(path, signal)")
+            .expect("fetchTreeEntries 必须接收 signal");
+        let fetch_end = js
+            .find("// 展开意图纯函数")
+            .expect("fetchTreeEntries 位于展开意图纯函数之前");
+        let fetch = &js[fetch_at..fetch_end];
+        assert!(
+            fetch.contains("opts.signal = signal") && fetch.contains("if (signal)"),
+            "fetchTreeEntries 必须仅在 signal 存在时附加 (无 signal 不传 abort 选项)"
+        );
+        let shell_at = js
+            .find("function buildTreeShell(")
+            .expect("buildTreeShell 存在");
+        let shell = &js[shell_at..];
+        assert_eq!(
+            shell
+                .matches("fetchTreeEntries('', treeAbort ? treeAbort.signal : undefined)")
+                .count(),
+            1,
+            "根加载必须把本壳 signal 传给 fetchTreeEntries"
+        );
+        let load_at = js
+            .find("function loadTreeChildren(")
+            .expect("loadTreeChildren 存在");
+        let load = &js[load_at..js.find("function toggleTreeNode(").expect("toggleTreeNode")];
+        assert!(
+            load.contains("fetchTreeEntries(path, treeAbort ? treeAbort.signal : undefined)"),
+            "子项加载必须把本壳 signal 传给 fetchTreeEntries"
+        );
+        // 子项失败处理器: AbortError 静默 (中止不标记失败/不重试).
+        let child_fail = &load[load.find("function (err) {").expect("子项失败处理器")..];
+        assert!(
+            child_fail.contains("err.name === 'AbortError'"),
+            "子项加载失败处理器必须静默吞掉 AbortError"
+        );
+        // syncTreeToPath: paneNavGuard 当前性检查必须先于 clearTreeCurrent 变异.
+        let sync_at = js
+            .find("function syncTreeToPath(")
+            .expect("syncTreeToPath 存在");
+        let sync_end = js
+            .find("function paneInitialLoad(")
+            .expect("paneInitialLoad 位于 syncTreeToPath 之后");
+        let sync = &js[sync_at..sync_end];
+        let guard_at = sync
+            .find("if (!paneNavGuard.isCurrent(gen)) return;")
+            .expect("syncTreeToPath 必须带导航当前性守卫");
+        let mutate_at = sync
+            .find("clearTreeCurrent()")
+            .expect("clearTreeCurrent 变异存在");
+        assert!(
+            guard_at < mutate_at,
+            "syncTreeToPath: 陈旧导航不得执行任何 clearTreeCurrent 变异"
         );
     }
 }

@@ -687,12 +687,23 @@
   // 目录展开意图: path -> desired boolean. 在途加载期间再次激活可翻转意图
   // (加载完成前表达收起); 响应落地时终态跟随意图, 绝不盲目展开.
   const treeDesiredExpanded = new Map();
+  // 显式用户展开意图 (path 集合): 与 nav/默认意图分离 — reveal/persist 写入
+  // 的 desired 只是默认展开意图, 不算用户动作; 只有用户激活 (click/键盘) 才
+  // 入集合. 在途 toggle 无显式意图时按可见 DOM 推导 (!expanded), nav 的隐藏
+  // desired 绝不参与翻转 (首击可见折叠目录即表达展开); 有显式意图则翻转当前
+  // desired. 安装方消费 (desired + 显式标记), 失败响应 (无缓存) / 叶子化 /
+  // 退出壳兜底清除.
+  const treeUserExpansionIntent = new Set();
   let treeSelectedEl = null;
   // 稳定节点 id 计数器: 仅保证当前壳内唯一/稳定 (ARIA 活动后代公告锚点);
   // 每次建壳复位 (退出树模式后旧节点随壳销毁, id 可安全复用).
   let treeItemSeq = 0;
   // 树壳生命周期 generation: 退出树模式递增使全部在途响应失效 (镜像 previewGuard)
   let treeGen = 0;
+  // 本壳树请求 (root/子项) 的 AbortController: 进入时创建 (先于 root/子项
+  // 请求), 退出时 abort 并置空 — 在途请求以 AbortError 收尾, 失败处理器静默
+  // 吞掉 (无可见陈旧 alert、无未处理拒绝).
+  let treeAbort = null;
   // 窄屏抽屉 (<64rem, off-canvas transform + 遮罩): 随树壳创建/销毁.
   // 开合态挂 body.cb-drawer-open (宽屏无对应 CSS, 恒 no-op).
   let treeScrim = null; // 遮罩: 点击收起抽屉
@@ -894,9 +905,12 @@
   }
 
   // 拉取目录子项 JSON: path 为空串时命中显式根路由 /__/tree (绝不拼尾斜杠).
-  function fetchTreeEntries(path) {
+  // signal: 本壳 AbortController 的取消信号 — 壳退出即中止在途树请求.
+  function fetchTreeEntries(path, signal) {
     const url = path === '' ? '/__/tree' : '/__/tree/' + path;
-    return fetch(url, { headers: { Accept: 'application/json' } })
+    const opts = { headers: { Accept: 'application/json' } };
+    if (signal) opts.signal = signal;
+    return fetch(url, opts)
       .then(function (res) {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         return res.json();
@@ -906,11 +920,15 @@
       });
   }
 
-  // 展开意图纯函数 (DOM 无关 seam): 在途加载期间 (pending) 再次激活表达翻转
-  // 意图 — true→false 即加载完成前收起, false→true 即重新表达展开; 无在途时
-  // 按当前可见态翻转 (展开→收起 / 收起→展开). 返回最新 desired 意图.
-  function treeExpansionIntent(pending, expanded, desired) {
-    if (pending) return desired === true ? false : true;
+  // 展开意图纯函数 (DOM 无关 seam): 显式用户意图与 nav/默认意图分离.
+  // - 在途 (pending) + 有显式用户意图 (hasExplicitIntent): 翻转当前 desired
+  //   — true→false 即加载完成前收起, false→true 即重新表达展开;
+  // - 在途 + 无显式用户意图: 按当前可见态推导 (!expanded) — 首击可见折叠的
+  //   目录表达展开 (true), nav/reveal 写入的隐藏 desired 绝不参与翻转;
+  // - 无在途: 按当前可见态翻转 (展开→收起 / 收起→展开), 与意图参数无关.
+  // 返回最新 desired 意图.
+  function treeExpansionIntent(pending, expanded, desired, hasExplicitIntent) {
+    if (pending && hasExplicitIntent) return desired === true ? false : true;
     return expanded ? false : true;
   }
 
@@ -945,13 +963,14 @@
       saveJsonArray(TREE_EXPANDED_KEY, treeExpandedPaths);
     }
     treeDesiredExpanded.delete(path);
+    treeUserExpansionIntent.delete(path); // 叶子无展开语义: 显式标记一并清除
   }
 
   // 唯一子项替换点: 把缓存子项安装进 li (缓存命中与异步响应共用). 空缓存 →
   // 叶子化; 替换前先清除被替换子树内的选中 (aria-activedescendant 同步移除);
   // 终态跟随最新意图 (在途期间可翻转表达收起), 绝不盲目 true; 落地终态后消费
-  // 意图 (DOM 即权威) — 续接方晚于 owner finally 注册, 意图必须由安装方清理,
-  // 否则 finally 抢先清除会让续接方读到已清除的意图.
+  // 意图 (desired + 显式标记, DOM 即权威) — 续接方晚于 owner finally 注册,
+  // 意图必须由安装方清理, 否则 finally 抢先清除会让续接方读到已清除的意图.
   function installTreeChildren(li, path) {
     const cached = treeCache.get(path);
     if (!cached) return;
@@ -966,6 +985,7 @@
     ul.replaceChildren(...cached);
     setTreeNodeExpanded(li, treeDesiredExpanded.get(path) !== false);
     treeDesiredExpanded.delete(path); // 意图已消费: DOM 即权威, 不留残留
+    treeUserExpansionIntent.delete(path); // 显式标记随意图一并消费
   }
 
   // 共享在途结果的续接方提交: 响应可能因发起方所有权陈旧只写缓存未动 DOM —
@@ -1026,7 +1046,7 @@
     if (!treeDesiredExpanded.has(path)) {
       treeDesiredExpanded.set(path, true); // reveal/persist 复用同一入口即表达展开
     }
-    const pending = fetchTreeEntries(path).then(
+    const pending = fetchTreeEntries(path, treeAbort ? treeAbort.signal : undefined).then(
       function (entries) {
         // 旧壳/旧进入链在途响应: 不得写缓存、不得触碰新壳 DOM
         if (gen !== treeGen || (enterGen !== undefined && enterGen !== treeGen)) return;
@@ -1036,21 +1056,24 @@
         if (navRequired && !paneNavGuard.isCurrent(navGen)) return;
         installTreeChildren(li, path);
       },
-      function () {
-        /* 加载失败: 不标记展开, 下次点击重试 */
+      function (err) {
+        /* 加载失败: 不标记展开, 下次点击重试; 壳退出中止 (AbortError) 静默 */
+        if (err && err.name === 'AbortError') return;
       }
     );
     treePendingLoads.set(path, pending);
     pending.finally(function () {
       // 清理只由 owner Promise 执行: 先比对在途条目身份 (恒为本 Promise) —
       // 旧壳/旧链的 finally 不得删除新壳注册的条目与意图. 成功响应已由安装方
-      // (installTreeChildren) 在落地终态后消费意图; 此处只在失败响应 (无缓存,
-      // 无安装方) 时兜底删除 — 续接方 (inFlight.then) 注册晚于本 finally,
-      // 若在此无条件删除意图, 续接方将读到已清除的意图 (折叠意图丢失).
+      // (installTreeChildren) 在落地终态后消费意图 (desired + 显式标记);
+      // 此处只在失败响应 (无缓存, 无安装方) 时兜底删除 — 续接方 (inFlight.then)
+      // 注册晚于本 finally, 若在此无条件删除意图, 续接方将读到已清除的意图
+      // (折叠意图丢失).
       if (treePendingLoads.get(path) === pending) {
         treePendingLoads.delete(path);
         if (!treeCache.has(path)) {
           treeDesiredExpanded.delete(path);
+          treeUserExpansionIntent.delete(path);
         }
       }
     });
@@ -1065,19 +1088,30 @@
     const expanded = !!ul && !ul.hidden;
     const pending = treePendingLoads.has(path);
     if (pending) {
-      // 在途: 只翻转意图 (treeExpansionIntent), 绝不发起第二个请求 — 响应
-      // 落地时终态跟随意图, 安装方消费意图后 DOM 成为权威.
+      // 在途: 显式用户意图与 nav/默认意图分离 — 无显式意图时按可见 DOM 推导
+      // (!expanded, nav 的隐藏 desired 绝不参与翻转 — 首击可见折叠目录即表达
+      // 展开), 有显式意图则翻转当前 desired; 写入 desired + 标记显式后, 恒经
+      // loadTreeChildren 挂 ownerless 续接 (在途去重: 绝不发起第二个请求) —
+      // 响应落地时由续接方安装, 终态跟随最新意图, 安装方消费意图后 DOM 成为
+      // 权威. 绝不裸 return: 无续接时陈旧 nav owner 的响应不会安装, 用户点击
+      // 将落空 (需要第三次点击).
       const desired = treeDesiredExpanded.has(path)
         ? treeDesiredExpanded.get(path)
         : expanded;
-      treeDesiredExpanded.set(path, treeExpansionIntent(pending, expanded, desired));
-      return;
+      const next = treeExpansionIntent(pending, expanded, desired, treeUserExpansionIntent.has(path));
+      treeDesiredExpanded.set(path, next);
+      treeUserExpansionIntent.add(path);
+      return loadTreeChildren(li, path);
     }
     // 无在途: 意图无消费方, 绝不写入残留 (陈旧意图会挡住后续 reveal 的缓存
     // 命中展开) — DOM 直接为权威.
     if (expanded) {
       setTreeNodeExpanded(li, false);
     } else {
+      // 用户激活即显式意图 (nav/reveal 默认 desired 不算): 标记后经
+      // loadTreeChildren 加载 — 在途期间的后续激活按显式意图翻转 (第二次
+      // 激活表达收起), 而不是把首击当 nav 默认意图翻转.
+      treeUserExpansionIntent.add(path);
       loadTreeChildren(li, path);
     }
   }
@@ -1441,24 +1475,30 @@
     document.body.append(treeRestoreBtn);
     installDrawerMql();
     applyTreeCollapsed(); // 壳就位: 同步生效态到新元素 (inert/hidden/类)
-    return fetchTreeEntries('').then(
+    return fetchTreeEntries('', treeAbort ? treeAbort.signal : undefined).then(
       function (entries) {
         if (gen !== treeGen) return;
+        // 重试/成功即清理: 既有错误元素 (同壳重取/迟到清理) 一律移除
+        const prevErr = treeNav.querySelector('.cb-tree-error');
+        if (prevErr) prevErr.remove();
         const nodes = entries.map(buildTreeNode);
         treeCache.set('', nodes);
         treeRootUl.replaceChildren(...nodes);
       },
-      function () {
-        // 根加载失败: 旧壳忽略; 当前壳清空根并显示纯文本错误 (role=alert),
-        // 链路 resolve — 无未处理拒绝; 重进/重试由新壳全新请求.
+      function (err) {
+        // 根加载失败: 壳退出中止 (AbortError) 与旧壳一律静默 — 无可见陈旧
+        // alert、无未处理拒绝; 当前壳清空根并把纯文本错误 (role=alert) 挂为
+        // nav 内 treeRootUl 的兄弟 (绝不直接挂进 role=tree 的 ul), 链路
+        // resolve; 重进/重试由新壳全新请求.
+        if (err && err.name === 'AbortError') return;
         if (gen !== treeGen) return;
         treeCache.delete('');
         treeRootUl.replaceChildren();
-        const err = document.createElement('div');
-        err.className = 'cb-tree-error';
-        err.setAttribute('role', 'alert');
-        err.textContent = '无法加载目录树';
-        treeRootUl.append(err);
+        const errEl = document.createElement('div');
+        errEl.className = 'cb-tree-error';
+        errEl.setAttribute('role', 'alert');
+        errEl.textContent = '无法加载目录树';
+        treeNav.append(errEl);
       }
     );
   }
@@ -1898,11 +1938,11 @@
   // 同步树状态到当前 URL: 清除陈旧 cb-current, revealPath 展开祖先链, 完成后
   // 以当前链为准重标记; 用户导航 (selectTree) 时选中跟随 URL.
   function syncTreeToPath(gen, selectTree) {
+    if (!paneNavGuard.isCurrent(gen)) return; // 陈旧导航: 树状态不跟进 (先于任何 mutation)
     const encoded = currentPathFromLocation();
     if (encoded === null || !treeRootUl) return;
     const segments = encoded === '' ? [] : encoded.split('/');
     clearTreeCurrent();
-    if (!paneNavGuard.isCurrent(gen)) return; // 陈旧导航: 树状态不跟进
     revealPath(segments, gen).then(function () {
       if (!paneNavGuard.isCurrent(gen)) return; // 过期: 树状态不跟进
       clearTreeCurrent(); // reveal 期间可能被更早链路标记: 重标记当前链
@@ -2131,6 +2171,9 @@
     // 进出间的任何在途响应都追不上新壳), 进入链 generation 即此值.
     treeGen += 1;
     const enterGen = treeGen;
+    // 本壳树请求 (root/子项) 的取消信号: 先于 buildTreeShell 的根请求与
+    // reveal/persist 子项请求创建; 退出时 abort+置空 (在途以 AbortError 收尾).
+    treeAbort = new AbortController();
     // 完整页 spy 观察原正文: pane fragment 替换后目标脱离 DOM — 先断开
     if (fullPageSpyDisposer) {
       fullPageSpyDisposer();
@@ -2249,6 +2292,10 @@
   function exitTreeMode() {
     const hadPane = pane !== null;
     treeGen += 1; // 使全部在途树响应失效 (旧壳 continuation 不得触碰新壳)
+    if (treeAbort) {
+      treeAbort.abort(); // 中止本壳在途树请求 (root/子项): AbortError 由失败
+      treeAbort = null; // 处理器静默吞掉, 绝不产生可见陈旧 alert/未处理拒绝
+    }
     document.body.classList.remove('cb-tree-mode');
     if (hadPane) {
       paneNavGuard.invalidate(); // 在途 fragment 响应/错误不得安装状态
@@ -2295,6 +2342,7 @@
     treeCache.clear();
     treePendingLoads.clear(); // 在途加载与意图随壳销毁 (旧壳响应已由 treeGen 作废)
     treeDesiredExpanded.clear();
+    treeUserExpansionIntent.clear(); // 显式用户意图随壳销毁
     clearTreeSelection();
     // SPA 期间 pane 内容已被 fragment 替换: 离开树模式重载当前 URL 恢复完整页.
     // 仅在真实离开树模式时 (init 时 treeMode 为 false 则 pane 不存在, 不重载).
@@ -2445,13 +2493,15 @@
         break;
       case 'ArrowRight':
         // → 只展开 (契约: → 展开 / ← 收起); 已展开则 no-op. 显式激活先记录
-        // 展开意图 (覆盖既有收起意图 — 最新用户动作权威), 在途响应终态跟随.
+        // 展开意图 (覆盖既有收起意图 — 最新用户动作权威) 并标记显式用户意图,
+        // 在途响应终态跟随.
         if (treeSelectedEl && isExpandableDir(treeSelectedEl)) {
           const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
           if (!ul || ul.hidden) {
             const path = encodedPathOf(treeSelectedEl);
             if (path !== null) {
               treeDesiredExpanded.set(path, true);
+              treeUserExpansionIntent.add(path);
               loadTreeChildren(treeSelectedEl, path);
             }
           }
