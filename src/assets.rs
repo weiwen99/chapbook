@@ -1799,6 +1799,43 @@ mod tests {
     ///   Escape 的 tree 范围清选中并收抽屉; switch 不再重复处理 '/' (已由
     ///   focus-search 分支接管);
     /// - helper 经 CommonJS 钩子导出 (浏览器无全局污染).
+    ///
+    /// 任务 5 收尾 + 异步生命周期隔离: 树加载提交决策纯函数在 QuickJS 中真实执行.
+    /// 行为矩阵:
+    /// - 壳不当前 (shellCurrent=false): 一律拒绝, 即使导航当前;
+    /// - 壳当前 + 无导航所有权 (navRequired=false, 显式用户调用): 提交,
+    ///   navCurrent 参数无关;
+    /// - 壳当前 + 导航所有权 (navRequired=true, reveal/sync 链): 仅导航当前可提交;
+    /// - 返回决策直接门禁缓存命中与异步响应的 DOM/展开/持久化提交; 缓存结果
+    ///   共享不受此约束 (陈旧导航可复用结果, 但不得提交 DOM).
+    #[test]
+    fn browser_js_tree_load_may_commit_matrix() {
+        let ctx = quick_js::Context::new().expect("quick-js context");
+        // CommonJS 钩子 shim: 与 Node 的 module.exports 语义一致 (浏览器无 module).
+        ctx.eval("globalThis.module = { exports: {} };")
+            .expect("CommonJS module shim");
+        ctx.eval(BROWSER_JS).expect("eval BROWSER_JS");
+        for (expr, expected) in [
+            // 壳不当前: 恒拒绝.
+            ("treeLoadMayCommit(false, false, false)", false),
+            ("treeLoadMayCommit(false, true, true)", false),
+            // 壳当前 + 显式用户调用 (无导航所有权): 提交, navCurrent 无关.
+            ("treeLoadMayCommit(true, false, false)", true),
+            ("treeLoadMayCommit(true, false, true)", true),
+            // 壳当前 + 导航所有权: 仅导航当前可提交.
+            ("treeLoadMayCommit(true, true, true)", true),
+            ("treeLoadMayCommit(true, true, false)", false),
+        ] {
+            let got = ctx
+                .eval(&format!("module.exports.{expr}"))
+                .expect("treeLoadMayCommit must not throw");
+            assert!(
+                matches!(got, quick_js::JsValue::Bool(b) if b == expected),
+                "{expr}: expected {expected}, got {got:?}"
+            );
+        }
+    }
+
     #[test]
     fn browser_js_tree_key_scope_seam_is_locked() {
         let js = BROWSER_JS;
@@ -1894,20 +1931,29 @@ mod tests {
         );
     }
 
-    /// 任务 5: 懒加载并发去重 + 意图终态 seam. 行为导向源不变量:
+    /// 任务 5 收尾 + 异步生命周期隔离: 懒加载并发去重 + 意图终态 seam.
+    /// 行为导向源不变量:
     /// - 模块状态: treePendingLoads (path → 在途 Promise) 与 treeDesiredExpanded
-    ///   (path → 最新意图) 声明, 退出树模式整体清空;
-    /// - loadTreeChildren: 缓存命中与异步响应两条替换路径都必须先清除被替换
-    ///   子树内的选中 (clearTreeSelection → aria-activedescendant 同步移除);
-    ///   在途查询 → 复用同一 Promise (绝不二次 fetch) → 仅当无在途才发起;
-    ///   响应落地先经旧壳 generation 守卫, 再写缓存/DOM;
+    ///   (path → 最新意图) 声明, 退出树模式整体清空; 意图只在退出/叶子化清除;
+    /// - treeLoadMayCommit (纯函数, 导出): 壳当前恒必需; 带导航所有权时还须
+    ///   导航当前; 显式用户调用 (无导航所有权) 只要求壳当前 (行为矩阵见
+    ///   browser_js_tree_load_may_commit_matrix);
+    /// - loadTreeChildren(li, path, owner): owner 传调用方所有权 — { navGen }
+    ///   (reveal/sync 导航链) 或 { enterGen } (进入链持久化展开); 陈旧导航/
+    ///   进入链只共享缓存结果, 不提交 DOM/展开/持久化; 缓存命中与异步响应都
+    ///   经 installTreeChildren 唯一替换点 (空缓存 → 叶子化); 替换前先清除被
+    ///   替换子树内的选中 (clearTreeSelection → aria-activedescendant 同步移除);
     ///   终态跟随最新意图 (setTreeNodeExpanded 以 desired 为准, 绝不盲目 true);
     ///   清理只由 owner Promise 在 finally 执行: 先比对在途条目身份再删除,
-    ///   意图条目一并删除;
+    ///   finally 绝不删除意图条目;
+    /// - convertTreeLeaf: 空目录响应 → 终端叶子 — treeExpandable='0'、移除
+    ///   aria-expanded、清 twist、移除子 role=group、持久化展开移除并保存、
+    ///   删除意图 (未来 click/ArrowRight 经 isExpandableDir 短路, 零请求);
     /// - toggleTreeNode: 在途只翻转意图 (treeExpansionIntent), 直接返回,
     ///   绝不发起第二个请求; 非在途按当前可见态展开/收起;
-    /// - reveal/persist 复用 loadTreeChildren 入口, 显式置 desired=true (展开
-    ///   意图, 见 loadTreeChildren 内 treeDesiredExpanded.set(path, true)).
+    /// - enterTreeMode: 进入链 generation (treeGen += 1 后捕获 enterGen), 旧进入
+    ///   链 (buildTreeShell().then / reveal.then / 持久化 walk 递归续接 / 选中
+    ///   恢复) 全部以 enterGen === treeGen 守卫 — 退出/重进后旧链不得触碰新壳.
     #[test]
     fn browser_js_tree_load_dedup_seam_is_locked() {
         let js = BROWSER_JS;
@@ -1915,7 +1961,11 @@ mod tests {
             "const treePendingLoads = new Map()",
             "const treeDesiredExpanded = new Map()",
             "function treeExpansionIntent(",
+            "function treeLoadMayCommit(",
             "function loadTreeChildren(",
+            "function convertTreeLeaf(",
+            "function installTreeChildren(",
+            "function ensureTreeChildrenInstalled(",
             "treePendingLoads.clear()",
             "treeDesiredExpanded.clear()",
         ] {
@@ -1945,71 +1995,114 @@ mod tests {
             1,
             "单条加载路径只允许一个 fetch 调用点 (去重契约)"
         );
-        // 意图显式置 true (reveal/persist 复用同一入口即表达展开).
+        // 意图显式置 true 只在无既有意图时 (reveal/persist 复用同一入口即表达
+        // 展开, 但绝不覆盖显式/用户意图 — 在途翻转的 false 必须保留).
+        assert!(
+            load.contains("if (!treeDesiredExpanded.has(path))"),
+            "发起加载必须仅在无既有意图时置展开意图"
+        );
         assert!(
             load.contains("treeDesiredExpanded.set(path, true)"),
-            "发起加载必须显式置展开意图"
+            "展开意图置位必须存在"
         );
-        // 缓存命中分支: 替换前先清被替换子树内的选中.
+        // 缓存命中分支: 先经提交决策 (陈旧导航只取缓存结果, 不动 DOM), 再经
+        // installTreeChildren 唯一替换点.
         let cache_start = load
             .find("if (treeCache.has(path)) {")
             .expect("缓存命中分支存在");
         let cache_end = load
-            .find("return Promise.resolve();")
-            .expect("缓存分支返回存在");
+            .find("const inFlight = treePendingLoads.get(path)")
+            .expect("在途分支位于缓存命中分支之后");
         let cache_branch = &load[cache_start..cache_end];
-        let cache_clear_at = cache_branch
-            .find("clearTreeSelection();")
-            .expect("缓存分支替换前清除选中");
-        let cache_replace_at = cache_branch
-            .find("ul.replaceChildren(...treeCache.get(path))")
-            .expect("缓存分支替换子项");
         assert!(
-            cache_clear_at < cache_replace_at,
-            "缓存分支: 必须先清除被替换子树内的选中再 replaceChildren"
+            cache_branch.contains("treeLoadMayCommit("),
+            "缓存分支必须先经提交决策 (陈旧导航只取缓存结果, 不提交 DOM)"
         );
-        // 异步分支: 旧壳守卫 → 缓存写入 → 清除选中 → 替换 → 意图终态.
+        assert!(
+            cache_branch.contains("installTreeChildren(li, path)"),
+            "缓存分支替换必须经 installTreeChildren 唯一替换点"
+        );
+        // 异步分支: 壳/进入链守卫 → 缓存写入 → 导航守卫 → 唯一替换点.
         let finally_at = load
             .find(".finally(function () {")
             .expect("owner finally 清理存在");
         let async_branch = &load[fetch_at..finally_at];
         let gen_at = async_branch
-            .find("if (gen !== treeGen) return;")
+            .find("gen !== treeGen")
             .expect("旧壳 generation 守卫存在");
         let cache_set_at = async_branch
             .find("treeCache.set(path, nodes)")
             .expect("缓存写入存在");
-        let async_clear_at = async_branch
-            .find("clearTreeSelection();")
-            .expect("异步分支替换前清除选中");
-        let async_replace_at = async_branch
-            .find("ul.replaceChildren(...nodes)")
-            .expect("异步分支替换子项");
-        let intent_at = async_branch
-            .find("setTreeNodeExpanded(li, treeDesiredExpanded.get(path) !== false)")
-            .expect("终态必须跟随最新意图");
+        let nav_guard_at = async_branch
+            .find("navRequired && !paneNavGuard.isCurrent(navGen)")
+            .expect("导航所有权守卫存在");
+        let install_at = async_branch
+            .find("installTreeChildren(li, path)")
+            .expect("异步分支经唯一替换点提交");
         assert!(
-            gen_at < cache_set_at
-                && cache_set_at < async_clear_at
-                && async_clear_at < async_replace_at
-                && async_replace_at < intent_at,
-            "异步分支顺序: 旧壳守卫 → 缓存写入 → 清选中 → 替换 → 意图终态"
+            gen_at < cache_set_at && cache_set_at < nav_guard_at && nav_guard_at < install_at,
+            "异步分支顺序: 壳守卫 → 缓存写入 → 导航守卫 → 唯一替换点"
         );
-        // owner 清理: finally 内先比对条目身份, 再删在途与意图.
+        // owner 清理: finally 内先比对在途条目身份, 再删在途条目; 意图条目
+        // (desired) 属壳级状态, finally 绝不删除 (只在退出/叶子化清除).
         let owner_cmp_at = load
             .find("treePendingLoads.get(path) === pending")
             .expect("owner 身份比对存在");
         let pending_del_at = load
             .find("treePendingLoads.delete(path)")
             .expect("删除在途条目存在");
-        let desired_del_at = load
-            .find("treeDesiredExpanded.delete(path)")
-            .expect("删除意图条目存在");
         assert!(
-            finally_at < owner_cmp_at
-                && owner_cmp_at < pending_del_at
-                && pending_del_at < desired_del_at,
-            "owner 清理顺序: finally → 身份比对 → 删在途 → 删意图"
+            finally_at < owner_cmp_at && owner_cmp_at < pending_del_at,
+            "owner 清理顺序: finally → 身份比对 → 删在途"
+        );
+        assert!(
+            !load.contains("treeDesiredExpanded.delete"),
+            "loadTreeChildren 内绝不删除意图条目 (desired 只在退出/叶子化清除)"
+        );
+        // convertTreeLeaf: 空目录 → 终端叶子契约 (无子项无展开语义, 未来
+        // click/ArrowRight 经 isExpandableDir 短路, 零请求).
+        let leaf_start = js
+            .find("function convertTreeLeaf(")
+            .expect("convertTreeLeaf 存在");
+        let leaf_end = js
+            .find("function installTreeChildren(")
+            .expect("installTreeChildren 位于 convertTreeLeaf 之后");
+        let leaf = &js[leaf_start..leaf_end];
+        for needle in [
+            "li.dataset.treeExpandable = '0'",
+            "li.removeAttribute('aria-expanded')",
+            "twist.textContent = ''",
+            "ul.remove()",
+            "treeExpandedPaths.splice(idx, 1)",
+            "treeDesiredExpanded.delete(path)",
+        ] {
+            assert!(
+                leaf.contains(needle),
+                "convertTreeLeaf 缺少叶子化契约: {needle}"
+            );
+        }
+        // installTreeChildren: 唯一替换点 — 替换前清被替换子树内的选中,
+        // 终态跟随最新意图.
+        let inst_start = js
+            .find("function installTreeChildren(")
+            .expect("installTreeChildren 存在");
+        let inst_end = js
+            .find("function ensureTreeChildrenInstalled(")
+            .expect("ensureTreeChildrenInstalled 位于 installTreeChildren 之后");
+        let inst = &js[inst_start..inst_end];
+        let inst_clear_at = inst
+            .find("clearTreeSelection();")
+            .expect("唯一替换点替换前清除选中");
+        let inst_replace_at = inst
+            .find("ul.replaceChildren(")
+            .expect("唯一替换点替换子项");
+        assert!(
+            inst_clear_at < inst_replace_at,
+            "唯一替换点: 必须先清除被替换子树内的选中再 replaceChildren"
+        );
+        assert!(
+            inst.contains("treeDesiredExpanded.get(path) !== false"),
+            "终态必须跟随最新意图 (绝不盲目 true)"
         );
         // toggleTreeNode: 在途只翻转意图, 不发起第二个请求; 非在途按可见态.
         let toggle_end = js
@@ -2023,6 +2116,27 @@ mod tests {
         assert!(
             toggle.contains("if (pending) return;"),
             "在途 toggle 必须直接返回 (绝不发起第二个请求)"
+        );
+        // enterTreeMode: 先递增树壳 generation 再捕获 enterGen; 进入链每处异步
+        // 边界后 (buildTreeShell().then / reveal.then / walk 递归续接 / 选中恢复)
+        // 都必须以 enterGen === treeGen 守卫 — 旧进入链不得触碰新壳全局.
+        let enter_start = js
+            .find("function enterTreeMode()")
+            .expect("enterTreeMode 存在");
+        let enter_end = js
+            .find("function exitTreeMode()")
+            .expect("exitTreeMode 位于 enterTreeMode 之后");
+        let enter = &js[enter_start..enter_end];
+        let inc_at = enter
+            .find("treeGen += 1")
+            .expect("进入链递增树壳 generation");
+        let enter_gen_at = enter
+            .find("const enterGen = treeGen")
+            .expect("进入链捕获 enterGen");
+        assert!(inc_at < enter_gen_at, "必须先递增再捕获 enterGen");
+        assert!(
+            enter.matches("enterGen !== treeGen").count() >= 4,
+            "进入链每处异步边界后都必须有 enterGen 守卫 (buildTreeShell.then / reveal.then / walk 续接 / 选中恢复)"
         );
         // exitTreeMode: 清空在途与意图表 (随树缓存整体销毁).
         let exit_start = js

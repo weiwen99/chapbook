@@ -910,41 +910,107 @@
     return expanded ? false : true;
   }
 
+  // 树加载提交决策纯函数 (DOM 无关 seam): 提交 DOM/展开/持久化前必须通过 —
+  // 壳当前 (shellCurrent) 恒必需; 带导航所有权 (navRequired, reveal/sync 链)
+  // 时还须导航当前 (navCurrent); 显式用户调用 (无导航所有权) 只要求壳当前.
+  // 缓存结果共享不受此约束 (陈旧导航可复用结果, 但不得提交 DOM).
+  function treeLoadMayCommit(shellCurrent, navRequired, navCurrent) {
+    if (!shellCurrent) return false;
+    return !navRequired || navCurrent;
+  }
+
+  // 空目录响应: li 转为终端叶子 — 无子项无展开语义, 未来 click/ArrowRight 经
+  // isExpandableDir 直接短路, 不再发起请求/翻转意图. 移除 group/展开属性与
+  // 持久化展开, 意图随叶子删除 (空目录不保留展开状态).
+  function convertTreeLeaf(li, path) {
+    const ul = li.querySelector(':scope > ul.cb-tree-children');
+    // 叶子化移除的子树内若含选中节点: 先清选中与 aria-activedescendant
+    if (ul && treeSelectedEl && ul.contains(treeSelectedEl)) {
+      clearTreeSelection();
+    }
+    li.dataset.treeExpandable = '0';
+    li.removeAttribute('aria-expanded');
+    const twist = li.querySelector(':scope > .cb-tree-row .cb-tree-twist');
+    if (twist) twist.textContent = '';
+    if (ul) ul.remove(); // 子 role=group 一并移除: 叶子不得携带 group 语义
+    const idx = treeExpandedPaths.indexOf(path);
+    if (idx >= 0) {
+      treeExpandedPaths.splice(idx, 1);
+      saveJsonArray(TREE_EXPANDED_KEY, treeExpandedPaths);
+    }
+    treeDesiredExpanded.delete(path);
+  }
+
+  // 唯一子项替换点: 把缓存子项安装进 li (缓存命中与异步响应共用). 空缓存 →
+  // 叶子化; 替换前先清除被替换子树内的选中 (aria-activedescendant 同步移除);
+  // 终态跟随最新意图 (在途期间可翻转表达收起), 绝不盲目 true.
+  function installTreeChildren(li, path) {
+    const cached = treeCache.get(path);
+    if (!cached) return;
+    if (cached.length === 0) {
+      convertTreeLeaf(li, path);
+      return;
+    }
+    const ul = childrenUlFor(li);
+    if (treeSelectedEl && ul.contains(treeSelectedEl)) {
+      clearTreeSelection();
+    }
+    ul.replaceChildren(...cached);
+    setTreeNodeExpanded(li, treeDesiredExpanded.get(path) !== false);
+  }
+
+  // 共享在途结果的续接方提交: 响应可能因发起方所有权陈旧只写缓存未动 DOM —
+  // 续接方所有权当前时补齐安装; 已安装 (子项非空) 则跳过, 保证同一 DOM/壳内
+  // 只有一个调用方执行 replaceChildren.
+  function ensureTreeChildrenInstalled(li, path) {
+    if (!treeCache.has(path)) return;
+    const ul = li.querySelector(':scope > ul.cb-tree-children');
+    if (ul && ul.childElementCount > 0) return;
+    installTreeChildren(li, path);
+  }
+
   // 懒加载目录子项; 失败静默 (网络/服务端错误不留半展开态). 同一目录路径只
   // 允许一个在途请求: 重复激活返回同一 Promise, 绝不二次 fetch; 在途期间的
   // 最新意图 (treeDesiredExpanded) 决定响应落地时的终态, 绝不盲目展开.
-  function loadTreeChildren(li, path) {
+  // owner 传调用方所有权: { navGen } (reveal/sync 导航链) 或 { enterGen }
+  // (进入链持久化展开) — 响应落地时导航/进入链已过期则只共享缓存结果, 不
+  // 提交 DOM/展开/持久化; 无 owner (显式用户调用) 可采纳共享在途结果.
+  function loadTreeChildren(li, path, owner) {
     const gen = treeGen;
+    const navGen = owner && typeof owner.navGen === 'number' ? owner.navGen : undefined;
+    const enterGen = owner && typeof owner.enterGen === 'number' ? owner.enterGen : undefined;
+    const navRequired = navGen !== undefined;
+    const navCurrent = navRequired && paneNavGuard.isCurrent(navGen);
     if (treeCache.has(path)) {
-      const ul = childrenUlFor(li);
-      // 被替换子树内的选中节点即将脱离 DOM: 先清除选中与 aria-activedescendant
-      if (treeSelectedEl && ul.contains(treeSelectedEl)) {
-        clearTreeSelection();
+      // 缓存结果可共享: 陈旧导航/进入链只取结果, 不提交 DOM/展开/持久化
+      if (!treeLoadMayCommit(enterGen === undefined || enterGen === treeGen, navRequired, navCurrent)) {
+        return Promise.resolve();
       }
-      ul.replaceChildren(...treeCache.get(path));
-      setTreeNodeExpanded(li, true);
-      treeDesiredExpanded.set(path, true);
+      if (!treeDesiredExpanded.has(path)) {
+        treeDesiredExpanded.set(path, true); // reveal/persist 复用同一入口即表达展开
+      }
+      installTreeChildren(li, path);
       return Promise.resolve();
     }
     const inFlight = treePendingLoads.get(path);
     if (inFlight) {
-      treeDesiredExpanded.set(path, true); // 在途: 复用同一请求, 刷新展开意图
+      if (!treeDesiredExpanded.has(path)) {
+        treeDesiredExpanded.set(path, true); // 在途: 复用同一请求, 刷新展开意图
+      }
       return inFlight;
     }
-    treeDesiredExpanded.set(path, true); // reveal/persist 复用同一入口即表达展开
+    if (!treeDesiredExpanded.has(path)) {
+      treeDesiredExpanded.set(path, true); // reveal/persist 复用同一入口即表达展开
+    }
     const pending = fetchTreeEntries(path).then(
       function (entries) {
-        if (gen !== treeGen) return; // 旧壳在途响应: 不得触碰新壳 DOM/缓存
+        // 旧壳/旧进入链在途响应: 不得写缓存、不得触碰新壳 DOM
+        if (gen !== treeGen || (enterGen !== undefined && enterGen !== treeGen)) return;
         const nodes = entries.map(buildTreeNode);
-        treeCache.set(path, nodes);
-        const ul = childrenUlFor(li);
-        // 被替换子树内的选中节点即将脱离 DOM: 先清除选中与 aria-activedescendant
-        if (treeSelectedEl && ul.contains(treeSelectedEl)) {
-          clearTreeSelection();
-        }
-        ul.replaceChildren(...nodes);
-        // 终态跟随最新意图 (在途期间可被翻转表达收起), 绝不盲目 true
-        setTreeNodeExpanded(li, treeDesiredExpanded.get(path) !== false);
+        treeCache.set(path, nodes); // 结果可共享: 缓存先于所有权提交
+        // 导航所有权: 陈旧导航只共享缓存结果, 不提交 DOM/展开/持久化
+        if (navRequired && !paneNavGuard.isCurrent(navGen)) return;
+        installTreeChildren(li, path);
       },
       function () {
         /* 加载失败: 不标记展开, 下次点击重试 */
@@ -953,11 +1019,11 @@
     treePendingLoads.set(path, pending);
     pending.finally(function () {
       // 条目只由 owner Promise 清理: 先比对在途条目身份 (恒为本 Promise),
-      // 再删在途与意图条目 — 重复激活复用同一 pending, 绝不误删
+      // 再删在途条目 — 重复激活复用同一 pending, 绝不误删; 意图 (desired)
+      // 属壳级状态, 持久到退出树模式/叶子化才清除, finally 绝不删除.
       if (treePendingLoads.get(path) === pending) {
         treePendingLoads.delete(path);
       }
-      treeDesiredExpanded.delete(path);
     });
     return pending;
   }
@@ -1091,12 +1157,18 @@
   // 展开并定位当前 URL 路径: 逐段匹配节点 (按 href, 不分目录/文件), 匹配即标
   // current; 可展开目录继续下钻, 环/非 UTF-8 目录或文件处终止. 解析为最深节点.
   function revealPath(segments, gen) {
+    const shellGen = treeGen; // 链级壳守卫: 退出/重进后旧链路立即终止
     let parentUl = treeRootUl;
     let lastNode = null;
     let promise = Promise.resolve();
     segments.forEach(function (seg, i) {
       const href = '/' + segments.slice(0, i + 1).join('/');
       promise = promise.then(function () {
+        // 旧壳链路: 立即终止 (退出/重进后不得触碰新壳 DOM)
+        if (shellGen !== treeGen) {
+          parentUl = null;
+          return;
+        }
         // 陈旧导航的链路不得继续标记 (single-active-navigation)
         if (gen !== undefined && !paneNavGuard.isCurrent(gen)) return;
         if (!parentUl) return;
@@ -1112,7 +1184,15 @@
             parentUl = null;
             return;
           }
-          return loadTreeChildren(node, path).then(function () {
+          // 导航所有权随加载传递: 陈旧导航响应只共享缓存结果
+          return loadTreeChildren(node, path, { navGen: gen }).then(function () {
+            if (shellGen !== treeGen) {
+              parentUl = null;
+              return;
+            }
+            // 续接方所有权当前才补齐安装 (发起方陈旧时响应只写缓存)
+            if (gen !== undefined && !paneNavGuard.isCurrent(gen)) return;
+            ensureTreeChildrenInstalled(node, path);
             parentUl = node.querySelector(':scope > ul.cb-tree-children');
           });
         }
@@ -1120,6 +1200,8 @@
       });
     });
     return promise.then(function () {
+      // 旧壳链路: 显式陈旧哨兵 (调用方不得按成功处理)
+      if (shellGen !== treeGen) return null;
       // 只有最深匹配节点标 current (祖先只展开, 不高亮)
       if (gen !== undefined && !paneNavGuard.isCurrent(gen)) return lastNode;
       if (lastNode) lastNode.classList.add('cb-current');
@@ -1983,7 +2065,12 @@
       });
     }
   }
+
   function enterTreeMode() {
+    // 新壳开始: 递增使旧壳在途响应全部失效 (exit 已递增; 此处确保首入与连续
+    // 进出间的任何在途响应都追不上新壳), 进入链 generation 即此值.
+    treeGen += 1;
+    const enterGen = treeGen;
     // 完整页 spy 观察原正文: pane fragment 替换后目标脱离 DOM — 先断开
     if (fullPageSpyDisposer) {
       fullPageSpyDisposer();
@@ -2032,6 +2119,8 @@
     createPane();
     paneInitialLoad();
     buildTreeShell().then(function () {
+      // 旧进入链 (退出/重进后): 新壳已接管, 不得触碰新全局
+      if (enterGen !== treeGen) return;
       // 启动期根 JSON 延迟时, 用户可能已通过 pane 迷你列表完成导航: 以最新
       // 已提交导航为准重同步树状态 (启动链的旧 generation 标记/选中不覆盖).
       if (
@@ -2052,6 +2141,7 @@
       return reveal.then(function () {
       // 先完成当前路径展开与持久化展开 (异步逐级加载), 再恢复选中 — 否则
       // 深层节点尚不存在, 选中恢复必然落空.
+      if (enterGen !== treeGen) return;
       const persisted = treeExpandedPaths.filter(isValidEncodedPath);
       const walks = persisted.map(function (path) {
           const segments = path.split('/');
@@ -2070,7 +2160,11 @@
             if (!node) return Promise.resolve();
             const nodePathV = encodedPathOf(node);
             if (nodePathV === null) return Promise.resolve();
-            return loadTreeChildren(node, nodePathV).then(function () {
+            // 进入链所有权随加载传递: 退出/重进后旧链响应不得提交
+            return loadTreeChildren(node, nodePathV, { enterGen: enterGen }).then(function () {
+              // 旧进入链续接: 退出/重进后不得继续遍历新壳 DOM
+              if (enterGen !== treeGen) return Promise.resolve();
+              ensureTreeChildrenInstalled(node, nodePathV);
               return walk(
                 node.querySelector(':scope > ul.cb-tree-children'),
                 segs.slice(1),
@@ -2083,6 +2177,8 @@
         return Promise.all(walks);
       });
     }).then(function () {
+      // 旧进入链 (退出/重进后): 不得恢复选中
+      if (enterGen !== treeGen) return;
       // 启动链的选中恢复只属于初始导航 generation: 用户已导航走则不覆盖
       if (paneInitialGen === null || paneNavGuard.isCurrent(paneInitialGen)) {
         restoreTreeSelection();
@@ -2288,12 +2384,16 @@
         event.preventDefault();
         break;
       case 'ArrowRight':
-        // → 只展开 (契约: → 展开 / ← 收起); 已展开则 no-op
+        // → 只展开 (契约: → 展开 / ← 收起); 已展开则 no-op. 显式激活先记录
+        // 展开意图 (覆盖既有收起意图 — 最新用户动作权威), 在途响应终态跟随.
         if (treeSelectedEl && isExpandableDir(treeSelectedEl)) {
           const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
           if (!ul || ul.hidden) {
             const path = encodedPathOf(treeSelectedEl);
-            if (path !== null) loadTreeChildren(treeSelectedEl, path);
+            if (path !== null) {
+              treeDesiredExpanded.set(path, true);
+              loadTreeChildren(treeSelectedEl, path);
+            }
           }
           event.preventDefault();
         }
@@ -2302,6 +2402,8 @@
         if (treeSelectedEl) {
           const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
           if (isDirNode(treeSelectedEl) && ul && !ul.hidden) {
+            const path = encodedPathOf(treeSelectedEl);
+            if (path !== null) treeDesiredExpanded.set(path, false); // 显式收起意图
             setTreeNodeExpanded(treeSelectedEl, false);
           } else {
             const row = treeSelectedEl.closest('ul');
@@ -2392,6 +2494,7 @@
       collapseFocusTarget: collapseFocusTarget,
       treeKeyScope: treeKeyScope,
       treeExpansionIntent: treeExpansionIntent,
+      treeLoadMayCommit: treeLoadMayCommit,
     };
   }
 })();
