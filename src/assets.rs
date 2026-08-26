@@ -255,4 +255,38 @@ mod tests {
             "preventDefault 必须先于关闭面板动作"
         );
     }
+    /// Task 1 行为导向源不变量: canonical transport key seam 必须锁定。
+    /// - 纯函数 canonicalTransportKey 存在, 且位于 actionUrl 之前;
+    /// - 请求路径与 wrapper path 都在 commitPane 中经该 seam 绑定;
+    /// - transport key 构造段不 decode (no-decode action 契约保留);
+    /// - 编码斜杠 `%2F` 必须拒绝 (byte === 0x2f);
+    /// - 经 CommonJS 钩子暴露 (浏览器无全局污染)。
+    #[test]
+    fn browser_js_canonical_transport_binding_seam_is_locked() {
+        let js = BROWSER_JS;
+        for seam in [
+            "function canonicalTransportKey(",
+            "canonicalTransportKey(encodedPath)",
+            "canonicalTransportKey(wrapperPath)",
+        ] {
+            assert!(js.contains(seam), "missing transport seam: {seam}");
+        }
+        let start = js
+            .find("function canonicalTransportKey(")
+            .expect("transport-key function");
+        let end = js[start..]
+            .find("function actionUrl(")
+            .map(|n| start + n)
+            .expect("actionUrl after transport key");
+        let body = &js[start..end];
+        assert!(
+            !body.contains("decodeURIComponent("),
+            "action transport must never decode"
+        );
+        assert!(
+            body.contains("byte === 0x2f"),
+            "encoded slash must be rejected"
+        );
+        assert!(js.contains("canonicalTransportKey: canonicalTransportKey"));
+    }
 }

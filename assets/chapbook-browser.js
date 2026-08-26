@@ -41,6 +41,49 @@
       );
     });
   }
+  const TRANSPORT_LITERAL_ASCII = /^[A-Za-z0-9\-._~!$()*]$/;
+
+  function hexByte(byte) {
+    return '%' + byte.toString(16).toUpperCase().padStart(2, '0');
+  }
+
+  // Canonical comparison key only: never used to construct an action URL.
+  // Literal '/' is the only segment separator; encoded '/' is rejected.
+  function canonicalTransportKey(value) {
+    if (typeof value !== 'string') return null;
+    if (value.length === 0) return '';
+    if (value[0] === '/' || value[value.length - 1] === '/') return null;
+    const out = [];
+    for (const rawSegment of value.split('/')) {
+      if (rawSegment.length === 0) return null;
+      let segment = '';
+      for (let i = 0; i < rawSegment.length; ) {
+        const ch = rawSegment[i];
+        if (ch === '%') {
+          if (i + 2 >= rawSegment.length) return null;
+          const pair = rawSegment.slice(i + 1, i + 3);
+          if (!/^[0-9A-Fa-f]{2}$/.test(pair)) return null;
+          const byte = parseInt(pair, 16);
+          if (byte === 0x2f) return null;
+          const ascii = byte < 0x80 ? String.fromCharCode(byte) : null;
+          segment += ascii && TRANSPORT_LITERAL_ASCII.test(ascii) ? ascii : hexByte(byte);
+          i += 3;
+          continue;
+        }
+        const scalar = String.fromCodePoint(rawSegment.codePointAt(i));
+        const bytes = new TextEncoder().encode(scalar);
+        if (bytes.length === 1 && TRANSPORT_LITERAL_ASCII.test(scalar)) {
+          segment += scalar;
+        } else {
+          bytes.forEach(function (byte) { segment += hexByte(byte); });
+        }
+        i += scalar.length;
+      }
+      if (segment === '.' || segment === '..') return null;
+      out.push(segment);
+    }
+    return out.join('/');
+  }
 
   // 单一 action URL 出口: 不 decode encodedPath, 直接放进 URL pathname;
   // 模式只经 URL.searchParams 添加 (fragment=1 / download=1); Full 无 query。
@@ -1198,14 +1241,20 @@
     const host = document.createElement('div');
     host.innerHTML = html; // 服务端 fragment (与预览面板同一信任契约)
     const wrapper = findFragmentWrapper(host);
-    // 服务端 wrapper identity 是权威 canonical 形态 (深链非规范 percent 编码
-    // 会被服务端规范化, 字节比较会误拒); 合法性仍 fail-closed 校验.
+    // 服务端 wrapper identity 是权威 canonical 形态; transport binding 要求
+    // 请求路径与 wrapper 的 canonical key 精确相等 (均非 null), 否则 fail-closed
+    // — 不接受任意合法 wrapper 路径. canonical key 仅用于比较, 绝不构造 action URL.
     const wrapperPath =
       wrapper && typeof wrapper.dataset.nativePathEncoded === 'string'
         ? wrapper.dataset.nativePathEncoded
         : null;
+    const requestedKey = canonicalTransportKey(encodedPath);
+    const wrapperKey = canonicalTransportKey(wrapperPath);
     const canonicalUrl =
-      wrapperPath !== null && isValidEncodedPath(wrapperPath)
+      requestedKey !== null &&
+      wrapperKey !== null &&
+      requestedKey === wrapperKey &&
+      isValidEncodedPath(wrapperPath)
         ? actionUrl(wrapperPath, 'full')
         : null;
     if (canonicalUrl === null) {
@@ -1735,6 +1784,7 @@
       escapeAction: escapeAction,
       panelTargetForSelection: panelTargetForSelection,
       createGenerationGuard: createGenerationGuard,
+      canonicalTransportKey: canonicalTransportKey,
     };
   }
 })();
