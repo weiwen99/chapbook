@@ -437,21 +437,105 @@ mod tests {
     }
 
     /// 任务 2: 文档布局 seam (installDocLayout 移动 TOC 节点, 不克隆).
+    /// 行为切片到真实函数体 (区别于全局 contains): 幂等查询/节点移动顺序,
+    /// initFullPageTocSpy 与 commitPane 内的生命周期调用顺序.
     #[test]
     fn browser_js_document_layout_seam_is_locked() {
         let js = BROWSER_JS;
+        // installDocLayout: 直系子级已有 layout 直接返回, TOC 原节点先移入 toc 列,
+        // 其余原节点再进 content, 最后整体替换 .cb-doc 子节点.
+        let inst_start = js
+            .find("function installDocLayout(")
+            .expect("installDocLayout 存在");
+        let inst_end = js
+            .find("function installTocSpy(")
+            .expect("installTocSpy 位于 installDocLayout 之后");
+        let inst = &js[inst_start..inst_end];
+        for needle in [
+            "docEl.querySelector(':scope > .cb-doc-layout')",
+            "if (existing) return existing;",
+            "Array.from(docEl.childNodes)",
+            "tocHost.append(tocNav)",
+            "if (node !== tocNav) content.append(node)",
+            "layout.append(tocHost, content)",
+            "docEl.replaceChildren(layout)",
+            "return layout;",
+        ] {
+            assert!(inst.contains(needle), "installDocLayout 必须包含 {needle}");
+        }
+        let append_at = inst
+            .find("tocHost.append(tocNav)")
+            .expect("TOC append 存在");
+        let replace_at = inst
+            .find("docEl.replaceChildren(layout)")
+            .expect("replaceChildren 存在");
+        assert!(
+            append_at < replace_at,
+            "TOC 原节点必须先 append 进 toc 列, 再整体替换 .cb-doc 子节点"
+        );
+        // 类名/函数存在性 (全局契约, 与上面的行为切片互补).
         for seam in [
             "function installDocLayout(",
             "cb-doc-layout",
             "cb-doc-toc",
             "cb-doc-content",
-            "installDocLayout(wrapper.querySelector('.cb-doc'))",
         ] {
             assert!(js.contains(seam), "missing document-layout seam: {seam}");
         }
+
+        // initFullPageTocSpy: 先装布局 (TOC 移入 toc 列), 再取 TOC 节点, 最后装 spy.
+        let spy_start = js
+            .find("function initFullPageTocSpy(")
+            .expect("initFullPageTocSpy 存在");
+        let spy_end = js
+            .find("function installPaneTocSpy(")
+            .expect("installPaneTocSpy 位于 initFullPageTocSpy 之后");
+        let spy = &js[spy_start..spy_end];
+        let layout_at = spy
+            .find("installDocLayout(docEl)")
+            .expect("installDocLayout 调用存在");
+        let nav_at = spy.find("tocNavIn(docEl)").expect("tocNavIn 调用存在");
+        let sniff_at = spy
+            .find("installTocSpy(docEl, tocNav, null)")
+            .expect("installTocSpy 调用存在");
         assert!(
-            js.contains("tocHost.append(tocNav)"),
-            "TOC node must move, not clone"
+            layout_at < nav_at,
+            "initFullPageTocSpy: 先装布局再取 TOC 节点"
+        );
+        assert!(
+            nav_at < sniff_at,
+            "initFullPageTocSpy: 先取 TOC 节点再装 spy"
+        );
+
+        // commitPane: 旧 pane 拆除 < 新 wrapper 就位 < 文档布局 < pane TOC spy.
+        let cp_start = js.find("function commitPane(").expect("commitPane 存在");
+        let cp_end = js
+            .find("function clearTreeCurrent(")
+            .expect("clearTreeCurrent 位于 commitPane 之后");
+        let cp = &js[cp_start..cp_end];
+        let teardown_at = cp
+            .rfind("teardownPane();")
+            .expect("成功路径 teardownPane 存在");
+        let replace_at = cp
+            .find("pane.replaceChildren(wrapper)")
+            .expect("pane.replaceChildren(wrapper) 存在");
+        let layout_call_at = cp
+            .find("installDocLayout(")
+            .expect("installDocLayout 调用存在");
+        let pane_spy_at = cp
+            .find("installPaneTocSpy(wrapper)")
+            .expect("installPaneTocSpy 调用存在");
+        assert!(
+            teardown_at < replace_at,
+            "commitPane: 先拆除旧 observer/媒体再替换内容"
+        );
+        assert!(
+            replace_at < layout_call_at,
+            "commitPane: 新内容就位后才装文档布局"
+        );
+        assert!(
+            layout_call_at < pane_spy_at,
+            "commitPane: 布局就位后才装 TOC spy"
         );
     }
 }

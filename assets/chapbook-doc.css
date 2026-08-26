@@ -152,42 +152,41 @@ html:has(> body.cb-doc-page) {
   .cb-doc pre code span.type, .cb-doc pre code span.variable { color: #ffa657; }
 }
 /* 文档布局 (ticket 02, JS 渐进增强 installDocLayout): TOC 与正文是命名网格的
- * 真实兄弟列 — 正文永不环绕/流入 TOC 列. 宽屏 (≥ 75rem): 内容区 + 右侧 240px
- * TOC 列, TOC sticky 于自身滚动容器 (完整页视口 / pane) 内, 长 TOC 内部滚动.
- * 窄屏: 单列, DOM 序 TOC 在内容前. 无 JS / 无 TOC 文档: wrapper 不建, TOC 保持
- * 顶部卡片. 完整页与片段共用 (宿主无关). */
-.cb-doc-layout,
-.cb-doc-content,
-.cb-doc-toc {
+ * 真实兄弟列 — 正文永不环绕/流入 TOC 列. 窄屏单列 (TOC 在内容前) 是基础规则:
+ * 窄屏无专门媒体查询 (旧分数像素断点查询已删除), 宽屏在 ≥ 75rem 媒体查询内
+ * 覆盖为 内容区 + 右侧 240px TOC 列, TOC sticky 于自身滚动容器 (完整页视口 /
+ * pane) 内, 长 TOC 内部滚动. 正文列 overflow-wrap: anywhere: 长 URL/连续字符
+ * 在列内折行, 绝不横向溢出到 TOC 列; pre/table/KaTeX 保持各自的横向滚动容器
+ * 与 white-space 规则. 无 JS / 无 TOC 文档: wrapper 不建, TOC 保持顶部卡片.
+ * 完整页与片段共用 (宿主无关). */
+.cb-doc-layout {
+  display: grid;
+  grid-template-areas: "toc" "content";
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
 }
-
+.cb-doc-content {
+  grid-area: content;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.cb-doc-toc {
+  grid-area: toc;
+  min-width: 0;
+}
 @media screen and (min-width: 75rem) {
   .cb-doc-layout {
-    display: grid;
     grid-template-areas: "content toc";
     grid-template-columns: minmax(0, 1fr) 240px;
     gap: 20px;
     align-items: start;
   }
-  .cb-doc-content { grid-area: content; }
   .cb-doc-toc {
-    grid-area: toc;
     position: sticky;
     top: 0;
     max-height: calc(100vh - 2rem);
     overflow-y: auto;
   }
-}
-
-@media screen and (max-width: 74.999rem) {
-  .cb-doc-layout {
-    display: grid;
-    grid-template-areas: "toc" "content";
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .cb-doc-toc { grid-area: toc; }
-  .cb-doc-content { grid-area: content; }
 }
 
 /* ---------- 树模式外壳 (chapbook-browser.js) ---------- */

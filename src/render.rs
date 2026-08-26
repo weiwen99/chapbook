@@ -728,6 +728,32 @@ mod tests {
         }
     }
 
+    /// 提取首个 `selector` 后的平衡 `{...}` 规则块 (含嵌套 media 查询), 对真实规则体
+    /// 做敏感断言 — 注释/排版差异不会误报, 同一选择器出现在不同规则时取首个.
+    fn css_block<'a>(css: &'a str, selector: &str) -> &'a str {
+        let at = css
+            .find(selector)
+            .unwrap_or_else(|| panic!("css 必须包含选择器 {selector}"));
+        let open = css[at..]
+            .find('{')
+            .unwrap_or_else(|| panic!("css 选择器 {selector}: 规则块必须含 {{"));
+        let start = at + open;
+        let mut depth = 0usize;
+        for (i, ch) in css[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &css[start..=start + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("css 选择器 {selector}: 未闭合规则块");
+    }
+
     #[test]
     fn dir_page_renders_bdi_label_inside_anchor_for_utf8() {
         let page = dir_page(
@@ -841,14 +867,83 @@ mod tests {
         assert!(css.contains(".cb-doc-page"), "css: {css}");
         // 文档布局 (ticket 02): TOC 是命名网格的兄弟列, 旧 fixed rail (完整页) 与
         // float rail (pane) 必须彻底移除 — 正文不得环绕/流入 TOC 列, rail 不得叠在正文上.
+        // 规则块切片断言 (非全局 contains): 窄屏单列是基础规则, 宽屏 (≥ 75rem)
+        // 覆盖为 内容区 + 右侧 240px TOC 列.
+        let layout_rule = css_block(css, ".cb-doc-layout {");
         assert!(
-            css.contains("grid-template-areas: \"content toc\""),
-            "css: {css}"
+            layout_rule.contains("display: grid"),
+            "base layout rule must be a grid: {layout_rule}"
         );
-        assert!(css.contains("grid-area: content"), "css: {css}");
-        assert!(css.contains("grid-area: toc"), "css: {css}");
         assert!(
-            !css.contains("float: right"),
+            layout_rule.contains("grid-template-areas: \"toc\" \"content\""),
+            "narrow single-column grid must be the base rule: {layout_rule}"
+        );
+        assert!(
+            layout_rule.contains("grid-template-columns: minmax(0, 1fr)"),
+            "base layout rule: {layout_rule}"
+        );
+        assert!(
+            layout_rule.contains("min-width: 0"),
+            "base layout rule: {layout_rule}"
+        );
+        let content_rule = css_block(css, ".cb-doc-content {");
+        assert!(
+            content_rule.contains("grid-area: content"),
+            "content rule: {content_rule}"
+        );
+        assert!(
+            content_rule.contains("min-width: 0"),
+            "content rule: {content_rule}"
+        );
+        assert!(
+            content_rule.contains("overflow-wrap: anywhere"),
+            "long unbroken prose/URL must wrap inside the content column: {content_rule}"
+        );
+        let toc_rule = css_block(css, ".cb-doc-toc {");
+        assert!(toc_rule.contains("grid-area: toc"), "toc rule: {toc_rule}");
+        assert!(toc_rule.contains("min-width: 0"), "toc rule: {toc_rule}");
+        assert!(
+            !toc_rule.contains("position: fixed") && !toc_rule.contains("float"),
+            "base TOC rule must not be fixed/float: {toc_rule}"
+        );
+        let wide_rule = css_block(css, "@media screen and (min-width: 75rem)");
+        assert!(
+            wide_rule.contains("grid-template-areas: \"content toc\""),
+            "wide layout must be content-left toc-right: {wide_rule}"
+        );
+        assert!(
+            wide_rule.contains("grid-template-columns: minmax(0, 1fr) 240px"),
+            "wide TOC column must be 240px: {wide_rule}"
+        );
+        assert!(
+            wide_rule.contains("gap: 20px") && wide_rule.contains("align-items: start"),
+            "wide layout must set gap/align-items: {wide_rule}"
+        );
+        let wide_toc_rule = css_block(wide_rule, ".cb-doc-toc {");
+        assert!(
+            wide_toc_rule.contains("position: sticky") && wide_toc_rule.contains("top: 0"),
+            "wide TOC must be sticky at top: {wide_toc_rule}"
+        );
+        assert!(
+            wide_toc_rule.contains("overflow-y: auto"),
+            "wide TOC must scroll internally: {wide_toc_rule}"
+        );
+        assert!(
+            wide_toc_rule.contains("max-height: calc(100vh - 2rem)"),
+            "wide TOC scroll height must be viewport-capped: {wide_toc_rule}"
+        );
+        assert!(
+            !wide_toc_rule.contains("position: fixed") && !wide_toc_rule.contains("float"),
+            "wide TOC rule must not be fixed/float: {wide_toc_rule}"
+        );
+        // 旧 max-width: 74.999rem 窄屏查询必须移除 (74.999 vs 75rem 交界处产生
+        // 分数像素空洞), 窄屏是基础规则, 宽屏只在 ≥ 75rem 覆盖.
+        assert!(
+            !css.contains("74.999rem"),
+            "legacy `max-width: 74.999rem` narrow query must be gone: {css}"
+        );
+        assert!(
+            !css.contains("float"),
             "TOC must not float over document text: {css}"
         );
         // 旧 fixed rail (完整页) 的组合/拆分选择器不允许回归: 早期版本同时使用
