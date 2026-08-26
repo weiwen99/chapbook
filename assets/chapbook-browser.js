@@ -1066,14 +1066,19 @@
       // 清理只由 owner Promise 执行: 先比对在途条目身份 (恒为本 Promise) —
       // 旧壳/旧链的 finally 不得删除新壳注册的条目与意图. 成功响应已由安装方
       // (installTreeChildren) 在落地终态后消费意图 (desired + 显式标记);
-      // 此处只在失败响应 (无缓存, 无安装方) 时兜底删除 — 续接方 (inFlight.then)
-      // 注册晚于本 finally, 若在此无条件删除意图, 续接方将读到已清除的意图
-      // (折叠意图丢失).
+      // 此处兜底只清无消费方的意图: 失败响应 (无缓存, 无安装方) 删 desired +
+      // 显式标记; 成功落地但无安装方 (陈旧导航只写缓存未落 DOM) 时, 无显式
+      // 标记则删默认 nav/reveal desired — 后续缓存命中会重新置默认展开, 无
+      // 行为损失; 有显式标记则保留 — 续接方 (inFlight.then) 注册晚于本
+      // finally, 若在此无条件删除, 续接方将读到已清除的意图 (折叠意图丢失),
+      // 显式意图由当前 ownerless 续接方安装时经 installTreeChildren 一并消费.
       if (treePendingLoads.get(path) === pending) {
         treePendingLoads.delete(path);
         if (!treeCache.has(path)) {
           treeDesiredExpanded.delete(path);
           treeUserExpansionIntent.delete(path);
+        } else if (!treeUserExpansionIntent.has(path)) {
+          treeDesiredExpanded.delete(path);
         }
       }
     });
@@ -2242,11 +2247,11 @@
           )
         : Promise.resolve();
       return reveal.then(function () {
-      // 先完成当前路径展开与持久化展开 (异步逐级加载), 再恢复选中 — 否则
-      // 深层节点尚不存在, 选中恢复必然落空.
-      if (enterGen !== treeGen) return;
-      const persisted = treeExpandedPaths.filter(isValidEncodedPath);
-      const walks = persisted.map(function (path) {
+        // 先完成当前路径展开与持久化展开 (异步逐级加载), 再恢复选中 — 否则
+        // 深层节点尚不存在, 选中恢复必然落空.
+        if (enterGen !== treeGen) return;
+        const persisted = treeExpandedPaths.filter(isValidEncodedPath);
+        const walks = persisted.map(function (path) {
           const segments = path.split('/');
           // 前缀正向遍历: 先在当前层找首个 segment, 展开后携带前缀下钻,
           // 绝不反向切片 (saved 'a/b' 必须先匹配 /a 再匹配 /a/b).

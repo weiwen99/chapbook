@@ -2036,8 +2036,11 @@ mod tests {
     ///   陈旧时 (如陈旧导航) 响应只写缓存不落 DOM, 本调用方所有权当前则补齐
     ///   安装 (ensureTreeChildrenInstalled), 绝不 bare-return 发起方 Promise;
     ///   清理只由 owner Promise 在 finally 执行: 先比对在途条目身份, 同一
-    ///   owner 块内删除在途条目; 失败响应 (无缓存无安装方) 才由 finally 兜底
-    ///   删除意图与显式标记 (旧壳 finally 比对失败时不得触碰新壳条目);
+    ///   owner 块内删除在途条目; 兜底只清无消费方的意图 — 失败响应 (无缓存
+    ///   无安装方) 删 desired + 显式标记; 成功落地但无安装方 (陈旧导航只写
+    ///   缓存) 无显式标记时删默认 nav/reveal desired (后续缓存命中重新置默认
+    ///   展开, 无行为损失), 有显式标记则保留给当前 ownerless 续接方安装时
+    ///   消费 (旧壳 finally 比对失败时不得触碰新壳条目);
     /// - convertTreeLeaf: 空目录响应 → 终端叶子 — treeExpandable='0'、移除
     ///   aria-expanded、清 twist、移除子 role=group、持久化展开全部重复条目
     ///   过滤并保存、删除意图与显式标记 (未来 click/ArrowRight 经
@@ -2170,9 +2173,13 @@ mod tests {
         );
         // owner 清理: finally 内先比对在途条目身份, owner 块内删在途条目;
         // 意图由安装方 (installTreeChildren) 在落地终态后消费 (续接方晚于
-        // finally 注册, finally 不得抢先清除意图 — 否则折叠意图丢失), 失败
-        // 响应 (无缓存无安装方) 才由 finally 兜底删除; 旧壳 finally 比对失败
-        // 时不得触碰新壳注册的条目与意图.
+        // finally 注册, finally 不得抢先清除意图 — 否则折叠意图丢失), 兜底
+        // 只清无消费方的意图; 旧壳 finally 比对失败时不得触碰新壳注册的条目
+        // 与意图. 兜底按结果分派: 失败响应 (无缓存, 无安装方) 删 desired +
+        // 显式标记; 成功落地但无安装方 (陈旧导航只写缓存未落 DOM) 时, 无显式
+        // 标记则删默认 nav/reveal desired — 后续缓存命中会重新置默认展开,
+        // 无行为损失; 有显式标记则保留, 由当前 ownerless 续接方安装时经
+        // installTreeChildren 一并消费.
         let owner_cmp_at = load
             .find("treePendingLoads.get(path) === pending")
             .expect("owner 身份比对存在");
@@ -2181,25 +2188,31 @@ mod tests {
             .expect("删除在途条目存在");
         let cache_check_at = load
             .find("if (!treeCache.has(path)) {")
-            .expect("意图兜底删除必须限定失败响应 (无缓存)");
+            .expect("兜底分派必须限定失败响应 (无缓存) 分支");
         let desired_del_at = load
             .find("treeDesiredExpanded.delete(path)")
             .expect("删除意图条目存在 (失败响应兜底)");
         let explicit_del_at = load
             .find("treeUserExpansionIntent.delete(path)")
             .expect("删除显式标记存在 (失败响应兜底)");
+        let marker_guard_at = load
+            .find("} else if (!treeUserExpansionIntent.has(path)) {")
+            .expect("成功落地无安装方: 无显式标记才删默认 desired (陈旧导航默认意图不留残留)");
         assert!(
             finally_at < owner_cmp_at
                 && owner_cmp_at < pending_del_at
                 && pending_del_at < cache_check_at
                 && cache_check_at < desired_del_at
-                && desired_del_at < explicit_del_at,
-            "owner 清理顺序: finally → 身份比对 → 删在途 → 无缓存才兜底删意图 + 显式标记"
+                && desired_del_at < explicit_del_at
+                && explicit_del_at < marker_guard_at,
+            "owner 清理顺序: finally → 身份比对 → 删在途 → 无缓存兜底删意图+显式标记 → 有缓存无显式标记删默认 desired"
         );
+        // 两条 desired 删除路径: 失败响应 (无缓存) 与成功落地无安装方 (陈旧
+        // 导航, 无显式标记) — 默认 nav/reveal desired 绝不残留到壳生命周期.
         assert_eq!(
             load.matches("treeDesiredExpanded.delete").count(),
-            1,
-            "意图删除只出现在 owner 块内 (loadTreeChildren 内无其他删除)"
+            2,
+            "意图删除两条兜底路径 (失败无缓存 + 成功无安装方无显式标记), 且只出现在 owner 块内"
         );
         // convertTreeLeaf: 空目录 → 终端叶子契约 (无子项无展开语义, 未来
         // click/ArrowRight 经 isExpandableDir 短路, 零请求).
