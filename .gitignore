@@ -18,6 +18,7 @@ result
 .cursor/
 .codex/
 .superpowers/
+/.worktrees/
 
 # 系统文件
 .DS_Store
