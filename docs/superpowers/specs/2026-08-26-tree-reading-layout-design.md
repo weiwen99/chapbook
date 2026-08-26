@@ -121,12 +121,12 @@ scrollbar-width: none;
 
 WebKit additionally hides `::-webkit-scrollbar`. Mouse-wheel, touchpad, touch and keyboard scrolling remain available. Only the scrollbar chrome disappears.
 
-The wide tree viewport is keyboard-focusable and exposes tree semantics:
+The scroll viewport remains `<nav class="cb-tree" aria-label="目录树">`, while the actual tree widget is the focusable root list:
 
-- `<nav role="tree" tabindex="0" aria-label="目录树">`
+- `<ul class="cb-tree-root" role="tree" tabindex="0">`
 - rows use `role="treeitem"` and nested lists use `role="group"`
-- the current programmatic-only `tabIndex = -1` is replaced
-- after Tab focuses the viewport, Arrow-key tree navigation plus PageUp/PageDown scrolling remain discoverable without a visible scrollbar
+- the current programmatic-only `treeNav.tabIndex = -1` is removed
+- after Tab focuses `.cb-tree-root`, Arrow-key tree navigation plus PageUp/PageDown scrolling remain discoverable without a visible scrollbar
 
 ## Manual Reading Collapse
 
@@ -158,7 +158,7 @@ A shared pure function produces a canonical transport comparison key, segment by
 1. Split only on literal `/`; never decode separators.
 2. Reject malformed `%HH`, encoded slash (`%2F`) and dot-segment forms after normalization. Encoded backslash (`%5C`) remains valid: on the Unix server `\` is a literal filename byte, not a separator.
 3. Normalize valid `%HH` hex to uppercase.
-4. Decode percent-encoded RFC 3986 unreserved ASCII into literal characters.
+4. Decode percent-encoded server-retained ASCII (`A-Z`, `a-z`, digits, `-._~!$()*`) into the literal character.
 5. Keep reserved bytes percent-encoded and uppercase.
 6. Encode literal Unicode as uppercase UTF-8 percent bytes.
 7. Encode the exact server ASCII path set, including space, `%`, `+`, `#`, `?`, `&`, `=`, quotes, brackets and backslash.
@@ -189,7 +189,7 @@ This covers noncanonical `%41`, mixed-case escapes, literal Unicode, literal `+`
 
 - Drag to minimum/maximum, release outside the handle, reload, and verify persistence.
 - Resize by separator keyboard controls and verify ARIA values.
-- Hidden tree scrollbar with wheel, touchpad and keyboard scrolling still functional after Tab focuses the `role="tree"` viewport.
+- Hidden tree scrollbar with wheel, touchpad and keyboard scrolling still functional after Tab focuses `.cb-tree-root[role="tree"]`.
 - Directory first click expands exactly once; file first click opens exactly once; double-click creates no second action.
 - Wide TOC is a true sibling column; long text never enters beneath it.
 - Narrow DOM and visual order are TOC then content.
