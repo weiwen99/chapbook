@@ -458,6 +458,9 @@ Install pointer handlers with pointer capture:
     let resizeStartX = 0;
     let resizeStartWidth = 0;
     treeResizer.addEventListener('pointerdown', function (event) {
+      // 折叠按钮是 separator 子节点: click.stopPropagation() 太晚,
+      // 必须在 pointerdown 阶段阻止它启动 resize/pointer capture.
+      if (event.target.closest('.cb-tree-collapse')) return;
       resizeStartX = event.clientX;
       resizeStartWidth = treeWidth;
       treeResizer.setPointerCapture(event.pointerId);
@@ -717,7 +720,7 @@ body.cb-tree-mode.cb-tree-collapsed .cb-tree-restore { display: block; }
 
 - [ ] **Step 5: Verify and commit**
 
-Chromium: collapse/restore, reload persistence, saved width restoration, focus never remains in hidden tree, and the full transition matrix: wide collapsed → narrow drawer opens normally → wide reapplies the persisted collapsed preference.
+Chromium: collapse/restore, reload persistence, saved width restoration, focus never remains in hidden tree, collapse button pointerdown never starts resize or writes `cb-tree-width`, and the full transition matrix: wide collapsed → narrow drawer opens normally → wide reapplies the persisted collapsed preference.
 
 ```bash
 cargo test assets::tests::browser_js_tree_collapse_seams_are_locked -- --exact

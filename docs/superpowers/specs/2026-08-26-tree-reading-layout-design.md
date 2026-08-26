@@ -138,6 +138,7 @@ Tree collapse is explicit, not automatic.
 - A small chevron control lives on the wide resizer.
 - Collapsing sets the tree column to zero and hides the resizer, while leaving a compact left-edge restore button.
 - Restoring uses the previously saved tree width.
+- Collapse/restore never starts the resize gesture and never overwrites `cb-tree-width`; restoring reuses the last explicit resize value.
 - File navigation never auto-collapses the tree.
 - Narrow drawer state never reads or overwrites the persisted wide collapse preference.
 
