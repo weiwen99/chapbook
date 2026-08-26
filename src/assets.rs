@@ -332,9 +332,12 @@ mod tests {
     fn browser_js_canonical_transport_key_matrix() {
         let ctx = quick_js::Context::new().expect("quick-js context");
         // CommonJS 钩子 shim: 与 Node 的 module.exports 语义一致 (浏览器无 module).
+        ctx.eval("globalThis.module = { exports: {} };")
+            .expect("CommonJS module shim");
+        // QuickJS 核心无 TextEncoder (WHATWG encode 语义: 孤立代理项替换为 U+FFFD,
+        // 单标量 UTF-8); BROWSER_JS 仅逐字节 percent 化 encode 结果, 由测试供 polyfill.
         ctx.eval(
             r#"
-            var module = { exports: {} };
             globalThis.TextEncoder = function TextEncoder() {
               this.encode = function (str) {
                 var bytes = [];
@@ -365,10 +368,12 @@ mod tests {
         .expect("test harness setup");
         ctx.eval(BROWSER_JS).expect("eval BROWSER_JS");
         let cases: &[(&str, Option<&str>)] = &[
-            ("%41", Some("A")),
-            ("%2b", Some("%2B")),
+            ("", Some("")),
+            ("%41GENTS.md", Some("AGENTS.md")),
+            ("%2b.txt", Some("%2B.txt")),
             ("中.md", Some("%E4%B8%AD.md")),
             ("%E4%b8%AD.md", Some("%E4%B8%AD.md")),
+            ("!%24()*", Some("!$()*")),
             ("~!$()*", Some("~!$()*")),
             ("a+b.md", Some("a%2Bb.md")),
             ("a%25b.md", Some("a%25b.md")),
@@ -382,9 +387,8 @@ mod tests {
             (".%2e", None),
             ("%2e.", None),
             ("bad%", None),
-            ("", Some("")),
-            ("😀", Some("%F0%9F%98%80")),
-            ("\u{FFFD}", Some("%EF%BF%BD")),
+            ("😀.md", Some("%F0%9F%98%80.md")),
+            ("\u{FFFD}.md", Some("%EF%BF%BD.md")),
         ];
         for (input, expected) in cases {
             let literal = serde_json::to_string(input).expect("json string literal");
