@@ -17,4 +17,4 @@
 
 ## Comments (2026-08-25 complete)
 
-Implemented commits 6bc1050 (implementation) + 06fee87/d74c343 (review fixes). Chromium acceptance 9/9 + 1 probe PASS; deterministic reruns: delayed-A/fast-B with AbortSignal-ignoring mock (generation guard alone discards late A) PASS, office-busy placeholder via pane path PASS (explicit, non-optional). Two-axis review (full range 9a34965..6bc1050) findings fixed. Ticket complete.
+Implemented commits 3263bd8 (implementation) + 12a2e3b/acb63b7 (review fixes). Chromium acceptance 9/9 + 1 probe PASS; deterministic reruns: delayed-A/fast-B with AbortSignal-ignoring mock (generation guard alone discards late A) PASS, office-busy placeholder via pane path PASS (explicit, non-optional). Two-axis review (full range 6281ff6..3263bd8) findings fixed. Ticket complete.

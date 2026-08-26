@@ -16,4 +16,4 @@
 
 ## Comments
 
-2026-08-25 implemented: commits 5e782f6 (test guards), 93b3d5e (endpoint). Release size 11874912 -> 11924512 B (+49600 B). Full suite green (204 tests). Non-UTF-8 fixture tests run only on non-macOS filesystems (APFS rejects invalid UTF-8, EILSEQ) — pre-existing tests gained the same guard.
+2026-08-25 implemented: commits b9c6e28 (test guards), 3cf798a (endpoint). Release size 11874912 -> 11924512 B (+49600 B). Full suite green (204 tests). Non-UTF-8 fixture tests run only on non-macOS filesystems (APFS rejects invalid UTF-8, EILSEQ) — pre-existing tests gained the same guard.

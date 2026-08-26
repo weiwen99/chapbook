@@ -13,4 +13,4 @@
 
 ## Comments (2026-08-25 complete)
 
-Implemented commits 06fee87 + fd08516 (review fixes: drawer focus gating on open state, range breakpoint, aria-expanded). Chromium acceptance 10 scenarios PASS at 1400x900 and 500x800. Ticket complete.
+Implemented commits 12a2e3b + 08064d1 (review fixes: drawer focus gating on open state, range breakpoint, aria-expanded). Chromium acceptance 10 scenarios PASS at 1400x900 and 500x800. Ticket complete.

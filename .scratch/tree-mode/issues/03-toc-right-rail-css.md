@@ -14,4 +14,4 @@
 
 ## Comments
 
-2026-08-25 implemented: commit d40d982. Evidence: real Chromium harness (wide viewport — TOC fixed right:0, content margin-right, no overlap; narrow — static top card; no-TOC — full width) + end-to-end curl (doc page serves TOC + katex link). Reviewed (two-axis, no findings against ticket).
+2026-08-25 implemented: commit bcce59a. Evidence: real Chromium harness (wide viewport — TOC fixed right:0, content margin-right, no overlap; narrow — static top card; no-TOC — full width) + end-to-end curl (doc page serves TOC + katex link). Reviewed (two-axis, no findings against ticket).

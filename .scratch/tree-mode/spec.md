@@ -144,7 +144,7 @@ SPA 导航；浮动按钮在目录模式与树模式间切换（localStorage 记
 
 Full-design gate (design-advisor + security-reviewer) over the final tree: 4 P1 findings
 (host-dependent shell, deep-link rejection/mutation, spy resize lifecycle, startup selection
-staleness) + 1 P2 (stale native-open evidence) — all fixed (commits afe3e5c, b775496, eb595dc).
+staleness) + 1 P2 (stale native-open evidence) — all fixed (commits 8ff6ac6, 4164b6d, f88f45e).
 Final Chromium acceptance on the final tree, 6/6 PASS: native-open capability boundary (zero
 POSTs across all tree actions, restored after exit reload), deep-link canonicalization
 (/%41GENTS.md#cli -> /AGENTS.md#cli, replaceState only, hash preserved; trailing-slash dir

@@ -14,4 +14,4 @@
 
 ## Comments
 
-2026-08-25 implemented: commits 9600b72 + seam merge follow-up. Deterministic private gate tests (preheld-permit busy mapping, cancellation permit lifetime, panic recovery, fragment/full-page recovery); FIFO/mkfifo HTTP tests rejected per zero-external-dependency test contract. Fragment busy -> 200 placeholder, full page busy -> 503 + Retry-After: 1. Two-axis review findings (capacity rationale, seam merge) fixed.
+2026-08-25 implemented: commits 6c884d6 + seam merge follow-up. Deterministic private gate tests (preheld-permit busy mapping, cancellation permit lifetime, panic recovery, fragment/full-page recovery); FIFO/mkfifo HTTP tests rejected per zero-external-dependency test contract. Fragment busy -> 200 placeholder, full page busy -> 503 + Retry-After: 1. Two-axis review findings (capacity rationale, seam merge) fixed.
