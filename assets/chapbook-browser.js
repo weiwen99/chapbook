@@ -2170,9 +2170,12 @@
     const disposer = installTocSpy(wrapper, tocNav, pane);
     if (disposer) {
       paneSpyDisposer = disposer;
+      const registeredDisposer = disposer;
       registerPaneDisposable(function () {
-        paneSpyDisposer = null;
-        disposer();
+        if (paneSpyDisposer === registeredDisposer) {
+          paneSpyDisposer = null;
+        }
+        registeredDisposer();
       });
     }
   }

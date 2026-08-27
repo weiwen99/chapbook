@@ -961,8 +961,6 @@ mod tests {
     ///   记录 (treeFocusKind, 落到非树壳控件即清空) 补判;
     ///   折叠路径: 恢复按钮解除 hidden → 折叠类 → 移交焦点 → 树 inert/aria →
     ///   调整器隐藏 (恢复按钮必须先解除 hidden 才能聚焦, display:none 不可聚焦);
-    ///   折叠路径: 恢复按钮解除 hidden → 折叠类 → 移交焦点 → 树 inert/aria →
-    ///   调整器隐藏 (恢复按钮必须先解除 hidden 才能聚焦, display:none 不可聚焦);
     ///   展开路径: 移除折叠类 → 树/调整器解除 inert/hidden → 落点聚焦 (窄屏
     ///   抽屉唤起按钮; 宽屏折叠按钮, 回退调整器/树壳) → 恢复按钮隐藏 (任何已
     ///   绘制帧都不暴露恢复控件), 焦点绝不停留在隐藏/inert 元素;
@@ -1234,27 +1232,6 @@ mod tests {
         assert!(
             pointer_body.contains("treeFocusKind = null"),
             "pointerdown 落在非树壳控件时清空追踪记录"
-        );
-        let exit_start = enter_end;
-        let exit_end = js
-            .find("function applyTreeMode()")
-            .expect("applyTreeMode 位于 exitTreeMode 之后");
-        let exit = &js[exit_start..exit_end];
-        assert!(
-            exit.contains("uninstallTreeCollapseMql();"),
-            "exit 卸载折叠 mql"
-        );
-        assert!(
-            exit.contains("document.removeEventListener('focusin', onTreeFocusIn, true)"),
-            "exit 卸载 focusin 追踪"
-        );
-        assert!(
-            exit.contains("document.removeEventListener('pointerdown', onTreePointerDown, true)"),
-            "exit 卸载 pointerdown 追踪"
-        );
-        assert!(
-            exit.contains("treeFocusKind = null"),
-            "exit 清空焦点追踪记录"
         );
         let exit_start = enter_end;
         let exit_end = js

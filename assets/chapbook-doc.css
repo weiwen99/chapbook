@@ -325,7 +325,6 @@ body.cb-tree-mode.cb-tree-collapsed .cb-tree-restore {
   outline-offset: 2px;
 }
 /* 拖拽期间: 全局 col-resize 光标 + 禁文本选择 (指针已捕获, 双保险) */
-/* 拖拽期间: 全局 col-resize 光标 + 禁文本选择 (指针已捕获, 双保险) */
 body.cb-tree-resizing {
   cursor: col-resize;
   user-select: none;

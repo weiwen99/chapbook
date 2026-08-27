@@ -629,7 +629,7 @@ struct TocNode<'a> {
 
 /// 由标题列表生成嵌套 `<nav id="TOC"><ul>…</ul></nav>`, 按标题级别嵌套.
 /// level > 6 按 h6 处理 (与正文标题渲染一致); max_depth 限制 TOC 深度.
-/// 无条目时返回空串 (页面无 TOC, 宽屏侧栏守卫 `:has(#TOC)` 不生效).
+/// 无条目时返回空串 (页面无 TOC, 浏览器侧不产生任何目录侧栏).
 pub fn toc_html(entries: &[TocEntry], max_depth: Option<usize>) -> String {
     // 先建树 (arena 式), 再递归渲染, 避免手工嵌套栈的边界错误
     let mut nodes: Vec<TocNode> = Vec::new();
