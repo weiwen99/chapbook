@@ -1210,13 +1210,90 @@ mod tests {
             !drawer_rule.contains("border-left"),
             "narrow drawer must not carry a left border: {drawer_rule}"
         );
-        // 窄屏抽屉内折叠按钮 (宽屏控件) 隐藏: display:none/visibility:hidden 均
-        // 不可聚焦/点击, 抽屉交互绝不暴露宽屏折叠入口.
         let collapse_narrow = css_block(narrow_block, "body.cb-tree-mode .cb-tree-collapse {");
         assert!(
             collapse_narrow.contains("display: none")
                 || collapse_narrow.contains("visibility: hidden"),
             "narrow drawer must hide the wide collapse button: {collapse_narrow}"
+        );
+    }
+
+    /// 模式切换按钮移入左侧工具栏 (不再浮动右上角): CSS 契约 —
+    /// 模式切换按钮移入左侧工具栏 (不再浮动右上角): CSS 契约 —
+    /// - .cb-mode-toggle 规则块: 绝无 position: fixed / top / right / z-index
+    ///   (浮动定位来源), 方角 border-radius: 0, flex: none 紧凑, 与折叠按钮
+    ///   同高 2rem (树顶栏垂直对齐一致);
+    /// - .cb-mode-toolbar 目录工具栏行: flex + 8px gap + 居中 + 树同款字号
+    ///   (12.8px 固定 px, 两宿主一致); [hidden] 必须 display: none
+    ///   (display:flex 会覆盖 UA hidden 默认样式);
+    /// - 行内迁入的顶栏搜索表单增长: .cb-mode-toolbar .cb-search flex: 1,
+    ///   输入框与树搜索同款 (方角 0.3em / 继承字号);
+    /// - 焦点可见性保留: .cb-mode-toggle:focus-visible 仍在统一 outline 组;
+    /// - 树网格选择器不再需要排除 .cb-mode-toggle (按钮不再是 body 直系子级).
+    #[test]
+    fn doc_css_mode_toolbar_layout_is_locked() {
+        let css = DOC_STYLE;
+        // 切换按钮: 绝不固定定位悬浮.
+        let toggle_rule = css_block(css, ".cb-mode-toggle {");
+        for bad in ["position: fixed", "top:", "right:", "z-index"] {
+            assert!(
+                !toggle_rule.contains(bad),
+                "toggle rule must not float ({bad}): {toggle_rule}"
+            );
+        }
+        assert!(
+            toggle_rule.contains("border-radius: 0"),
+            "toggle button must be square: {toggle_rule}"
+        );
+        assert!(
+            toggle_rule.contains("flex: none"),
+            "toggle button must stay compact (flex: none): {toggle_rule}"
+        );
+        assert!(
+            toggle_rule.contains("height: 2rem"),
+            "toggle button must match collapse button height (2rem): {toggle_rule}"
+        );
+        // 目录工具栏行: flex 行 + 树同款字号 (固定 px, 两宿主一致).
+        let toolbar_rule = css_block(css, ".cb-mode-toolbar {");
+        for needle in [
+            "display: flex",
+            "gap: 8px",
+            "align-items: center",
+            "font-size: 12.8px",
+        ] {
+            assert!(
+                toolbar_rule.contains(needle),
+                "mode toolbar rule must keep {needle}: {toolbar_rule}"
+            );
+        }
+        // [hidden] 显式 display:none: display:flex 基规则会覆盖 UA hidden 样式.
+        let hidden_rule = css_block(css, ".cb-mode-toolbar[hidden] {");
+        assert!(
+            hidden_rule.contains("display: none"),
+            "hidden toolbar row must be display:none (flex base rule overrides UA): {hidden_rule}"
+        );
+        // 迁入的顶栏搜索表单在行内增长, 输入框与树搜索一致.
+        let search_rule = css_block(css, ".cb-mode-toolbar .cb-search {");
+        assert!(
+            search_rule.contains("flex: 1"),
+            "moved topbar search must flex-fill the toolbar row: {search_rule}"
+        );
+        let input_rule = css_block(css, ".cb-mode-toolbar .cb-search input[type=\"search\"] {");
+        assert!(
+            input_rule.contains("border-radius: 0.3em")
+                && input_rule.contains("font-size: inherit"),
+            "moved search input must match tree search look: {input_rule}"
+        );
+        // 焦点可见性保留: 统一 outline 组仍含切换按钮.
+        let focus_rule = css_block(css, ".cb-mode-toggle:focus-visible {");
+        assert!(
+            focus_rule.contains("outline: 2px solid var(--cb-accent)"),
+            "toggle focus-visible outline must remain: {focus_rule}"
+        );
+        // 按钮不再是 body 直系子级: 网格选择器不得再排除 .cb-mode-toggle.
+        assert!(
+            !css.contains(":not(.cb-mode-toggle)"),
+            "grid selectors must not exclude .cb-mode-toggle anymore: {css}"
         );
     }
 

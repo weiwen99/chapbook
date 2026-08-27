@@ -1416,6 +1416,157 @@ mod tests {
 
     /// 任务 4 质量收尾: 折叠/展开焦点落点纯函数在 QuickJS 中真实执行. 行为
     /// 矩阵覆盖全部过渡与 no-op:
+    /// 模式切换按钮移入左侧工具栏 (不再浮动右上角). 行为导向源不变量:
+    /// - 目录模式工具栏行 buildModeToolbar: 仅树能力页创建 (搜索页绝不创建 —
+    ///   isTreeCapablePage 守卫), 行类名 .cb-mode-toolbar, prepend 到 body 顶部;
+    ///   顶栏搜索表单存在则移动 (非克隆) 进行内, 否则复用树搜索结构
+    ///   (treeSearchForm 带独立 id); 模式切换按钮最后挂载 (行内末位);
+    /// - 按钮跨模式复用: 建树壳时树顶栏 append 按钮 (移动) 且位于折叠按钮
+    ///   之后 (顶栏末位); 退出树模式在树壳销毁 (treeNav.remove) 前把按钮迁回
+    ///   目录工具栏行, 绝不置空引用;
+    /// - applyTreeMode: 标签/aria-pressed/title 更新保持; 树模式隐藏目录工具栏
+    ///   行, 退出恢复;
+    /// - 按钮绝不直接挂 body (无固定定位悬浮), 全文件恰创建一个;
+    /// - click 语义不变: 翻转 treeMode → 持久化 MODE_KEY → applyTreeMode.
+    #[test]
+    fn browser_js_mode_toggle_toolbar_seam_is_locked() {
+        let js = BROWSER_JS;
+        // 旧的浮动注入已移除: 按钮只经工具栏挂载函数创建.
+        assert!(
+            !js.contains("function injectModeToggle("),
+            "浮动注入函数必须移除 (改为工具栏挂载)"
+        );
+        assert!(
+            !js.contains("document.body.append(modeToggleBtn)"),
+            "按钮绝不直接挂 body (浮动定位来源)"
+        );
+        // 目录模式工具栏行: 创建函数 + 树能力守卫 + 行类名 + body 顶部挂载.
+        let build_at = js
+            .find("function buildModeToolbar(")
+            .expect("buildModeToolbar 存在");
+        assert!(
+            js[build_at..].contains("if (!isTreeCapablePage() || $('.cb-mode-toolbar')) return;"),
+            "目录工具栏行必须经 isTreeCapablePage 守卫 (搜索页绝不创建)"
+        );
+        assert!(
+            js[build_at..].contains("toolbar.className = 'cb-mode-toolbar'"),
+            "目录工具栏行类名存在"
+        );
+        assert!(
+            js[build_at..].contains("document.body.prepend(toolbar)"),
+            "目录工具栏行挂 body 顶部"
+        );
+        // 搜索表单: 顶栏表单存在则移动 (非克隆), 否则复用树搜索结构 (独立 id).
+        let build_end = js
+            .find("function treeKeyScope(")
+            .expect("treeKeyScope 位于 buildModeToolbar 之后");
+        let build = &js[build_at..build_end];
+        assert!(
+            build.contains("document.querySelector('header.cb-topbar form.cb-search')"),
+            "目录页搜索表单从顶栏定位"
+        );
+        assert!(
+            build.contains("toolbar.append(topbarSearch)"),
+            "顶栏搜索表单移动 (非克隆) 进目录工具栏行"
+        );
+        assert!(
+            build.contains("treeSearchForm('cb-mode-search-q')"),
+            "文档页无顶栏表单时复用树搜索结构 (独立 id 防与树搜索撞 id)"
+        );
+        // 按钮: 恰创建一个, 类名不变, 行内末位挂载; click 语义不变.
+        assert_eq!(
+            js.matches("modeToggleBtn = document.createElement('button')")
+                .count(),
+            1,
+            "模式切换按钮全文件恰创建一次 (跨模式复用)"
+        );
+        let btn_class_at = build
+            .find("modeToggleBtn.className = 'cb-mode-toggle'")
+            .expect("按钮类名保持 cb-mode-toggle");
+        let btn_append_at = build
+            .find("toolbar.append(modeToggleBtn)")
+            .expect("按钮挂目录工具栏行末位");
+        assert!(btn_class_at < btn_append_at, "按钮先赋类名再挂目录工具栏行");
+        let click_start = build
+            .find("modeToggleBtn.addEventListener('click',")
+            .expect("按钮 click 处理器存在");
+        let click_end = build
+            .find("toolbar.append(modeToggleBtn)")
+            .expect("click 处理器先于挂载");
+        let click = &build[click_start..click_end];
+        assert!(click.contains("treeMode = !treeMode"), "click 翻转模式");
+        assert!(
+            click.contains("localStorage.setItem(MODE_KEY, 'tree')")
+                && click.contains("localStorage.removeItem(MODE_KEY)"),
+            "click 持久化模式偏好"
+        );
+        assert!(click.contains("applyTreeMode()"), "click 应用模式");
+        // 树顶栏: 按钮在折叠按钮之后 (末位), 经 append 移动自目录工具栏行.
+        let shell_at = js
+            .find("function buildTreeShell(")
+            .expect("buildTreeShell 存在");
+        let shell_end = js
+            .find("function enterTreeMode(")
+            .expect("enterTreeMode 位于 buildTreeShell 之后");
+        let shell = &js[shell_at..shell_end];
+        let collapse_append_at = shell
+            .find("treeToolbar.append(treeCollapseBtn)")
+            .expect("折叠按钮挂顶栏");
+        let toggle_append_at = shell
+            .find("treeToolbar.append(modeToggleBtn)")
+            .expect("模式切换按钮挂树顶栏");
+        assert!(
+            collapse_append_at < toggle_append_at,
+            "树顶栏顺序: 搜索 → 折叠 → 模式切换 (按钮末位)"
+        );
+        // 退出树模式: 树壳销毁前按钮迁回目录工具栏行, 绝不置空引用.
+        let exit_start = js
+            .find("function exitTreeMode(")
+            .expect("exitTreeMode 存在");
+        let exit_end = js
+            .find("function applyTreeMode()")
+            .expect("applyTreeMode 位于 exitTreeMode 之后");
+        let exit = &js[exit_start..exit_end];
+        let nav_remove_at = exit.find("treeNav.remove()").expect("exit 移除树壳");
+        let move_back_at = exit
+            .find("modeToolbar.append(modeToggleBtn)")
+            .expect("exit 把按钮迁回目录工具栏行");
+        assert!(
+            move_back_at < nav_remove_at,
+            "按钮必须先在树壳销毁前迁出 (随壳销毁即丢失)"
+        );
+        assert!(
+            !exit.contains("modeToggleBtn = null"),
+            "exit 绝不置空按钮引用 (跨模式复用)"
+        );
+        // applyTreeMode: 标签/aria 更新保持 + 目录工具栏行随模式显隐.
+        let apply_start = exit_end;
+        let apply_end = js
+            .find("function treeKeyScope(")
+            .expect("treeKeyScope 位于 applyTreeMode 之后");
+        let apply = &js[apply_start..apply_end];
+        assert!(
+            apply.contains("btn.textContent = treeMode ? '目录' : '树'")
+                && apply.contains("btn.setAttribute('aria-pressed', treeMode ? 'true' : 'false')")
+                && apply.contains("btn.title = treeMode ? '切换到目录模式' : '切换到树模式'"),
+            "标签/aria-pressed/title 更新保持"
+        );
+        assert!(
+            apply.contains("modeToolbar.hidden = treeMode"),
+            "树模式隐藏目录工具栏行, 退出恢复"
+        );
+        // init 挂载点: 工具栏行先于模式应用 (进入树模式时按钮已在目录行待命).
+        let init_at = js.find("function init()").expect("init 存在");
+        let init = &js[init_at..];
+        let init_build_at = init
+            .find("buildModeToolbar();")
+            .expect("init 先挂载目录工具栏行");
+        let init_apply_at = init.find("applyTreeMode();").expect("init 应用模式");
+        assert!(
+            init_build_at < init_apply_at,
+            "init: 工具栏行挂载必须先于 applyTreeMode"
+        );
+    }
     /// - 折叠生效 (nextCollapsed): 焦点在树内/调整器内/抽屉唤起按钮 → 'restore'
     ///   (inert/隐藏元素不可聚焦, 必须提前移交); 焦点在恢复按钮自身或受影响
     ///   控件之外 → null (恢复按钮保持可见, 无需移交);

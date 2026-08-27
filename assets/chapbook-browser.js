@@ -732,6 +732,10 @@
   let treeCollapseMql = null; // 断点感知: 窄屏强制展开, 宽屏重放偏好
   let treeCollapseMqlHandler = null;
   let treeCollapseBtn = null; // 折叠按钮 (树壳顶栏子控件; 展开态焦点落点, 随壳创建/销毁)
+  // 目录模式左缘工具栏行与模式切换按钮: 跨模式复用 (按钮在树顶栏与目录工具
+  // 栏行之间移动, 随目录工具栏行创建/销毁; 树模式隐藏该行, 退出恢复).
+  let modeToolbar = null;
+  let modeToggleBtn = null;
   // 树壳焦点追踪: 跨断点时浏览器在 mql 处理器运行前就按新视口 CSS 把目标
   // 控件 display:none 并静默丢弃焦点 (无 focusout 事件), 处理器启动时
   // activeElement 已回落 body. focusin 捕获阶段记录最近一次落在树壳控件上的
@@ -785,7 +789,7 @@
     return isValidEncodedPath(rel) ? rel : null;
   }
 
-  function treeSearchForm() {
+  function treeSearchForm(inputId) {
     const form = document.createElement('form');
     form.className = 'cb-tree-search';
     form.action = '/__/search';
@@ -794,7 +798,7 @@
     const input = document.createElement('input');
     input.type = 'search';
     input.name = 'q';
-    input.id = 'cb-tree-search-q';
+    input.id = inputId || 'cb-tree-search-q';
     input.placeholder = '搜索文件';
     input.setAttribute('aria-label', '搜索文件');
     input.autocomplete = 'off';
@@ -1363,6 +1367,9 @@
       setTreeCollapsePreference(true, true);
     });
     treeToolbar.append(treeCollapseBtn);
+    // 模式切换按钮: 顶栏末位 (append 移动节点, 自目录工具栏行迁入; 随树壳
+    // inert/hidden/抽屉生命周期一起走). 退出树模式时迁回目录工具栏行.
+    treeToolbar.append(modeToggleBtn);
     treeNav.append(treeToolbar);
     treeItemSeq = 0; // 新壳: id 计数器复位 (id 仅需壳内稳定唯一, 见声明)
     treeRootUl = document.createElement('ul');
@@ -2354,6 +2361,11 @@
     treeOpenBtn = null;
     if (treeRestoreBtn) treeRestoreBtn.remove();
     treeRestoreBtn = null;
+    // 模式切换按钮跨模式复用: 树壳销毁 (treeNav.remove) 前必须迁回目录工具
+    // 栏行 — append 移动节点, 按钮随树壳销毁即永久丢失.
+    if (modeToggleBtn && modeToolbar) {
+      modeToolbar.append(modeToggleBtn);
+    }
     if (treeNav) treeNav.remove();
     treeNav = null;
     treeRootUl = null;
@@ -2378,14 +2390,30 @@
     } else {
       exitTreeMode();
     }
+    // 树模式隐藏目录工具栏行 (搜索随树内搜索让位); 退出恢复 (按钮已迁回).
+    if (modeToolbar) {
+      modeToolbar.hidden = treeMode;
+    }
   }
 
-  function injectModeToggle() {
-    if (!isTreeCapablePage() || $('.cb-mode-toggle')) return;
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'cb-mode-toggle';
-    btn.addEventListener('click', function () {
+  // 目录模式左缘工具栏行: 搜索表单 + 模式切换按钮 (仅树能力页; 搜索页绝不
+  // 创建 — 顶栏搜索表单保持原位). 目录页把顶栏搜索表单移动 (非克隆) 进本行;
+  // 文档页无顶栏表单, 复用树搜索结构 (独立 id, 与树内搜索不撞). 树模式隐藏
+  // 本行, 按钮移入树顶栏; 退出恢复.
+  function buildModeToolbar() {
+    if (!isTreeCapablePage() || $('.cb-mode-toolbar')) return;
+    const toolbar = document.createElement('div');
+    toolbar.className = 'cb-mode-toolbar';
+    const topbarSearch = document.querySelector('header.cb-topbar form.cb-search');
+    if (topbarSearch) {
+      toolbar.append(topbarSearch);
+    } else {
+      toolbar.append(treeSearchForm('cb-mode-search-q'));
+    }
+    modeToggleBtn = document.createElement('button');
+    modeToggleBtn.type = 'button';
+    modeToggleBtn.className = 'cb-mode-toggle';
+    modeToggleBtn.addEventListener('click', function () {
       treeMode = !treeMode;
       try {
         if (treeMode) {
@@ -2398,7 +2426,9 @@
       }
       applyTreeMode();
     });
-    document.body.append(btn);
+    toolbar.append(modeToggleBtn);
+    modeToolbar = toolbar;
+    document.body.prepend(toolbar);
   }
 
   // 树键范围纯函数 (DOM 无关 seam): 返回 'escape-search' | 'focus-search' |
@@ -2571,7 +2601,7 @@
       'meta[name="cb-native-open-token"]'
     );
     nativeToken = tokenMeta ? tokenMeta.getAttribute('content') : null;
-    injectModeToggle();
+    buildModeToolbar();
     // 完整页 spy 先于 applyTreeMode: 树模式启动时 enterTreeMode 立即断开它
     // (原正文将被 pane fragment 替换), 避免残留观察已脱离 DOM 的标题.
     initFullPageTocSpy();

@@ -191,16 +191,16 @@ html:has(> body.cb-doc-page) {
 
 /* ---------- 树模式外壳 (chapbook-browser.js) ---------- */
 
-/* 浮动模式切换按钮: 两种模式、所有可挂树壳页面统一位置 */
+/* 模式切换按钮: 树顶栏 (.cb-tree-toolbar) 末位控件与目录模式工具栏行
+ * (.cb-mode-toolbar) 末位控件共用 — 方角、与折叠按钮同高, 绝不固定定位/悬浮 */
 .cb-mode-toggle {
-  position: fixed;
-  top: 0.75rem;
-  right: 0.75rem;
-  z-index: 30;
-  padding: 0.35em 0.8em;
-  font-size: 0.85em;
+  flex: none;
+  height: 2rem;
+  padding: 0 0.8em;
+  font-size: 1em;
+  line-height: calc(2rem - 2px); /* border-box: 内容高 = 2rem - 上下边框 */
   border: 1px solid var(--cb-border);
-  border-radius: 0.4em;
+  border-radius: 0;
   background: var(--cb-soft-bg);
   color: var(--cb-text);
   cursor: pointer;
@@ -208,6 +208,30 @@ html:has(> body.cb-doc-page) {
 .cb-mode-toggle:hover {
   border-color: var(--cb-accent);
   color: var(--cb-accent);
+}
+/* 目录模式左缘工具栏行: 搜索表单 (顶栏迁入或树结构表单) + 模式切换按钮;
+ * 树模式隐藏 (JS hidden 属性), 搜索页不创建. 字号固定 px 与树壳一致
+ * (dir 宿主 root 80% / doc 宿主 root 16px 不同, 两宿主观感统一) */
+.cb-mode-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 0.4rem 0 0.6rem; /* 与树顶栏垂直呼吸一致 */
+  font-size: 12.8px;
+}
+.cb-mode-toolbar[hidden] {
+  display: none; /* display:flex 基规则会覆盖 UA hidden 默认, 必须显式隐藏 */
+}
+/* 迁入的顶栏搜索表单在行内增长 (原 max-width 32rem 让位), 输入框与树搜索
+ * 同款 (方角 0.3em / 继承字号), 两工具栏观感一致 */
+.cb-mode-toolbar .cb-search {
+  flex: 1;
+  max-width: none;
+}
+.cb-mode-toolbar .cb-search input[type="search"] {
+  padding: 0.35em 0.5em;
+  font-size: inherit;
+  border-radius: 0.3em;
 }
 
 /* 树模式布局: 左树 + 8px 调整器 + 右内容, 各自独立滚动. 列 1 宽由 JS 变量
@@ -218,7 +242,7 @@ body.cb-tree-mode {
   height: 100vh;
   overflow: hidden;
 }
-body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer):not(.cb-mode-toggle) {
+body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer) {
   grid-column: 3;
   min-width: 0;
 }
@@ -437,7 +461,7 @@ body.cb-tree-mode [data-cb-action="native"] {
   body.cb-tree-mode {
     grid-template-columns: minmax(0, 1fr);
   }
-  body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer):not(.cb-mode-toggle) {
+  body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer) {
     grid-column: 1;
   }
   /* 窄屏抽屉: resizer 隐藏, --cb-tree-width 不参与 (树宽由抽屉宽度决定) */
@@ -498,7 +522,7 @@ body.cb-tree-mode [data-cb-action="native"] {
     visibility: visible;
     transition: opacity 0.25s ease, visibility 0s;
   }
-  /* 唤起按钮: 左上角悬浮 (模式切换按钮在右上角, 互不重叠) */
+  /* 唤起按钮: 左上角悬浮 (模式切换按钮在抽屉顶栏内, 互不重叠) */
   body.cb-tree-mode .cb-tree-open {
     display: block;
     position: fixed;
