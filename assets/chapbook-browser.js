@@ -129,6 +129,14 @@
     return null;
   }
 
+  // PDF 判定 (DOM 无关 seam): kind 必须为 'file' 且编码后缀匹配 .pdf
+  // (大小写不敏感)。编码串后缀可直接判定 — percent-encoding 从不编码字面字母
+  // 与点, 扩展名只可能来自末段 (`dir.pdf/file.txt` 以 .txt 结尾); decode 保持
+  // native-open 独占 seam, 此处绝不 decode。
+  function isPdfFile(encodedPath, kind) {
+    return kind === 'file' && /\.pdf$/i.test(encodedPath);
+  }
+
   // 选择后的 panel target 决策 (DOM 无关 seam): 选中非 actionable 条目
   // (selectedEncoded === null) 必须立即清空旧 target, 绝不复用 stale target;
   // actionable 选择保持现有 panel target (只有预览安装 target)。
@@ -405,8 +413,13 @@
   // 错误用 textContent; target 只从返回 wrapper 的合法 encoded data 安装。
   // P2#5: generation 守卫 — 新请求/面板关闭使在途请求过期, 旧响应/错误
   // 不得 overwrite/install 任何状态。
-  function openPreview(encodedPath) {
+  function openPreview(encodedPath, kind) {
     if (!isValidEncodedPath(encodedPath)) return; // fail-closed
+    // PDF: 面板承载不了原生查看器 — 新 tab 打开并返回, 不打开面板/不 fetch
+    if (isPdfFile(encodedPath, kind)) {
+      window.open(actionUrl(encodedPath, 'full').href, '_blank', 'noopener');
+      return;
+    }
     const gen = previewGuard.begin(); // 新请求作废所有在途请求
     clearPanelTarget();
     openPanel();
@@ -487,7 +500,7 @@
     if (target === null) return; // 非 actionable: no-op
     event.preventDefault();
     if (action === 'preview') {
-      openPreview(target);
+      openPreview(target, entry ? entry.dataset.kind : null);
     } else if (action === 'full') {
       location.href = actionUrl(target, 'full').href;
     } else if (action === 'new') {
@@ -525,10 +538,17 @@
     if (miniLink) {
       event.preventDefault();
       const target = encodedPathOf(miniLink);
+      const li = miniLink.closest('li');
+      const kind = li ? li.dataset.kind : null;
+      // PDF 文件: 新 tab 原生查看器 — 目录模式与树模式一致, 不 SPA / 不面板
+      if (isPdfFile(target, kind)) {
+        window.open(actionUrl(target, 'full').href, '_blank', 'noopener');
+        return;
+      }
       if (treeMode) {
         if (target !== null) paneNavigate(target);
       } else {
-        openPreview(target);
+        openPreview(target, kind);
       }
       return;
     }
@@ -573,6 +593,14 @@
     );
   }
 
+  // 选中条目的 data-kind (dir|file): PDF 判定需要 kind + 后缀双条件 —
+  // 目录名 `folder.pdf` 必须按目录处理.
+  function selectedEntryKind() {
+    const entries = visibleEntries();
+    if (selectedIndex < 0 || selectedIndex >= entries.length) return null;
+    return entries[selectedIndex].dataset.kind || null;
+  }
+
   function togglePreview() {
     const target = selectedTarget();
     if (target === null) return;
@@ -581,7 +609,7 @@
       closePanel();
       return;
     }
-    openPreview(target);
+    openPreview(target, selectedEntryKind());
   }
 
   function onKeydown(event) {
@@ -1214,6 +1242,12 @@
     const url = nodeHref(li);
     if (url === null) return;
     const path = encodedPathOf(li);
+    // PDF 文件: 不 SPA fetch / 不 history / 不换 pane — 新 tab 原生查看器
+    // (Chromium 内置查看器拒绝 document-sandbox 响应; 面板承载不了原生 viewer)
+    if (!isDirNode(li) && isPdfFile(path, 'file')) {
+      window.open(actionUrl(path, 'full').href, '_blank', 'noopener');
+      return;
+    }
     // 树内导航: SPA (fragment 注入 + pushState); 无 pane (异常) 时兜底整页导航.
     if (pane && path !== null) {
       paneNavigate(path);
@@ -2653,6 +2687,7 @@
       treeNextExplicitIntent: treeNextExplicitIntent,
       publishTreeExpansionIntent: publishTreeExpansionIntent,
       treeLoadMayCommit: treeLoadMayCommit,
+      isPdfFile: isPdfFile,
     };
   }
 })();

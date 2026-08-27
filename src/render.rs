@@ -95,7 +95,7 @@ pub fn dir_fragment(root: &Path, path: &Path, files: &[FileMeta]) -> String {
     let body = html! {
         ul class="cb-dir-mini" {
             @for f in files {
-                li {
+                li data-kind=(if f.is_directory { "dir" } else { "file" }) {
                     // 可操作条目: anchor + 自身 encoded identity (供面板内下钻);
                     // href 恒为 "/" + encoded (同一编码器), 非 UTF-8 条目 display-only
                     @if let Some(enc) = f.browser_path_encoded() {
@@ -336,6 +336,7 @@ fn entry_row(
 ) -> Markup {
     let label = entry_label_text(f);
     let encoded = f.browser_path_encoded();
+    let kind = if f.is_directory { "dir" } else { "file" };
     let body = html! {
         @if let Some(href) = f.href() {
             td { a href=(href) { (entry_label(f)) } }
@@ -350,15 +351,16 @@ fn entry_row(
         }
         td { (last) (entry_actions(f, native_token)) }
     };
-    // 只有可操作路径携带 data-native-path-encoded (maud 不支持 Option 属性, 显式分支)
+    // 只有可操作路径携带 data-native-path-encoded (maud 不支持 Option 属性, 显式分支);
+    // data-kind (dir|file) 两个分支都携带 — JS 的 PDF 判定是 kind + 后缀双条件
     match encoded {
         Some(enc) => html! {
-            tr class="cb-row" data-browser-entry data-native-path-encoded=(enc) title=(label) aria-label=(label) {
+            tr class="cb-row" data-browser-entry data-kind=(kind) data-native-path-encoded=(enc) title=(label) aria-label=(label) {
                 (body)
             }
         },
         None => html! {
-            tr class="cb-row" data-browser-entry title=(label) aria-label=(label) {
+            tr class="cb-row" data-browser-entry data-kind=(kind) title=(label) aria-label=(label) {
                 (body)
             }
         },
@@ -405,6 +407,7 @@ fn entry_grid(files: &[FileMeta]) -> Markup {
 fn grid_item(f: &FileMeta) -> Markup {
     let label = entry_label_text(f);
     let encoded = f.browser_path_encoded();
+    let kind = if f.is_directory { "dir" } else { "file" };
     let img_src = is_image_entry(f).then(|| f.href()).flatten();
     let body = html! {
         @if let Some(src) = img_src {
@@ -424,12 +427,12 @@ fn grid_item(f: &FileMeta) -> Markup {
     };
     match encoded {
         Some(enc) => html! {
-            div class="cb-grid-item" data-browser-entry data-native-path-encoded=(enc) title=(label) aria-label=(label) {
+            div class="cb-grid-item" data-browser-entry data-kind=(kind) data-native-path-encoded=(enc) title=(label) aria-label=(label) {
                 (body)
             }
         },
         None => html! {
-            div class="cb-grid-item" data-browser-entry title=(label) aria-label=(label) {
+            div class="cb-grid-item" data-browser-entry data-kind=(kind) title=(label) aria-label=(label) {
                 (body)
             }
         },
@@ -1478,6 +1481,7 @@ mod tests {
         )
         .into_string();
         assert!(page.contains(r#"data-browser-entry"#), "page: {page}");
+        assert!(page.contains(r#"data-kind="file""#), "page: {page}");
         assert!(
             page.contains(r#"data-native-path-encoded="a%20b/photo.png""#),
             "page: {page}"
@@ -1489,6 +1493,56 @@ mod tests {
         // 安全 label attributes: basename 经显示 codec
         assert!(page.contains(r#"title="photo.png""#), "page: {page}");
         assert!(page.contains(r#"aria-label="photo.png""#), "page: {page}");
+    }
+
+    /// data-kind (dir|file) 标记行/网格/迷你条目: JS 的 PDF 判定是
+    /// kind + 后缀双条件 — 目录名 `folder.pdf` 必须仍是 dir.
+    #[test]
+    fn entry_kind_attribute_marks_dirs_and_files() {
+        let files = [
+            meta2(PathBuf::from("doc.pdf"), false),
+            meta2(PathBuf::from("folder.pdf"), true),
+        ];
+        let page = dir_page(
+            Path::new("/srv"),
+            Path::new("/srv"),
+            &files,
+            SortBy::default(),
+            None,
+        )
+        .into_string();
+        // 目录表行 + 网格项各一份 (共 2 行 + 2 网格项)
+        assert_eq!(
+            page.matches(r#"data-kind="file""#).count(),
+            2,
+            "page: {page}"
+        );
+        assert_eq!(
+            page.matches(r#"data-kind="dir""#).count(),
+            2,
+            "page: {page}"
+        );
+        // 迷你列表 li 同样携带 (可操作 anchor 分支)
+        let frag = dir_fragment(Path::new("/srv"), Path::new("/srv"), &files);
+        assert!(frag.contains(r#"<li data-kind="file">"#), "frag: {frag}");
+        assert!(frag.contains(r#"<li data-kind="dir">"#), "frag: {frag}");
+        // 非 UTF-8 display-only 分支: li 仍携带 data-kind, 只是无 anchor
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            let bad = FileMeta {
+                relative_to_root: PathBuf::from(OsString::from_vec(b"\xFFbad.pdf".to_vec())),
+                display_name: String::new(),
+                is_directory: false,
+                size: 0,
+                last_modified_time: SystemTime::UNIX_EPOCH,
+                last_access_time: SystemTime::UNIX_EPOCH,
+                creation_time: SystemTime::UNIX_EPOCH,
+            };
+            let frag = dir_fragment(Path::new("/srv"), Path::new("/srv"), &[bad]);
+            assert!(frag.contains(r#"<li data-kind="file">"#), "frag: {frag}");
+        }
     }
 
     /// 网格缩略图判定: 仅图片扩展名, 大小写不敏感; 目录/音视频/无扩展名一律 false.

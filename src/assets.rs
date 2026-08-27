@@ -2916,4 +2916,100 @@ mod tests {
             "syncTreeToPath: 陈旧导航不得执行任何 clearTreeCurrent 变异"
         );
     }
+
+    /// PDF native-open 行为源不变量 (TDD 契约):
+    /// - isPdfFile 是纯函数 (DOM 段之前): kind === 'file' + 编码后缀
+    ///   /\.pdf$/i 双条件, 绝不 decode (decode 仍只出现在 nativeOpenParams seam);
+    /// - navigateTreeNode: PDF 文件守卫先于 paneNavigate — window.open 新 tab
+    ///   ('_blank', 'noopener') 后直接返回, 不 SPA / 不 history;
+    /// - openPreview 入口短路 PDF (kind 参数化): 先于 previewGuard.begin(),
+    ///   不打开面板/不 fetch; 全部调用方传 kind (行按钮 / mini 列表 / p 键);
+    /// - mini 列表 handler 从 li 的 data-kind 派生 kind;
+    /// - isPdfFile 经 CommonJS 钩子暴露.
+    #[test]
+    fn browser_js_pdf_native_open_seam_is_locked() {
+        let js = BROWSER_JS;
+        let pdf_fn = js.find("function isPdfFile(").expect("isPdfFile 函数存在");
+        let dom_at = js.find("/* ---------- DOM").expect("DOM 段标记存在");
+        assert!(pdf_fn < dom_at, "isPdfFile 必须是纯函数 (早于 DOM 段)");
+        let pdf_body = &js[pdf_fn..dom_at];
+        assert!(
+            pdf_body.contains(r"kind === 'file' && /\.pdf$/i.test(encodedPath)"),
+            "isPdfFile 必须 kind + 编码后缀双条件判定"
+        );
+        // navigateTreeNode: PDF 守卫先于 paneNavigate
+        let nav_start = js
+            .find("function navigateTreeNode(")
+            .expect("navigateTreeNode 存在");
+        let nav_end = js
+            .find("function findTreeNode(")
+            .expect("findTreeNode 位于 navigateTreeNode 之后");
+        let nav = &js[nav_start..nav_end];
+        let pdf_guard = nav
+            .find("isPdfFile(path, 'file')")
+            .expect("navigateTreeNode 必须带 PDF 守卫");
+        let pane = nav.find("paneNavigate(").expect("paneNavigate 调用存在");
+        assert!(pdf_guard < pane, "PDF 守卫必须先于 paneNavigate");
+        assert!(
+            nav.contains("window.open(actionUrl(path, 'full').href, '_blank', 'noopener')"),
+            "PDF 必须 window.open 新 tab (noopener)"
+        );
+        // openPreview: kind 参数 + 入口短路先于 previewGuard.begin()
+        let ov_start = js.find("function openPreview(").expect("openPreview 存在");
+        let ov_end = js
+            .find("function openNative(")
+            .expect("openNative 位于 openPreview 之后");
+        let ov = &js[ov_start..ov_end];
+        let ov_guard = ov
+            .find("isPdfFile(encodedPath, kind)")
+            .expect("openPreview 必须带 PDF 短路");
+        let gen_at = ov
+            .find("previewGuard.begin()")
+            .expect("previewGuard.begin 仍存在");
+        assert!(ov_guard < gen_at, "PDF 短路必须先于面板 fetch 流程");
+        assert!(
+            ov.contains("window.open(actionUrl(encodedPath, 'full').href, '_blank', 'noopener')"),
+            "openPreview PDF 分支必须 window.open 新 tab (noopener)"
+        );
+        // 调用方: 行预览按钮 / mini 列表 / p 键 (togglePreview) 都传 kind
+        assert!(
+            js.contains("openPreview(target, entry ? entry.dataset.kind : null)"),
+            "行预览按钮必须传 entry 的 data-kind"
+        );
+        let mini_start = js
+            .find("const miniLink = event.target.closest(")
+            .expect("mini 列表 handler 存在");
+        let mini_body = &js[mini_start..];
+        assert!(
+            mini_body.contains("const li = miniLink.closest('li');"),
+            "mini handler 必须从 li 派生 kind"
+        );
+        assert!(
+            mini_body.contains("const kind = li ? li.dataset.kind : null;"),
+            "mini handler 必须读取 li 的 data-kind"
+        );
+        assert!(
+            mini_body.contains("openPreview(target, kind)"),
+            "mini 目录模式预览必须传 kind"
+        );
+        let tp_start = js
+            .find("function togglePreview(")
+            .expect("togglePreview 存在");
+        let tp_body = &js[tp_start..];
+        assert!(
+            tp_body.contains("openPreview(target, selectedEntryKind())"),
+            "p 键预览必须传选中条目的 kind"
+        );
+        // 无新增 decode 出口
+        assert_eq!(
+            js.matches("decodeURIComponent(").count(),
+            1,
+            "decode 仍只出现在 native-open seam"
+        );
+        // CommonJS 钩子
+        assert!(
+            js.contains("isPdfFile: isPdfFile"),
+            "isPdfFile 必须经 CommonJS 钩子暴露"
+        );
+    }
 }
