@@ -210,7 +210,7 @@ This covers noncanonical `%41`, mixed-case escapes, literal Unicode, literal `+`
 
 ## Final Acceptance Record
 
-Implemented and reviewed through 2026-08-27 in isolated worktree `.worktrees/tree-reading-layout` on branch `feature/tree-reading-layout`, ending at `bfca7ca`.
+Implemented and reviewed through 2026-08-27 in isolated worktree `.worktrees/tree-reading-layout` on branch `feature/tree-reading-layout`, ending at `7d355c0`.
 
 - Canonical fragment transport: QuickJS matrix plus commitPane ordering lock; encoded slash/dot/malformed and literal Unicode/`+`/`%`/backslash pass.
 - True TOC sibling column: full page and SPA pane share `installDocLayout`; wide `content | toc` and narrow `toc` then `content` verified without overlap; long unbroken prose contained.
