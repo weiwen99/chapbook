@@ -207,3 +207,18 @@ This covers noncanonical `%41`, mixed-case escapes, literal Unicode, literal `+`
 - New colors, typography or icon redesign.
 - Changes to tree sorting, search semantics, native-open security gates or server-side document rendering.
 - Replacing the existing narrow drawer design.
+
+## Final Acceptance Record
+
+Implemented and reviewed through 2026-08-27 in isolated worktree `.worktrees/tree-reading-layout` on branch `feature/tree-reading-layout`, ending at `bfca7ca`.
+
+- Canonical fragment transport: QuickJS matrix plus commitPane ordering lock; encoded slash/dot/malformed and literal Unicode/`+`/`%`/backslash pass.
+- True TOC sibling column: full page and SPA pane share `installDocLayout`; wide `content | toc` and narrow `toc` then `content` verified without overlap; long unbroken prose contained.
+- Tree geometry: pointer/keyboard resize with persisted preferred width, 160–480 and viewport-aware effective clamp, 8px separator/gutter, no scrollbar chrome while wheel/PageDown scrolling remains.
+- Manual collapse: persisted wide preference separate from effective state; breakpoint round-trip, focus transfer, width preservation, and drawer independence verified.
+- Click contract: directory first click expands once; file first click opens once; double-click produces no second action; focused `role="tree"` root with stable treeitem IDs and live `aria-activedescendant`.
+- Async lifecycle: versioned expansion intent, per-caller settle ownership, cross-shell pending identity, abort/resource cleanup, and empty-directory leaf conversion verified by the committed CDP harness.
+- Final verification: `cargo test` 225 passed, `cargo clippy --all-targets` zero warnings, `cargo fmt --check` clean, `node --check` clean, `tests/browser_tree_async_acceptance.mjs` 11/11, integrated Chromium matrix 10/10.
+- Final reviews: spec compliance PASS; standards/quality APPROVED with zero Critical/Important findings.
+
+No push was performed.
