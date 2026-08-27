@@ -731,7 +731,7 @@
   let treeRestoreBtn = null; // 左缘恢复按钮 (仅折叠生效时可见)
   let treeCollapseMql = null; // 断点感知: 窄屏强制展开, 宽屏重放偏好
   let treeCollapseMqlHandler = null;
-  let treeCollapseBtn = null; // 折叠按钮 (调整器子控件; 展开态焦点落点, 随壳创建/销毁)
+  let treeCollapseBtn = null; // 折叠按钮 (树壳顶栏子控件; 展开态焦点落点, 随壳创建/销毁)
   // 树壳焦点追踪: 跨断点时浏览器在 mql 处理器运行前就按新视口 CSS 把目标
   // 控件 display:none 并静默丢弃焦点 (无 focusout 事件), 处理器启动时
   // activeElement 已回落 body. focusin 捕获阶段记录最近一次落在树壳控件上的
@@ -1346,7 +1346,24 @@
     treeNav.className = 'cb-tree';
     treeNav.id = 'cb-tree-nav'; // 稳定 id: 抽屉唤起按钮 aria-controls 锚点
     treeNav.setAttribute('aria-label', '目录树');
-    treeNav.append(treeSearchForm());
+    // 顶栏: 搜索表单 + 折叠按钮, 作为树壳第一个子节点 (先于根列表). 折叠按钮
+    // 随树壳 inert/hidden/抽屉生命周期一起走, 不再是调整器子控件; 调整器上的
+    // pointerdown/keydown 守卫 (closest('.cb-tree-collapse')) 保留为防御纵深.
+    const treeToolbar = document.createElement('div');
+    treeToolbar.className = 'cb-tree-toolbar';
+    treeToolbar.append(treeSearchForm());
+    treeCollapseBtn = document.createElement('button');
+    treeCollapseBtn.type = 'button';
+    treeCollapseBtn.className = 'cb-tree-collapse';
+    treeCollapseBtn.setAttribute('aria-label', '收起目录树');
+    treeCollapseBtn.title = '收起目录树';
+    treeCollapseBtn.textContent = '‹';
+    treeCollapseBtn.addEventListener('click', function (event) {
+      event.stopPropagation(); // 不落入 document 全局 click (native action 等)
+      setTreeCollapsePreference(true, true);
+    });
+    treeToolbar.append(treeCollapseBtn);
+    treeNav.append(treeToolbar);
     treeItemSeq = 0; // 新壳: id 计数器复位 (id 仅需壳内稳定唯一, 见声明)
     treeRootUl = document.createElement('ul');
     treeRootUl.className = 'cb-tree-root';
@@ -1369,7 +1386,7 @@
     treeResizer.setAttribute('aria-valuemax', String(treeWidthMax()));
     treeResizer.setAttribute('aria-valuenow', String(treeWidth));
     treeResizer.addEventListener('pointerdown', function (event) {
-      // 未来的折叠按钮 (.cb-tree-collapse 子控件) 不触发拖拽: 先于一切返回.
+      // 折叠按钮守卫 (防御纵深, 按钮已移入树壳顶栏): 子控件不触发拖拽, 先于一切返回.
       if (event.target.closest('.cb-tree-collapse')) return;
       // 仅主指针左键可开始; 已有在途手势时拒绝 (副键/多指不抢手势).
       if (!canStartTreeResize(event, treeResizePointerId)) return;
@@ -1417,7 +1434,7 @@
       treeResizer.addEventListener('lostpointercapture', onEnd);
     });
     treeResizer.addEventListener('keydown', function (event) {
-      // 折叠按钮 (子控件) 的按键 (Enter/Space 触发 click) 不得被当成宽度步进.
+      // 折叠按钮守卫 (防御纵深) 的按键 (Enter/Space 触发 click) 不得被当成宽度步进.
       if (event.target.closest('.cb-tree-collapse')) return;
       let next = null;
       switch (event.key) {
@@ -1440,19 +1457,6 @@
       event.stopPropagation(); // 阻断冒泡: 分隔器按键不得落入全局树键
       setTreeWidth(next, true);
     });
-    // 折叠按钮: resizer 子控件. pointerdown 守卫 (closest('.cb-tree-collapse'))
-    // 已排除拖拽, keydown 守卫已排除步进. 点击只改折叠偏好, 绝不触碰宽度.
-    treeCollapseBtn = document.createElement('button');
-    treeCollapseBtn.type = 'button';
-    treeCollapseBtn.className = 'cb-tree-collapse';
-    treeCollapseBtn.setAttribute('aria-label', '收起目录树');
-    treeCollapseBtn.title = '收起目录树';
-    treeCollapseBtn.textContent = '‹';
-    treeCollapseBtn.addEventListener('click', function (event) {
-      event.stopPropagation(); // 不落入 document 全局 click (native action 等)
-      setTreeCollapsePreference(true, true);
-    });
-    treeResizer.append(treeCollapseBtn);
     document.body.append(treeResizer);
     // 窄屏抽屉配套: 遮罩 + 唤起按钮 (宽屏 display:none, 无行为).
     // 遮罩点击收起; 按钮点击唤起 — 都走独立监听, 不干扰目录模式全局 handler.
@@ -1615,8 +1619,8 @@
     return null;
   }
 
-  // 树壳焦点分类: 树内 → 'tree', 调整器内 (折叠按钮是调整器子控件) →
-  // 'resizer', 恢复按钮自身 → 'restore', 抽屉唤起按钮自身 → 'drawer', 其余
+  // 树壳焦点分类: 树内 → 'tree' (折叠按钮已在树壳顶栏内, 归 'tree'), 调整器内
+  // → 'resizer', 恢复按钮自身 → 'restore', 抽屉唤起按钮自身 → 'drawer', 其余
   // → null. 供 applyTreeCollapsed 与焦点追踪共用, 判定顺序先包含后 identity.
   function classifyTreeFocusTarget(target) {
     if (treeNav && treeNav.contains(target)) return 'tree';
@@ -2341,7 +2345,7 @@
       treeResizer.remove();
       treeResizer = null;
     }
-    treeCollapseBtn = null; // 折叠按钮是调整器子控件, 随壳销毁; 引用必须清空
+    treeCollapseBtn = null; // 折叠按钮在树壳顶栏内, 随壳销毁; 引用必须清空
     document.body.style.removeProperty('--cb-tree-width');
     document.body.classList.remove('cb-tree-resizing');
     if (treeScrim) treeScrim.remove();
@@ -2431,11 +2435,12 @@
 
   function onTreeKeydown(event) {
     if (event.ctrlKey || event.metaKey || event.altKey) return;
-    // 分隔器按键由 resizer 自行处理并阻断冒泡; 未来分隔器子控件 (如折叠按钮)
-    // 的按键同样不得落入全局树键 (defaultPrevented 兜底).
+    // 分隔器按键由 resizer 自行处理并阻断冒泡; 分隔器子控件的按键同样不得落入
+    // 全局树键 (defaultPrevented 兜底).
     if (event.defaultPrevented || event.target.closest('.cb-tree-resizer')) return;
     // 恢复按钮 (body 直系子级, 不在 resizer 内): Enter/Space 只触发恢复, 不得
-    // 落入全局树键 (折叠按钮在 resizer 内, 已被上一条守卫覆盖).
+    // 落入全局树键; 折叠按钮在树壳顶栏内, 其按键经 treeKeyScope 决策 (焦点不在
+    // 树根/搜索框时返回 null, 原生 click 照常触发折叠).
     if (event.target.closest('.cb-tree-restore')) return;
     const searchInput = $('#cb-tree-search-q');
     const scope = treeKeyScope(

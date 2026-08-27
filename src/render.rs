@@ -1107,6 +1107,85 @@ mod tests {
         }
     }
 
+    /// 视觉收尾 (tree-ui-polish): 树列与分隔线契约.
+    /// - 宽屏树列基础规则无右边框 (分隔线唯一来自调整器伪元素, 不得出现树边 +
+    ///   把手双线); 调整器列保持 8px, ::before 是唯一 2px 居中分隔线 (left: 3px);
+    /// - 折叠按钮移入 .cb-tree-toolbar (flex 顶栏: 8px gap + 居中 + 指定内边距),
+    ///   搜索表单 flex:1 且无自带内边距; 折叠按钮方角 (border-radius: 0)、
+    ///   约 1.6rem x 2rem, 不得再绝对定位悬浮;
+    /// - TOC 方角 (border-radius: 0);
+    /// - 内容侧呼吸: 宽屏 pane 左内边距 0.25rem (配合树列右内边距 4px + 调整器
+    ///   列左右 3px 半宽, 线心距两侧文本各约 8px, 树-内容总间隙 16px); 窄屏
+    ///   抽屉无分隔线, 不加内容内边距 (抽屉行为不变).
+    #[test]
+    fn doc_css_tree_separator_and_square_corners() {
+        let css = DOC_STYLE;
+        // 树列 (宽屏基础规则): 无右边框.
+        let tree_rule = css_block(css, "body.cb-tree-mode .cb-tree {");
+        assert!(
+            !tree_rule.contains("border-right"),
+            "tree rule must not carry border-right (single separator line): {tree_rule}"
+        );
+        // 调整器列保持 8px; 2px 分隔线在列内居中 (left: 3px, 两侧各 3px).
+        let mode_rule = css_block(css, "body.cb-tree-mode {");
+        assert!(
+            mode_rule
+                .contains("grid-template-columns: var(--cb-tree-width, 238px) 8px minmax(0, 1fr)"),
+            "resizer column must stay the 8px gutter: {mode_rule}"
+        );
+        let resizer_line = css_block(css, ".cb-tree-resizer::before {");
+        assert!(
+            resizer_line.contains("width: 2px") && resizer_line.contains("left: 3px"),
+            "separator must be the single 2px centered pseudo line: {resizer_line}"
+        );
+        // 顶栏: flex, 8px gap, 居中, 指定内边距.
+        let toolbar_rule = css_block(css, ".cb-tree-toolbar {");
+        for needle in [
+            "display: flex",
+            "gap: 8px",
+            "align-items: center",
+            "padding: 0.4rem 0.25rem 0.6rem",
+        ] {
+            assert!(
+                toolbar_rule.contains(needle),
+                "toolbar rule must keep {needle}: {toolbar_rule}"
+            );
+        }
+        // 搜索表单: 顶栏内 flex:1, 无自带内边距.
+        let search_rule = css_block(css, ".cb-tree-search {");
+        assert!(
+            search_rule.contains("flex: 1") && search_rule.contains("padding: 0"),
+            "search rule must flex-fill toolbar without own padding: {search_rule}"
+        );
+        // 折叠按钮: 方角, 约 1.6rem x 2rem, 不再绝对定位悬浮.
+        let collapse_rule = css_block(css, ".cb-tree-collapse {");
+        assert!(
+            !collapse_rule.contains("position: absolute"),
+            "collapse button must not be absolutely positioned: {collapse_rule}"
+        );
+        assert!(
+            collapse_rule.contains("border-radius: 0"),
+            "collapse button must be square: {collapse_rule}"
+        );
+        assert!(
+            collapse_rule.contains("width: 1.6rem") && collapse_rule.contains("height: 2rem"),
+            "collapse button must be ~1.6rem x 2rem: {collapse_rule}"
+        );
+        // TOC 方角.
+        let toc_rule = css_block(css, ".cb-doc #TOC, .cb-doc #table-of-contents {");
+        assert!(
+            toc_rule.contains("border-radius: 0"),
+            "TOC must be square: {toc_rule}"
+        );
+        // 内容侧呼吸: 宽屏 pane 左内边距 4px (窄屏抽屉无分隔线, 不加内边距).
+        let wide_pane = css_block(css, "@media (width >= 64rem)");
+        assert!(
+            wide_pane.contains("body.cb-tree-mode .cb-pane {")
+                && wide_pane.contains("padding-left: 0.25rem"),
+            "wide pane must carry the 4px breathing padding: {wide_pane}"
+        );
+    }
+
     use crate::listing::SearchResult;
 
     fn meta2(rel: PathBuf, is_directory: bool) -> FileMeta {

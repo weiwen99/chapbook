@@ -557,17 +557,23 @@ mod tests {
         }
         // 键盘步进必须阻断冒泡: stopPropagation 位于 resizer keydown 处理器内且
         // 在应用宽度之前 — 分隔器按键不得冒泡成全局树键 (展开/收起/选中).
+        // (切片限定处理器体: 折叠按钮 click 的 stopPropagation 已在顶栏, 不得
+        // 参与本顺序判定.)
         let resizer_kd = js
             .find("treeResizer.addEventListener('keydown',")
             .expect("resizer keydown 处理器存在");
-        let stop_at = js
+        let kd_end = js
+            .find("document.body.append(treeResizer)")
+            .expect("resizer append 存在");
+        let kd_body = &js[resizer_kd..kd_end];
+        let stop_at = kd_body
             .find("event.stopPropagation();")
             .expect("resizer 键盘步进阻断冒泡");
-        let apply_at = js
+        let apply_at = kd_body
             .find("setTreeWidth(next, true)")
             .expect("键盘步进应用宽度");
         assert!(
-            resizer_kd < stop_at && stop_at < apply_at,
+            stop_at < apply_at,
             "resizer 键盘处理必须先阻断冒泡再应用宽度"
         );
         // onTreeKeydown 防御性守卫: 已 preventDefault 或源自分隔器
@@ -967,9 +973,9 @@ mod tests {
     /// - 持久化只写两态 '1'/'0'; 恢复按钮点击只写偏好 false;
     /// - mql install/uninstall 同一 handler 引用 add/remove (含 legacy 回退),
     ///   uninstall 清空引用;
-    /// - 折叠按钮 (resizer 子控件): 模块引用先赋值再挂 click, click 顺序
-    ///   stopPropagation → 偏好 true, 绝不触碰宽度/宽度存储; resizer keydown
-    ///   同样跳过该子控件;
+    /// - 折叠按钮 (工具栏子控件, 见 browser_js_tree_toolbar_seam_is_locked): 模块引用
+    ///   先赋值再挂 click, click 顺序 stopPropagation → 偏好 true, 绝不触碰宽度/
+    ///   宽度存储; resizer keydown 同样跳过该子控件 (守卫保留);
     /// - enter: 读偏好 (=== '1') → install → apply; exit: uninstall + 清类 +
     ///   清空折叠按钮引用 + 移除按钮, 绝不写 localStorage (偏好保留).
     #[test]
@@ -1025,7 +1031,7 @@ mod tests {
             "生效态 → 焦点捕获 → 四类分类 → 追踪补判 → 落点计算必须全部先于任何 class/inert/hidden 变更"
         );
         // 统一分类函数: 四类判定 (树内/调整器内/恢复按钮/抽屉按钮) 按序内联,
-        // 覆盖折叠按钮 (调整器子控件) 与两个 identity 按钮.
+        // 折叠按钮已在树壳工具栏内 (归 'tree'), 两个 identity 按钮单独判定.
         let classify_start = js
             .find("function classifyTreeFocusTarget(")
             .expect("classifyTreeFocusTarget 存在");
@@ -1133,9 +1139,9 @@ mod tests {
                 && fallback_nav_at < restore_hidden_at,
             "展开路径: 移除类 → 解除 inert/hidden → 落点聚焦 → 记录种类 → 恢复按钮隐藏"
         );
-        // 折叠按钮 (resizer 子控件): 建壳时先赋值模块引用再挂 click; click 先
-        // 阻断冒泡再写偏好 true, 绝不触碰宽度或其存储键; resizer keydown 对
-        // 同一子控件同样放行 (不步进).
+        // 折叠按钮 (工具栏子控件, 见 browser_js_tree_toolbar_seam_is_locked): 建壳时
+        // 先赋值模块引用再挂 click; click 先阻断冒泡再写偏好 true, 绝不触碰宽度
+        // 或其存储键; resizer keydown 对同一子控件同样放行 (不步进, 守卫保留).
         let create_at = js
             .find("treeCollapseBtn = document.createElement('button')")
             .expect("折叠按钮创建必须赋值模块引用");
@@ -1144,7 +1150,7 @@ mod tests {
             .expect("折叠按钮 click 处理器存在");
         assert!(create_at < click_start, "折叠按钮先创建再挂 click");
         let click_end = js
-            .find("treeResizer.append(treeCollapseBtn)")
+            .find("treeToolbar.append(treeCollapseBtn)")
             .expect("折叠按钮 append 存在");
         let click = &js[click_start..click_end];
         assert!(
@@ -1257,6 +1263,100 @@ mod tests {
         assert!(
             !exit.contains("localStorage"),
             "exit 绝不写折叠键 (偏好保留)"
+        );
+    }
+
+    /// 任务 4 视觉收尾 (tree-ui-polish): 折叠按钮移入树顶栏 .cb-tree-toolbar,
+    /// 不再是调整器子控件. 行为导向源不变量:
+    /// - 顶栏是 nav.cb-tree 的第一个子节点, 先于根列表 (treeNav.append(treeToolbar)
+    ///   位于 treeNav.append(treeRootUl) 之前), 内含搜索表单 (先挂) 与折叠按钮
+    ///   (后挂); 折叠按钮模块引用先赋值再挂 click, 再 append 进顶栏;
+    /// - 调整器保持素列: treeResizer.append(treeCollapseBtn) 不得存在;
+    /// - 调整器 pointerdown/keydown 的 .cb-tree-collapse 守卫保留 (防御纵深);
+    /// - 折叠按钮 aria-label/title 契约保留; 随树壳 inert/hidden/抽屉生命周期
+    ///   走 (按钮在树壳内, 折叠时树壳 inert + aria-hidden 天然覆盖);
+    /// - 焦点生命周期不变 (展开路径焦点落点 + exit 清空引用, 见
+    ///   browser_js_tree_collapse_seams_are_locked).
+    #[test]
+    fn browser_js_tree_toolbar_seam_is_locked() {
+        let js = BROWSER_JS;
+        let shell_at = js
+            .find("function buildTreeShell(")
+            .expect("buildTreeShell 存在");
+        let shell_end = js
+            .find("function enterTreeMode(")
+            .expect("enterTreeMode 位于 buildTreeShell 之后");
+        let shell = &js[shell_at..shell_end];
+        let toolbar_at = shell
+            .find("treeToolbar = document.createElement('div')")
+            .expect("顶栏 div 创建存在");
+        let class_at = shell
+            .find("treeToolbar.className = 'cb-tree-toolbar'")
+            .expect("顶栏类名存在");
+        assert!(toolbar_at < class_at, "顶栏先创建再赋类名");
+        let search_at = shell
+            .find("treeToolbar.append(treeSearchForm())")
+            .expect("顶栏先挂搜索表单");
+        let collapse_at = shell
+            .find("treeToolbar.append(treeCollapseBtn)")
+            .expect("顶栏挂折叠按钮");
+        assert!(search_at < collapse_at, "顶栏顺序: 搜索表单先于折叠按钮");
+        let nav_toolbar_at = shell
+            .find("treeNav.append(treeToolbar)")
+            .expect("顶栏 append 进树壳");
+        let nav_root_at = shell
+            .find("treeNav.append(treeRootUl)")
+            .expect("根列表 append 进树壳");
+        assert!(
+            nav_toolbar_at < nav_root_at,
+            "顶栏必须是树壳第一个子节点 (先于根列表)"
+        );
+        // 折叠按钮生命周期: 模块引用先赋值 → 挂 click → 进顶栏 → 顶栏进树壳.
+        let create_at = shell
+            .find("treeCollapseBtn = document.createElement('button')")
+            .expect("折叠按钮创建必须赋值模块引用");
+        let click_at = shell
+            .find("treeCollapseBtn.addEventListener('click',")
+            .expect("折叠按钮 click 处理器存在");
+        assert!(create_at < click_at, "折叠按钮先创建再挂 click");
+        assert!(
+            create_at < nav_toolbar_at && click_at < collapse_at,
+            "折叠按钮创建/挂 click 必须先于顶栏进树壳"
+        );
+        // 调整器保持素列: 不得再 append 折叠按钮.
+        assert!(
+            !js.contains("treeResizer.append(treeCollapseBtn)"),
+            "调整器不得持有折叠按钮 (已移入顶栏)"
+        );
+        // 守卫保留 (防御纵深): resizer pointerdown 与 keydown 都排除
+        // .cb-tree-collapse 子控件 (见任务 3/4 原守卫契约).
+        let pd_start = js
+            .find("treeResizer.addEventListener('pointerdown',")
+            .expect("resizer pointerdown 处理器存在");
+        let pd_end = js
+            .find("treeResizer.addEventListener('keydown',")
+            .expect("resizer keydown 处理器存在");
+        assert!(
+            js[pd_start..pd_end].contains("closest('.cb-tree-collapse')"),
+            "pointerdown 折叠按钮守卫保留"
+        );
+        let kd_end = js
+            .find("document.body.append(treeResizer)")
+            .expect("resizer append 存在");
+        assert!(
+            js[pd_end..kd_end].contains("closest('.cb-tree-collapse')"),
+            "keydown 折叠按钮守卫保留"
+        );
+        // 角色/aria 契约: 折叠按钮 aria-label 与 title 保留, 且位于顶栏挂载前
+        // (按钮创建段在 search_at 与 collapse_at 之间).
+        let btn_slice = &shell[search_at..collapse_at];
+        assert!(
+            btn_slice.contains("aria-label', '收起目录树'"),
+            "折叠按钮 aria-label 保留"
+        );
+        assert!(
+            btn_slice.contains("title = '收起目录树'"),
+            "折叠按钮 title 保留"
         );
     }
 

@@ -58,7 +58,7 @@ html:has(> body.cb-doc-page) {
   padding: 0.9em 1.4em;
   background: var(--cb-soft-bg);
   border: 1px solid var(--cb-border);
-  border-radius: 8px;
+  border-radius: 0; /* 方角 (tree-ui-polish): 与代码块/控件方角体系一致 */
   font-size: 0.95em;
 }
 .cb-doc #TOC ul, .cb-doc #table-of-contents ul { margin: 0.2em 0; padding-left: 1.1em; list-style: none; }
@@ -222,21 +222,23 @@ body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer):not(.cb-mode-toggle) {
   grid-column: 3;
   min-width: 0;
 }
-/* 树列: 滚动条隐藏 (wheel/PageDown 等滚动作不受影响), 可见宽度全给内容 */
+/* 树列: 滚动条隐藏 (wheel/PageDown 等滚动作不受影响), 可见宽度全给内容.
+ * 无右边框 — 分隔线唯一来自调整器列内的 2px 伪线 (不得出现树边 + 把手双线);
+ * 内边距由顶栏 (.cb-tree-toolbar) 与根列表 (.cb-tree-root) 各自承担. */
 body.cb-tree-mode .cb-tree {
   grid-column: 1;
   grid-row: 1 / -1;
   overflow-y: auto;
   scrollbar-width: none; /* Firefox */
-  border-right: 1px solid var(--cb-border);
   background: var(--cb-soft-bg);
   font-size: 0.85em;
-  padding: 0.4rem 0.25rem;
 }
 body.cb-tree-mode .cb-tree::-webkit-scrollbar {
   display: none; /* Chromium/Safari */
 }
-/* 树宽调整器: 整列 8px (列间唯一间隙); ::before 是 2px 视觉把手 (left 3px) */
+/* 树宽调整器: 整列 8px 命中区; ::before 是唯一 2px 分隔线 (left 3px, 列内
+ * 居中). 树-内容总间隙 16px, 线心距两侧文本各约 8px: 树侧 = 列内边距 4px +
+ * 列左半 3px + 线半宽 1px; 内容侧镜像 (见宽屏 pane 左内边距规则). */
 .cb-tree-resizer {
   grid-column: 2;
   grid-row: 1 / -1;
@@ -253,21 +255,17 @@ body.cb-tree-mode .cb-tree::-webkit-scrollbar {
   width: 2px;
   background: var(--cb-border);
 }
-/* 折叠按钮: resizer 子控件 (8px 列内放不下, 向两侧各溢出一半; 点击不触发
- * 拖拽/步进 — JS pointerdown/keydown 守卫均排除 .cb-tree-collapse) */
+/* 折叠按钮: 顶栏 (.cb-tree-toolbar) 子控件, 方角约 1.6rem x 2rem; 点击不触发
+ * 拖拽/步进 — JS pointerdown/keydown 守卫仍排除 .cb-tree-collapse (防御纵深) */
 .cb-tree-collapse {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  z-index: 5;
-  width: 1.5rem;
-  height: 2.2rem;
+  flex: none;
+  width: 1.6rem;
+  height: 2rem;
   padding: 0;
   font-size: 1em;
   line-height: 1;
   border: 1px solid var(--cb-border);
-  border-radius: 0.3em;
+  border-radius: 0;
   background: var(--cb-soft-bg);
   color: var(--cb-text);
   cursor: pointer;
@@ -341,6 +339,14 @@ body.cb-tree-mode .cb-pane {
   min-width: 0;
   min-height: 0;
 }
+/* 宽屏分隔呼吸: pane 左内边距 4px, 与树列内边距 4px + 调整器列左右 3px 半宽
+ * 合成 16px 总间隙 (2px 分隔线居中, 线心距两侧文本各约 8px). 窄屏抽屉无分隔
+ * 线, 不加内容内边距 (抽屉行为不变). */
+@media (width >= 64rem) {
+  body.cb-tree-mode .cb-pane {
+    padding-left: 0.25rem;
+  }
+}
 
 .cb-tree ul {
   list-style: none;
@@ -348,7 +354,7 @@ body.cb-tree-mode .cb-pane {
   padding: 0 0 0 1.1em;
 }
 .cb-tree-root {
-  padding-left: 0.25em;
+  padding: 0 0.25rem 0.4rem;
 }
 .cb-tree-row {
   display: flex;
@@ -390,8 +396,16 @@ body.cb-tree-mode .cb-pane {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 顶栏: 搜索表单 + 折叠按钮 (宽屏常驻; 折叠/窄屏随树壳隐藏, 无宽度依赖) */
+.cb-tree-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 0.4rem 0.25rem 0.6rem;
+}
 .cb-tree-search {
-  padding: 0 0.4em 0.6em;
+  flex: 1;
+  padding: 0;
 }
 .cb-tree-search input {
   width: 100%;
