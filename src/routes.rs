@@ -1082,10 +1082,10 @@ async fn serve_org(path: &Path, headers: HeaderMap) -> Response {
     }
 }
 
-/// 唯一的 raw-content 出口: 全部走 ServeFile (Range/条件请求能力保留),
-/// text/* charset 修补。主动内容与 download 附加 `sandbox allow-scripts` CSP
-/// (绝不 allow-same-origin); audio/video 省略 document sandbox 以兼容 Chromium，
-/// 并强制 nosniff，防止伪装成媒体的主动内容被重新解释。
+/// (绝不 allow-same-origin); 浏览器原生内容 (audio/video/PDF) 省略 document
+/// sandbox 以兼容 Chromium (内置媒体播放器拒绝 sandbox 子资源、内置 PDF
+/// 查看器拒绝渲染 sandbox 文档), 并强制 nosniff, 防止伪装成原生内容的
+/// 主动内容被重新解释。
 /// download 时附加 `Content-Disposition: attachment` (RFC 8187, 仅 basename).
 async fn serve_file(path: &Path, headers: HeaderMap, download: bool) -> Response {
     // ServeFile 依据请求头处理 Range / If-Modified-Since 等条件请求
@@ -1100,7 +1100,7 @@ async fn serve_file(path: &Path, headers: HeaderMap, download: bool) -> Response
             );
             let headers = response.headers_mut();
             ensure_text_charset(headers);
-            if download || !playable_status || !is_playable_media(headers) {
+            if download || !playable_status || !is_browser_native_content(headers) {
                 headers.insert(
                     header::CONTENT_SECURITY_POLICY,
                     HeaderValue::from_static("sandbox allow-scripts"),
@@ -1133,11 +1133,15 @@ async fn serve_file(path: &Path, headers: HeaderMap, download: bool) -> Response
     }
 }
 
-fn is_playable_media(headers: &HeaderMap) -> bool {
+/// Chromium 内置查看器直接消费的 MIME (200/206 时省略 document sandbox,
+/// 同时强制 nosniff): audio/*、video/*、application/pdf 精确匹配.
+fn is_browser_native_content(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("audio/") || value.starts_with("video/"))
+        .is_some_and(|value| {
+            value.starts_with("audio/") || value.starts_with("video/") || value == "application/pdf"
+        })
 }
 
 /// mime_guess 给出的 text/* Content-Type 不带 charset (如 text/plain, text/x-rust),

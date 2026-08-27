@@ -133,11 +133,9 @@ tests/
     启动时从 `/dev/urandom` 生成 token；请求按 peer loopback → 字面 loopback Host →
     精确 `http://Host` Origin → token → `resolve_within_root` → exists → opener 固定顺序校验。
     `xdg-open`/`open` 使用单 path argv、null stdio、`kill_on_drop`，由 Tokio task 异步 wait 回收。
-15. 目录页与搜索页由 `chapbook-browser.js` 渐进增强：面包屑、服务端搜索、列表/网格切换、
-    图片 lazy thumbnail、侧边 fragment 预览与 `j`、`k`、`↑`、`↓`、`Enter`、`o`、`p`、`v`、
-    `Backspace`、`/`、`Esc` 键盘导航。
-    文件名、当前 tab、新 tab 与 download 保持原生 `<a>`，禁用 JS 仍可用；音视频预览使用原生
-    `<audio>/<video controls preload="metadata">`，源文件 200/206 保持浏览器播放与 seek。
+    `.pdf` 文件（按 `data-kind="file"` + 编码后缀 `.pdf` 双条件判定，目录名 `folder.pdf`
+    不受影响）的预览、树导航与迷你列表点击一律 `window.open` 新 tab 交给浏览器原生查看器，
+    不 SPA、不进预览面板；服务端对 PDF 的 200/206 响应省略 sandbox 保证查看器可渲染。
 
 ## 安全不变量
 
@@ -148,11 +146,13 @@ tests/
   回退 `symlink_metadata`，再失败则跳过该项，不允许单个坏文件导致列表 500。
 - href 编码使用 RFC 3986 percent-encoding（`meta::PATH_SEGMENT_ENCODE_SET`），空格为 `%20`；
   **不要**用表单语义编码（`+` 在 path segment 是字面加号，链接会坏），测试已锁定正确行为。
-- **raw content origin isolation**：除下述媒体兼容例外，`ServeFile` 响应都带
+- **raw content origin isolation**：除下述浏览器原生内容兼容例外，`ServeFile` 响应都带
   `Content-Security-Policy: sandbox allow-scripts`，严禁加入 `allow-same-origin`；download 和
-  非 200/206 响应永不例外。Chromium 会拒绝加载带 document sandbox 的媒体，因此只有非 download
-  的 200/206 `audio/*`、`video/*` 响应省略 sandbox，并强制
-  `X-Content-Type-Options: nosniff`。CB 生成的完整页/fragment/静态资源不经过 raw 出口。
+  非 200/206 响应永不例外。Chromium 会拒绝加载带 document sandbox 的媒体，且内置 PDF 查看器
+  拒绝渲染 document-sandbox 的 PDF 文档，因此只有非 download 的 200/206 `audio/*`、`video/*`
+  与 `application/pdf`（精确匹配）响应省略 sandbox，并强制
+  `X-Content-Type-Options: nosniff`。PDF 排除在 anydoc 之外、由浏览器原生打开。
+  CB 生成的完整页/fragment/静态资源不经过 raw 出口。
 - **trusted UI anti-framing**：所有 CB 生成的完整页（目录/搜索/文档/代码/Office 渲染页）统一带
   `Content-Security-Policy: frame-ancestors 'none'` 和 `X-Frame-Options: DENY`；策略必须是
   HTTP header，不能降级为 meta。fragment/JSON/静态资源不携带 token，不复用该 header。

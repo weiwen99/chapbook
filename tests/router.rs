@@ -1086,18 +1086,81 @@ async fn oversized_office_file_not_rendered() {
     assert_eq!(content_type(&res), "text/csv; charset=utf-8");
 }
 
-/// PDF 不进 anydoc 渲染路径: 浏览器原生打开 (ServeFile 透传 application/pdf).
+/// PDF 与可播放媒体同属浏览器原生内容: 非 download 的 200/206 省略 document
+/// sandbox (Chromium 内置 PDF 查看器拒绝渲染 sandbox 文档), 强制 nosniff;
+/// download / 非 200/206 仍走 sandbox 出口; fragment 仍是占位 (绝不泄裸字节).
 #[tokio::test]
-async fn pdf_still_served_raw() {
+async fn pdf_omits_sandbox_like_media_but_download_and_errors_stay_sandboxed() {
     let dir = fixture();
-    let pdf = b"%PDF-1.4 fake pdf bytes";
-    std::fs::write(dir.path().join("doc.pdf"), pdf).unwrap();
+    std::fs::write(dir.path().join("doc.pdf"), b"%PDF-1.4 fake pdf bytes").unwrap();
 
-    let res = get_with_accept(app(dir.path()), "/doc.pdf", "text/html").await;
+    // 200 (Accept text/html 不影响 raw 出口) + 206 (Range)
+    for uri in ["/doc.pdf", "/doc.pdf?raw=1"] {
+        let res = get_with_accept(app(dir.path()), uri, "text/html").await;
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        assert_eq!(content_type(&res), "application/pdf", "{uri}");
+        assert!(
+            res.headers().get(header::CONTENT_SECURITY_POLICY).is_none(),
+            "{uri}: document sandbox breaks Chromium PDF viewer"
+        );
+        assert_eq!(
+            res.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&header::HeaderValue::from_static("nosniff")),
+            "{uri}: PDF exemption must not permit MIME sniffing"
+        );
+    }
+    let res = app(dir.path())
+        .oneshot(
+            Request::builder()
+                .uri("/doc.pdf")
+                .header(header::RANGE, "bytes=0-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert!(res.headers().get(header::CONTENT_SECURITY_POLICY).is_none());
+    assert_eq!(
+        res.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+        Some(&header::HeaderValue::from_static("nosniff"))
+    );
+
+    // download: sandbox + attachment
+    let res = get(app(dir.path()), "/doc.pdf?download=1").await;
+    assert_eq!(
+        res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+        "sandbox allow-scripts"
+    );
+    assert!(res.headers().contains_key(header::CONTENT_DISPOSITION));
+
+    // 不满足 Range: 非 200/206 -> sandbox
+    let res = app(dir.path())
+        .oneshot(
+            Request::builder()
+                .uri("/doc.pdf")
+                .header(header::RANGE, "bytes=999-1000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+        "sandbox allow-scripts"
+    );
+
+    // fragment: 占位 HTML, 绝不回退裸字节 (PDF 不是可预览类型)
+    let res = get_with_accept(app(dir.path()), "/doc.pdf?fragment=1", "text/html").await;
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(content_type(&res), "application/pdf");
-    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(bytes.to_vec(), pdf);
+    assert!(
+        res.headers().get(header::X_CONTENT_TYPE_OPTIONS).is_some(),
+        "fragment must set nosniff"
+    );
+    let body = body_string(res).await;
+    assert!(body.contains(r#"<div class="cb-fragment""#), "body: {body}");
+    assert!(!body.contains("%PDF-1.4"), "body: {body}");
 }
 
 // ---------- Task 5: ResponseMode / download / CSP / fragments / search ----------
