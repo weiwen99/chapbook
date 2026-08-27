@@ -1114,9 +1114,12 @@ mod tests {
     ///   搜索表单 flex:1 且无自带内边距; 折叠按钮方角 (border-radius: 0)、
     ///   约 1.6rem x 2rem, 不得再绝对定位悬浮;
     /// - TOC 方角 (border-radius: 0);
-    /// - 内容侧呼吸: 宽屏 pane 左内边距 0.25rem (配合树列右内边距 4px + 调整器
-    ///   列左右 3px 半宽, 线心距两侧文本各约 8px, 树-内容总间隙 16px); 窄屏
-    ///   抽屉无分隔线, 不加内容内边距 (抽屉行为不变).
+    /// - 内容侧呼吸: 宽屏 pane 左内边距 4px (px 精确 — 配合树列右内边距 4px +
+    ///   调整器列左右 3px 半宽, 线心距两侧文本各 8px, 树-内容总间隙 16px); 树侧
+    ///   呼吸同样 px 精确: 根列表右内边距 4px (压过 .cb-tree ul 的右 0) + 顶栏
+    ///   水平内边距 4px; 窄屏抽屉无分隔线, 不加内容内边距 (抽屉行为不变);
+    /// - 窄屏抽屉: 单边右边框 (无左边框); 抽屉内折叠按钮 (宽屏控件) 隐藏且
+    ///   不可聚焦/点击.
     #[test]
     fn doc_css_tree_separator_and_square_corners() {
         let css = DOC_STYLE;
@@ -1138,19 +1141,26 @@ mod tests {
             resizer_line.contains("width: 2px") && resizer_line.contains("left: 3px"),
             "separator must be the single 2px centered pseudo line: {resizer_line}"
         );
-        // 顶栏: flex, 8px gap, 居中, 指定内边距.
+        // 顶栏: flex, 8px gap, 居中, 指定内边距 (水平呼吸 px 精确).
         let toolbar_rule = css_block(css, ".cb-tree-toolbar {");
         for needle in [
             "display: flex",
             "gap: 8px",
             "align-items: center",
-            "padding: 0.4rem 0.25rem 0.6rem",
+            "padding: 0.4rem 4px 0.6rem",
         ] {
             assert!(
                 toolbar_rule.contains(needle),
                 "toolbar rule must keep {needle}: {toolbar_rule}"
             );
         }
+        // 树侧呼吸: 根列表右内边距 4px — 必须压过 .cb-tree ul 的右 0 (同元素
+        // 匹配时更高优先级), 否则线心距树侧仅 4px.
+        let root_rule = css_block(css, ".cb-tree ul.cb-tree-root {");
+        assert!(
+            root_rule.contains("padding: 0 4px 0 1.1em"),
+            "root list must carry the 4px right breathing padding: {root_rule}"
+        );
         // 搜索表单: 顶栏内 flex:1, 无自带内边距.
         let search_rule = css_block(css, ".cb-tree-search {");
         assert!(
@@ -1177,12 +1187,36 @@ mod tests {
             toc_rule.contains("border-radius: 0"),
             "TOC must be square: {toc_rule}"
         );
-        // 内容侧呼吸: 宽屏 pane 左内边距 4px (窄屏抽屉无分隔线, 不加内边距).
+        // 内容侧呼吸: 宽屏 pane 左内边距 4px (px 精确, 不得用 rem — 线心距
+        // 内容恰 8px: 调整器列右半 3px + 线半宽 1px + pane 4px).
         let wide_pane = css_block(css, "@media (width >= 64rem)");
         assert!(
             wide_pane.contains("body.cb-tree-mode .cb-pane {")
-                && wide_pane.contains("padding-left: 0.25rem"),
-            "wide pane must carry the 4px breathing padding: {wide_pane}"
+                && wide_pane.contains("padding-left: 4px"),
+            "wide pane must carry the exact 4px breathing padding: {wide_pane}"
+        );
+        assert!(
+            !wide_pane.contains("0.25rem"),
+            "wide pane breathing must be px-exact, not rem: {wide_pane}"
+        );
+        // 窄屏抽屉: 单边右边框 (无左边框) — 抽屉自带分隔线, 宽屏才走调整器伪线.
+        let narrow_block = css_block(css, "@media (width < 64rem)");
+        let drawer_rule = css_block(narrow_block, "body.cb-tree-mode .cb-tree {");
+        assert!(
+            drawer_rule.contains("border-right: 1px"),
+            "narrow drawer must carry a single right border: {drawer_rule}"
+        );
+        assert!(
+            !drawer_rule.contains("border-left"),
+            "narrow drawer must not carry a left border: {drawer_rule}"
+        );
+        // 窄屏抽屉内折叠按钮 (宽屏控件) 隐藏: display:none/visibility:hidden 均
+        // 不可聚焦/点击, 抽屉交互绝不暴露宽屏折叠入口.
+        let collapse_narrow = css_block(narrow_block, "body.cb-tree-mode .cb-tree-collapse {");
+        assert!(
+            collapse_narrow.contains("display: none")
+                || collapse_narrow.contains("visibility: hidden"),
+            "narrow drawer must hide the wide collapse button: {collapse_narrow}"
         );
     }
 

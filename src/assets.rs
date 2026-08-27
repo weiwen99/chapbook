@@ -1044,7 +1044,7 @@ mod tests {
             .expect("分类覆盖树内");
         let cls_resizer_at = classify
             .find("treeResizer.contains(target)")
-            .expect("分类覆盖调整器内 (折叠按钮子控件)");
+            .expect("分类覆盖调整器内");
         let cls_restore_at = classify
             .find("target === treeRestoreBtn")
             .expect("分类覆盖恢复按钮自身");
@@ -1108,12 +1108,15 @@ mod tests {
         let collapse_focus_at = apply
             .find("treeCollapseBtn.focus({ preventScroll: true })")
             .expect("宽屏展开路径焦点移交折叠按钮");
-        let kind_resizer_at = apply
-            .find("treeFocusKind = 'resizer'")
-            .expect("宽屏展开路径记录调整器焦点种类");
+        let kind_tree_at = apply
+            .find("treeFocusKind = 'tree'")
+            .expect("宽屏展开路径记录树焦点种类 (折叠按钮在树顶栏内, 归 'tree')");
         let fallback_resizer_at = apply
             .find("treeResizer.focus({ preventScroll: true })")
             .expect("折叠按钮缺失时回退调整器");
+        let resizer_kind_at = apply
+            .find("treeFocusKind = 'resizer'")
+            .expect("回退调整器落点记录调整器焦点种类");
         // 任务 5: nav 不再挂 tabIndex (不可聚焦), 回退链优先树根 (tabindex=0
         // 单停靠点), nav 仅最后兜底 — 焦点绝不停留在隐藏/inert 元素.
         let fallback_root_at = apply
@@ -1132,12 +1135,19 @@ mod tests {
                 && resizer_show_at < drawer_focus_at
                 && drawer_focus_at < kind_drawer_at
                 && kind_drawer_at < collapse_focus_at
-                && collapse_focus_at < kind_resizer_at
-                && kind_resizer_at < fallback_resizer_at
-                && fallback_resizer_at < fallback_root_at
+                && collapse_focus_at < kind_tree_at
+                && kind_tree_at < fallback_resizer_at
+                && fallback_resizer_at < resizer_kind_at
+                && resizer_kind_at < fallback_root_at
                 && fallback_root_at < fallback_nav_at
                 && fallback_nav_at < restore_hidden_at,
             "展开路径: 移除类 → 解除 inert/hidden → 落点聚焦 → 记录种类 → 恢复按钮隐藏"
+        );
+        // 生效态应用绝不写折叠偏好键: 唯一写入通道是按钮 click 的
+        // setTreeCollapsePreference (见下); 窄屏/断点过渡只重算生效态, 不触碰偏好.
+        assert!(
+            !apply.contains("setItem(TREE_COLLAPSED_KEY"),
+            "applyTreeCollapsed 绝不写折叠偏好键 (窄屏抽屉/断点过渡不触碰偏好)"
         );
         // 折叠按钮 (工具栏子控件, 见 browser_js_tree_toolbar_seam_is_locked): 建壳时
         // 先赋值模块引用再挂 click; click 先阻断冒泡再写偏好 true, 绝不触碰宽度
@@ -1276,7 +1286,12 @@ mod tests {
     /// - 折叠按钮 aria-label/title 契约保留; 随树壳 inert/hidden/抽屉生命周期
     ///   走 (按钮在树壳内, 折叠时树壳 inert + aria-hidden 天然覆盖);
     /// - 焦点生命周期不变 (展开路径焦点落点 + exit 清空引用, 见
-    ///   browser_js_tree_collapse_seams_are_locked).
+    ///   browser_js_tree_collapse_seams_are_locked);
+    /// - 焦点种类一致: 折叠按钮在树顶栏内归 'tree' (展开路径落点记录 'tree',
+    ///   与 classifyTreeFocusTarget 一致, 不留过期 'resizer');
+    /// - 窄屏不暴露宽屏折叠入口: 按钮可见性纯 CSS 管理 (JS 无 hidden/style
+    ///   操作), 折叠偏好键唯一写入点是按钮 click 的 setTreeCollapsePreference,
+    ///   applyTreeCollapsed 绝不写偏好 (窄屏抽屉/断点过渡不触碰偏好).
     #[test]
     fn browser_js_tree_toolbar_seam_is_locked() {
         let js = BROWSER_JS;
@@ -1358,6 +1373,45 @@ mod tests {
             btn_slice.contains("title = '收起目录树'"),
             "折叠按钮 title 保留"
         );
+        // 焦点种类: 折叠按钮在树顶栏内 (归 'tree', 与 classifyTreeFocusTarget
+        // 一致) — 展开路径移交焦点后必须记录 'tree', 且先于调整器回退 (按钮
+        // 不是调整器子控件, 不得留 'resizer' 种类).
+        let apply_start = js
+            .find("function applyTreeCollapsed(")
+            .expect("applyTreeCollapsed 存在");
+        let apply_end = js
+            .find("function setTreeCollapsePreference(")
+            .expect("setTreeCollapsePreference 位于 applyTreeCollapsed 之后");
+        let apply = &js[apply_start..apply_end];
+        let btn_focus_at = apply
+            .find("treeCollapseBtn.focus({ preventScroll: true })")
+            .expect("展开路径焦点移交折叠按钮");
+        let kind_tree_at = apply
+            .find("treeFocusKind = 'tree'")
+            .expect("折叠按钮落点记录树焦点种类");
+        let resizer_fallback_at = apply
+            .find("treeResizer.focus({ preventScroll: true })")
+            .expect("回退调整器存在");
+        assert!(
+            btn_focus_at < kind_tree_at && kind_tree_at < resizer_fallback_at,
+            "折叠按钮落点必须记录 'tree' 且先于调整器回退 (按钮归树顶栏, 非调整器)"
+        );
+        // 窄屏隐藏/inert: 按钮可见性纯 CSS 管理 (窄屏抽屉内隐藏, 见 render CSS
+        // 契约) — JS 不得有任何路径重新暴露按钮; 折叠偏好键唯一写入点是按钮
+        // click 的 setTreeCollapsePreference, 生效态应用绝不写偏好.
+        assert!(
+            !js.contains("treeCollapseBtn.hidden") && !js.contains("treeCollapseBtn.style"),
+            "折叠按钮可见性必须纯 CSS 管理 (JS 不得绕过窄屏隐藏)"
+        );
+        assert!(
+            !apply.contains("setItem(TREE_COLLAPSED_KEY"),
+            "applyTreeCollapsed 绝不写折叠偏好键"
+        );
+        assert_eq!(
+            js.matches("setItem(TREE_COLLAPSED_KEY").count(),
+            1,
+            "折叠偏好键唯一写入点必须只有 setTreeCollapsePreference (按钮 click 通道)"
+        );
     }
 
     /// 任务 4 质量收尾: 折叠/展开焦点落点纯函数在 QuickJS 中真实执行. 行为
@@ -1366,7 +1420,7 @@ mod tests {
     ///   (inert/隐藏元素不可聚焦, 必须提前移交); 焦点在恢复按钮自身或受影响
     ///   控件之外 → null (恢复按钮保持可见, 无需移交);
     /// - 展开生效 (!nextCollapsed): 焦点在恢复按钮 → 窄屏 'drawer' (恢复按钮
-    ///   即将隐藏, 抽屉唤起按钮可见) / 宽屏 'collapse' (折叠按钮是调整器子控件,
+    ///   即将隐藏, 抽屉唤起按钮可见) / 宽屏 'collapse' (折叠按钮在树顶栏内,
     ///   树列重新可见); 宽屏下抽屉唤起按钮焦点 → 'collapse'; 焦点在树内/调整器
     ///   内/其余 → null (元素保持可见/可聚焦, 不移交).
     #[test]

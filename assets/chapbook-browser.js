@@ -1678,7 +1678,7 @@
     }
     // 展开路径: 折叠类移除 → 树/调整器解除 inert/hidden → 落点聚焦 → 恢复
     // 按钮隐藏 (任何已绘制帧都不暴露恢复控件). 落点: 窄屏抽屉唤起按钮 (宽
-    // →窄过渡, 恢复按钮即将隐藏); 宽屏折叠按钮 (调整器子控件, 已解除隐藏),
+    // →窄过渡, 恢复按钮即将隐藏); 宽屏折叠按钮 (树顶栏子控件, 已解除隐藏),
     // 折叠按钮缺失时回退调整器/树根 (nav 仅最后兜底) — 焦点绝不停留在隐藏/inert 元素.
     document.body.classList.remove('cb-tree-collapsed');
     if (treeNav) {
@@ -1696,7 +1696,7 @@
     } else if (focusTarget === 'restore' || focusTarget === 'collapse') {
       if (treeCollapseBtn) {
         treeCollapseBtn.focus({ preventScroll: true });
-        treeFocusKind = 'resizer';
+        treeFocusKind = 'tree'; // 折叠按钮在树顶栏内, 归 'tree' (与 classify 一致)
       } else if (treeResizer) {
         treeResizer.focus({ preventScroll: true });
         treeFocusKind = 'resizer';

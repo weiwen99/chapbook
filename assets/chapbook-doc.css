@@ -339,12 +339,12 @@ body.cb-tree-mode .cb-pane {
   min-width: 0;
   min-height: 0;
 }
-/* 宽屏分隔呼吸: pane 左内边距 4px, 与树列内边距 4px + 调整器列左右 3px 半宽
- * 合成 16px 总间隙 (2px 分隔线居中, 线心距两侧文本各约 8px). 窄屏抽屉无分隔
- * 线, 不加内容内边距 (抽屉行为不变). */
+/* 宽屏分隔呼吸: pane 左内边距 4px (px 精确, 与树列内边距 4px + 调整器列左右
+ * 3px 半宽合成 16px 总间隙; 2px 分隔线居中, 线心距两侧文本各 8px). 窄屏抽屉
+ * 无分隔线, 不加内容内边距 (抽屉行为不变). */
 @media (width >= 64rem) {
   body.cb-tree-mode .cb-pane {
-    padding-left: 0.25rem;
+    padding-left: 4px;
   }
 }
 
@@ -353,8 +353,11 @@ body.cb-tree-mode .cb-pane {
   margin: 0;
   padding: 0 0 0 1.1em;
 }
-.cb-tree-root {
-  padding: 0 0.25rem 0.4rem;
+/* 根列表: 右内边距 4px 是树侧分隔呼吸的一半 (4px + 调整器列左半 3px + 线半宽
+ * 1px = 线心距 8px). 必须压过通用 .cb-tree ul 的右 0 (同选择器优先级更高);
+ * 左 1.1em 层级缩进与底部 0 保持现状 (嵌套 ul 仍走 .cb-tree ul 规则). */
+.cb-tree ul.cb-tree-root {
+  padding: 0 4px 0 1.1em;
 }
 .cb-tree-row {
   display: flex;
@@ -401,7 +404,7 @@ body.cb-tree-mode .cb-pane {
   display: flex;
   gap: 8px;
   align-items: center;
-  padding: 0.4rem 0.25rem 0.6rem;
+  padding: 0.4rem 4px 0.6rem; /* 水平呼吸 px 精确 (右 4px + 列左半 3px + 线半宽 1px = 8px) */
 }
 .cb-tree-search {
   flex: 1;
@@ -439,6 +442,11 @@ body.cb-tree-mode [data-cb-action="native"] {
   }
   /* 窄屏抽屉: resizer 隐藏, --cb-tree-width 不参与 (树宽由抽屉宽度决定) */
   body.cb-tree-mode .cb-tree-resizer {
+    display: none;
+  }
+  /* 窄屏抽屉: 折叠按钮是宽屏控件, 抽屉内隐藏 — display:none 不可聚焦/点击,
+   * 抽屉交互绝不触碰折叠偏好 (偏好只由宽屏按钮写入) */
+  body.cb-tree-mode .cb-tree-collapse {
     display: none;
   }
   /* 折叠态兜底: 窄屏抽屉恒展开 — JS 已按 !narrow 移除生效类; 类残留时同样
