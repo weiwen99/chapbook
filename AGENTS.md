@@ -55,6 +55,7 @@ assets/        # materialize.min.css / materialize.min.js（v2.3.3 社区分支�
                # + chapbook-browser.js（键盘/列表网格/预览面板渐进增强，无构建步骤）
                # + chapbook-doc.css（`.cb-doc` 内容 + `.cb-doc-page` 页面双作用域）
                # + katex/（KaTeX 0.16.7 样式表 woff2 裁剪版 + 20 个 woff2 字体）
+               # + mermaid.min.js（Mermaid 11.17.2 图表渲染，IIFE 单文件自包含构建；见 THIRD_PARTY_NOTICES）
                # + syntaxes/（14 个补充语法定义，syntect 默认集缺失的常见语言；见 THIRD_PARTY_NOTICES）
 vendor/        # quick-js 0.4.1（katex crate 的 JS 引擎）本地副本：唯一改动是
                # src/bindings.rs ContextWrapper::new 里 JS_SetMaxStackSize 256KB -> 8MB
@@ -93,6 +94,16 @@ tests/
    页面骨架在 `<head>` 注入 `/__/static/katex/katex.min.css`（裁剪版，仅 woff2 引用；
    字体走 `assets/katex/fonts/` 二进制内嵌），`chapbook-doc.css` 对 `.katex-display`
    加横向溢出滚动（长 align 公式不撑破布局），颜色继承正文（亮/暗自适应）。
+   Mermaid 图表**浏览器端渲染**（mermaid 无纯 Rust 实现，服务端渲染需 DOM/无头浏览器，
+   违反零运行时外部依赖）：md fence ` ```mermaid ` 经 comrak `codefence_renderers` 插件、
+   org `#+begin_src mermaid`（大小写不敏感）经 `OrgHtmlHandler` SourceBlock 特判，两者统一输出
+   `<pre class="mermaid">` + HTML 转义源码（**不经 syntect 高亮**）；`chapbook-browser.js`
+   发现容器才懒加载 `/__/static/js/mermaid.min.js`（全站一次），事务式 `mermaid.render(id, 源码)`
+   （不传容器元素——v11 会先清空传入元素，失败即丢源码），成功且节点仍 `isConnected` 才提交
+   SVG；`securityLevel: 'strict'`、`suppressErrorRendering: true`。降级约定与数学一致：
+   无 JS / 库加载失败 / 图语法错误一律显示原始源码，不出现 mermaid 红色错误图。
+   主题按 `prefers-color-scheme` 选 `default`/`dark` 并监听切换重渲（主题色渲染时烘焙进 SVG）。
+   预览面板与树模式 fragment 注入后由同一驱动扫描渲染；Office/CSV 与 .md 同管线自动获得支持。
    已废弃：Markdeep 客户端渲染与 pandoc/emacs 子进程管线（提案
    docs/2026-08-05-proposal-remove-dependency-of-pandoc.org，Phase 1/2 已实施）。
 6. 文件服务必须支持 Range（tower-http `ServeFile` 提供）；缺失文件 404。
@@ -154,8 +165,10 @@ tests/
   `X-Content-Type-Options: nosniff`。PDF 排除在 anydoc 之外、由浏览器原生打开。
   CB 生成的完整页/fragment/静态资源不经过 raw 出口。
 - **trusted UI anti-framing**：所有 CB 生成的完整页（目录/搜索/文档/代码/Office 渲染页）统一带
-  `Content-Security-Policy: frame-ancestors 'none'` 和 `X-Frame-Options: DENY`；策略必须是
-  HTTP header，不能降级为 meta。fragment/JSON/静态资源不携带 token，不复用该 header。
+  `Content-Security-Policy: frame-ancestors 'none'; script-src 'self'` 和 `X-Frame-Options: DENY`
+  （文档页执行 mermaid 渲染脚本，`script-src 'self'` 锁死 inline `<script>` 注入；全站无 inline
+  事件 handler，测试锁定该头）；策略必须是 HTTP header，不能降级为 meta。fragment/JSON/静态资源
+  不携带 token，不复用该 header。
 - **Org 主动内容**：HTML ExportBlock/Snippet 必须以 `HtmlEscape` 输出；Org link 在首个冒号前
   去除 ASCII whitespace/control 并小写后，拒绝 `javascript`/`vbscript`/`data`/`file` scheme。
   Full 与 Fragment 必须复用同一 `OrgHtmlHandler`，禁止 fragment 出口另做字符串清洗。
@@ -188,6 +201,11 @@ Materialize 前端资源来自 [materializecss/materialize](https://github.com/m
 视觉主题由 `assets/chapbook-theme.css` 覆盖（GitHub 色系，亮/暗自适应，与 org 渲染页同源）——v2.3.3 dist
 的链接色是无效的 `colorFunc(...)` 声明，浏览器会丢弃并回退到 UA 默认蓝紫色，必须保留该覆盖。
 
+`assets/mermaid.min.js` 是 [mermaid-js/mermaid](https://github.com/mermaid-js/mermaid) v11.17.2（MIT）
+官方 dist 的 IIFE 单文件自包含构建（`mermaid.esm.min.mjs` 有 38 个懒加载 chunk，不可单文件嵌入，
+不可用），升级时替换该文件并同步 `tests/router.rs::mermaid_js_static_asset_served` 的字节数断言
+与 THIRD_PARTY_NOTICES。二进制 +~3.5MB。
+
 ## 设计决策
 
 1. 路径穿越：词法前缀比较不消除 `..` 分量 → 逐分量解析，溢出 root 返回 403；符号链接保持跟随。
@@ -198,6 +216,9 @@ Materialize 前端资源来自 [materializecss/materialize](https://github.com/m
    仅在完整安全校验后 spawn，使用 Tokio async wait 回收，runtime shutdown 时 kill-on-drop。
 4. `.md` 不走客户端 JS 渲染（Markdeep 依赖外部 CDN，离线即无法渲染，且与 org 页视觉不一致），
    改由 comrak 服务端渲染；无 `-c/--css` 选项。
+   例外：Mermaid 图表只能浏览器端渲染（无纯 Rust 实现；quick-js 无 DOM 跑不了 mermaid；
+   mermaid-cli 是无头浏览器外部进程，违反决策 3）。vendored IIFE 内嵌离线可用，无 JS 时
+   读者看到原始源码（渐进增强），与 Markdeep 的 CDN 依赖本质不同。
 5. 全局字号约为浏览器默认的 80%，org/md 正文栏宽 100rem（与字号等比，保持每行字数）。
 6. 代码块为方角（无圆角）；语法高亮用 GitHub prettylights（亮）/ GitHub Dark（暗）双模式色板，
    选择器基于 syntect 输出的 scope atom 类名（`pre code span.keyword` 等），代码块背景色不变。

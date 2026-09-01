@@ -93,6 +93,11 @@ pub const KATEX_FONTS: &[(&str, &[u8])] = &[
     ),
 ];
 
+/// Mermaid 图表库 (v11.17.2, 官方 dist 的 IIFE 单文件自包含构建, MIT,
+/// 见 THIRD_PARTY_NOTICES): 浏览器端把 `<pre class="mermaid">` 渲染为 SVG;
+/// 由 chapbook-browser.js 按需懒加载, 仅页面含 mermaid 代码块时才请求.
+pub const MERMAID_JS: &[u8] = include_bytes!("../assets/mermaid.min.js");
+
 /// 浏览器渐进增强 JS (目录页/搜索页): 编译期内嵌, 由共享页面 head 引用.
 pub const BROWSER_JS: &str = include_str!("../assets/chapbook-browser.js");
 

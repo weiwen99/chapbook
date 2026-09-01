@@ -63,6 +63,38 @@ chapbook 本身采用 Apache License 2.0（见 [LICENSE](./LICENSE)）。
 > AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 > LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+### Mermaid v11.17.2（图表渲染）
+
+`assets/mermaid.min.js` 来自 [mermaid-js/mermaid](https://github.com/mermaid-js/mermaid)
+（v11.17.2，MIT）官方 dist 的 IIFE 单文件自包含构建（零动态 import、零运行时网络请求）。
+md fence ```` ```mermaid ```` 与 org `#+begin_src mermaid` 代码块由服务端输出为
+`<pre class="mermaid">` 容器，`chapbook-browser.js` 在页面含 mermaid 块时懒加载本文件，
+在浏览器端渲染为 SVG（`securityLevel: 'strict'`）。升级时替换
+`assets/mermaid.min.js` 并同步 `tests/router.rs::mermaid_js_static_asset_served`
+的字节数断言。
+
+> The MIT License (MIT)
+>
+> Copyright (c) 2014 - 2022 Knut Sveidqvist
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all
+> copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 > SOFTWARE.
 
 ## 内嵌语法定义（随二进制分发）

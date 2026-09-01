@@ -228,6 +228,16 @@ impl HtmlHandler<IoError> for OrgHtmlHandler {
             Element::Text { value } => {
                 write!(w, "{}", crate::math::org_text_html(value))?;
             }
+            // mermaid 图: 与 markdown 同一输出契约 (`<pre class="mermaid">` + 转义源码),
+            // 浏览器端 mermaid.js 懒加载渲染; 无 JS / 渲染失败时读者看到原始源码.
+            // 语言名大小写不敏感 (org 侧无 GitHub 惯例约束).
+            Element::SourceBlock(block) if block.language.eq_ignore_ascii_case("mermaid") => {
+                write!(
+                    w,
+                    "<pre class=\"mermaid\">{}</pre>",
+                    HtmlEscape(&block.contents)
+                )?;
+            }
             // src 块: syntect 高亮 (无语言时交回默认 handler 输出 `<pre class="example">`)
             Element::SourceBlock(block) if !block.language.is_empty() => {
                 write!(

@@ -9,6 +9,8 @@
 //! - 代码块经 syntect 高亮, 类名与 org/代码文件一致 (同一调色板)
 //! - 数学公式服务端 KaTeX 渲染 (comrak math_dollars/math_latex 扩展 +
 //!   math::replace_comrak_math 后处理; 解析失败回退原文)
+//! - mermaid 代码块经 codefence_renderers 插件输出 `<pre class="mermaid">` 容器
+//!   (浏览器端 mermaid.js 懒加载渲染; 无 JS/渲染失败时读者看到原始源码)
 //! - 文档内 raw HTML 转义显示 (pandoc 原样透传; 安全改进, 服务端渲染不执行内嵌 HTML)
 
 use std::borrow::Cow;
@@ -16,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Mutex;
 
-use comrak::adapters::{HeadingAdapter, HeadingMeta, SyntaxHighlighterAdapter};
+use comrak::adapters::{
+    CodefenceRendererAdapter, HeadingAdapter, HeadingMeta, SyntaxHighlighterAdapter,
+};
 use comrak::nodes::Sourcepos;
 use comrak::{Options, markdown_to_html_with_plugins, options::Plugins};
 
@@ -51,6 +55,13 @@ pub fn render(source: &str, file_name: &str) -> (String, String) {
     let mut plugins = Plugins::default();
     plugins.render.heading_adapter = Some(&heading);
     plugins.render.codefence_syntax_highlighter = Some(&MdHighlighter);
+    // mermaid fence 整块交给专用渲染器 (codefence_renderers 优先于高亮器),
+    // 输出浏览器端渲染容器; key 精确匹配小写 "mermaid" (与 GitHub 一致)
+    let mermaid = MermaidCodefence;
+    plugins
+        .render
+        .codefence_renderers
+        .insert("mermaid".to_string(), &mermaid);
 
     let body = markdown_to_html_with_plugins(source, &options, &plugins);
     // 数学 span → 服务端 KaTeX HTML (解析失败保留原 span 内容)
@@ -148,6 +159,29 @@ impl HeadingAdapter for HeadingCollector {
 
     fn exit(&self, output: &mut dyn fmt::Write, heading: &HeadingMeta) -> fmt::Result {
         write!(output, "</a></h{}>", heading.level)
+    }
+}
+
+/// mermaid 图表代码块渲染器: 输出 `<pre class="mermaid">` + HTML 转义源码,
+/// 不经 syntect 高亮; 浏览器端 mermaid.js 懒加载渲染 (见 chapbook-browser.js),
+/// 无 JS / 渲染失败时读者看到原始源码 (与数学公式的降级约定一致).
+struct MermaidCodefence;
+
+impl CodefenceRendererAdapter for MermaidCodefence {
+    fn write(
+        &self,
+        output: &mut dyn fmt::Write,
+        _lang: &str,
+        _meta: &str,
+        code: &str,
+        _sourcepos: Option<Sourcepos>,
+    ) -> fmt::Result {
+        output.write_str(
+            &maud::html! {
+                pre class="mermaid" { (code) }
+            }
+            .into_string(),
+        )
     }
 }
 

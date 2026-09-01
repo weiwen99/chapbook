@@ -447,6 +447,7 @@
           setDownloadEnabled(!wrapper.classList.contains('cb-dir-fragment'));
         }
         installPanelTitleMarkup(wrapper.querySelector('.cb-frag-title'));
+        renderMermaidIn(host); // 预览面板 fragment 内的 mermaid 容器
       })
       .catch(function (err) {
         if (!previewGuard.isCurrent(gen)) return; // 过期错误: 丢弃
@@ -1978,6 +1979,7 @@
       installDocLayout(wrapper.querySelector('.cb-doc'));
     }
     installPaneTocSpy(wrapper); // 新内容就位后重建 pane TOC spy (无 TOC 则 no-op)
+    renderMermaidIn(wrapper); // 树模式内容区 fragment 内的 mermaid 容器
     paneCommittedPath = wrapperPath;
     paneCommittedGen = gen;
     syncTreeToPath(gen, selectTree);
@@ -2630,6 +2632,122 @@
     }
   }
 
+  /* ---------- Mermaid 图表渲染 (懒加载; 事务式 render; 失败保留源码) ---------- */
+
+  // 服务端把 md fence ```mermaid 与 org #+begin_src mermaid 渲染为
+  // <pre class="mermaid">转义源码</pre> (textContent 即原始图源码)。
+  // 这里发现容器才懒加载 mermaid.min.js (3.5MB, 全站只请求一次), 渲染为 SVG。
+  // 降级约定 (与 math.rs 一致): 库加载失败/图语法错误 → 保留原始源码显示。
+
+  // 元素 → 原始图源码. WeakMap: 预览/树导航替换 fragment 后旧节点随 GC 释放.
+  const mermaidSources = new WeakMap();
+  // 元素 → 渲染票号 (单调递增): 主题切换/重复扫描并发时, 只有最新一次
+  // 渲染允许提交, 杜绝迟到的旧主题/旧结果覆盖新结果.
+  const mermaidTickets = new WeakMap();
+  let mermaidLoading = null; // 加载 Promise 缓存; 失败复位以允许下次重试
+  let mermaidSeq = 0; // mermaid.render 要求的唯一 id 序列
+
+  function mermaidTheme() {
+    return window.matchMedia &&
+      window.matchMedia('(prefers-color-scheme: dark)').matches
+      ? 'dark'
+      : 'default';
+  }
+
+  function loadMermaid() {
+    if (mermaidLoading !== null) return mermaidLoading;
+    mermaidLoading = new Promise(function (resolve, reject) {
+      const script = document.createElement('script');
+      script.src = '/__/static/js/mermaid.min.js';
+      script.onload = resolve;
+      script.onerror = function () {
+        mermaidLoading = null;
+        reject(new Error('mermaid.min.js 加载失败'));
+      };
+      document.head.appendChild(script);
+    });
+    return mermaidLoading;
+  }
+
+  // mermaid.render 的工作节点 (id 为 'd'+id) 可能残留在 body 下, 清理.
+  function removeMermaidStray(id) {
+    const stray = document.getElementById('d' + id);
+    if (stray && stray.parentNode) stray.parentNode.removeChild(stray);
+  }
+
+  // 事务式渲染: 不把容器元素交给 mermaid (v11 会先清空传入元素, 失败即丢源码),
+  // 先用保存的源码 render 出 SVG, 成功、票号最新且节点仍在文档中才提交;
+  // 任何失败都恢复原始源码 (suppressErrorRendering 已禁掉 mermaid 的错误图).
+  function renderOneMermaid(el) {
+    const source = mermaidSources.get(el);
+    if (typeof source !== 'string') return;
+    const ticket = (mermaidTickets.get(el) || 0) + 1;
+    mermaidTickets.set(el, ticket);
+    const id = 'cb-mermaid-' + mermaidSeq++;
+    window.mermaid.render(id, source).then(
+      function (out) {
+        removeMermaidStray(id);
+        if (mermaidTickets.get(el) !== ticket) return; // 已被更新的渲染取代
+        if (!el.isConnected) return; // fragment 已被替换: 丢弃结果
+        el.innerHTML = out.svg;
+        el.classList.add('cb-mermaid-rendered');
+        if (typeof out.bindFunctions === 'function') out.bindFunctions(el);
+      },
+      function () {
+        removeMermaidStray(id);
+        if (mermaidTickets.get(el) !== ticket) return;
+        if (!el.isConnected) return;
+        el.textContent = source; // 回退源码显示
+        el.classList.remove('cb-mermaid-rendered');
+      }
+    );
+  }
+
+  // 扫描 root 内未渲染的 mermaid 容器并渲染; root 为 document 时覆盖全页.
+  function renderMermaidIn(root) {
+    if (!root || typeof root.querySelectorAll !== 'function') return;
+    const els = Array.from(
+      root.querySelectorAll('pre.mermaid:not(.cb-mermaid-rendered)')
+    );
+    if (els.length === 0) return;
+    els.forEach(function (el) {
+      if (!mermaidSources.has(el)) {
+        mermaidSources.set(el, el.textContent || '');
+      }
+    });
+    loadMermaid().then(
+      function () {
+        if (!window.mermaid) return;
+        window.mermaid.initialize({
+          startOnLoad: false, // 手动驱动; 库是懒加载的, load 事件早已过去
+          securityLevel: 'strict', // 文件可来自局域网分享: 禁 click/HTML label
+          suppressErrorRendering: true, // 错误图由 catch 分支的源码回退取代
+          theme: mermaidTheme(),
+        });
+        els.forEach(renderOneMermaid);
+      },
+      function () {
+        /* 库加载失败: 源码保持显示; mermaidLoading 已复位, 下次扫描重试 */
+      }
+    );
+  }
+
+  // 系统主题切换: mermaid 主题色在渲染时烘焙进 SVG (无 CSS 变量可循),
+  // 用保存的源码按新主题重渲全部仍在文档中的图.
+  function rethemeMermaids() {
+    if (!window.mermaid) return; // 从未加载: 下次扫描自会按新主题初始化
+    window.mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: 'strict',
+      suppressErrorRendering: true,
+      theme: mermaidTheme(),
+    });
+    Array.from(document.querySelectorAll('pre.mermaid')).forEach(function (el) {
+      el.classList.remove('cb-mermaid-rendered');
+      renderOneMermaid(el);
+    });
+  }
+
   function init() {
     const tokenMeta = document.querySelector(
       'meta[name="cb-native-open-token"]'
@@ -2640,6 +2758,12 @@
     // (原正文将被 pane fragment 替换), 避免残留观察已脱离 DOM 的标题.
     initFullPageTocSpy();
     installTocSpyMql(); // 断点感知 spy 控制器 (跨 75rem 重装, 页面生命周期)
+    renderMermaidIn(document); // 完整页 (文档/代码页) 首屏 mermaid 扫描
+    if (window.matchMedia) {
+      window
+        .matchMedia('(prefers-color-scheme: dark)')
+        .addEventListener('change', rethemeMermaids);
+    }
     if (isTreeCapablePage()) {
       try {
         treeMode = localStorage.getItem(MODE_KEY) === 'tree';

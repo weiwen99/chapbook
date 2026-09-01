@@ -385,6 +385,7 @@ async fn static_asset(AxumPath(path): AxumPath<String>) -> Response {
         "css/chapbook-doc.css" => asset_response(render::DOC_STYLE, "text/css"),
         "js/materialize.min.js" => asset_response(assets::MATERIALIZE_JS, "application/javascript"),
         "js/chapbook-browser.js" => asset_response(assets::BROWSER_JS, "application/javascript"),
+        "js/mermaid.min.js" => asset_bytes_response(assets::MERMAID_JS, "application/javascript"),
         "katex/katex.min.css" => asset_response(assets::KATEX_CSS, "text/css"),
         path if path.starts_with("katex/fonts/") => {
             let name = &path["katex/fonts/".len()..];
@@ -915,7 +916,7 @@ fn trusted_ui_response(markup: String) -> Response {
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("frame-ancestors 'none'"),
+        HeaderValue::from_static("frame-ancestors 'none'; script-src 'self'"),
     );
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     response

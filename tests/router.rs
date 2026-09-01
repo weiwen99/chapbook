@@ -415,6 +415,106 @@ async fn markdown_toc_anchors_match_heading_ids() {
     assert!(heading_ids.contains(&"intro-1"), "body: {body}");
 }
 
+/// mermaid 代码块 (md fence / org src 块) 输出浏览器端渲染容器:
+/// `<pre class="mermaid">` + HTML 转义源码, 不经 syntect 高亮;
+/// 无 JS / 渲染失败时读者看到原始源码 (与数学降级约定一致).
+#[tokio::test]
+async fn mermaid_blocks_render_as_browser_containers() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("dia.md"),
+        "# Dia\n\n```mermaid\ngraph TD\n  A --> B\n```\n\n```rust\nfn main() {}\n```\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("dia.org"),
+        "* Dia\n\n#+begin_src mermaid\ngraph TD\n  A --> B\n#+end_src\n",
+    )
+    .unwrap();
+
+    for file in ["dia.md", "dia.org"] {
+        let res = get(app(dir.path()), &format!("/{file}")).await;
+        assert_eq!(res.status(), StatusCode::OK, "{file}");
+        let body = body_string(res).await;
+        assert!(
+            body.contains("<pre class=\"mermaid\">graph TD\n  A --&gt; B"),
+            "{file}: {body}"
+        );
+        // mermaid 块不经 syntect: 无高亮容器/语言类
+        assert!(!body.contains("language-mermaid"), "{file}: {body}");
+        assert!(!body.contains("src-mermaid"), "{file}: {body}");
+    }
+
+    // md 同页其它代码块仍走 syntect 高亮, 互不影响
+    let res = get(app(dir.path()), "/dia.md").await;
+    let body = body_string(res).await;
+    assert!(
+        body.contains(r#"<pre class="sourceCode"><code class="language-rust">"#),
+        "body: {body}"
+    );
+}
+
+/// org 语言名大小写不敏感: `#+begin_src Mermaid` 同样渲染为 mermaid 容器.
+#[tokio::test]
+async fn org_mermaid_language_is_case_insensitive() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("upper.org"),
+        "* Dia\n\n#+begin_src Mermaid\ngraph LR\n  X --> Y\n#+end_src\n",
+    )
+    .unwrap();
+    let res = get(app(dir.path()), "/upper.org").await;
+    let body = body_string(res).await;
+    assert!(
+        body.contains("<pre class=\"mermaid\">graph LR\n  X --&gt; Y"),
+        "body: {body}"
+    );
+}
+
+/// fragment 模式: mermaid 容器原样保留在预览片段中 (由面板 JS 渲染),
+/// 与其它文档 fragment 同一契约 — 只返回 CB 生成 HTML, 绝不回退裸字节.
+#[tokio::test]
+async fn fragment_preserves_mermaid_container() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("dia.md"),
+        "# Dia\n\n```mermaid\ngraph TD\n  A --> B\n```\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("dia.org"),
+        "* Dia\n\n#+begin_src mermaid\ngraph TD\n  A --> B\n#+end_src\n",
+    )
+    .unwrap();
+
+    for file in ["dia.md", "dia.org"] {
+        let res = get(app(dir.path()), &format!("/{file}?fragment=1")).await;
+        assert_eq!(res.status(), StatusCode::OK, "{file}");
+        assert_eq!(content_type(&res), "text/html; charset=utf-8", "{file}");
+        let body = body_string(res).await;
+        assert!(
+            body.contains("<pre class=\"mermaid\">graph TD\n  A --&gt; B"),
+            "{file}: {body}"
+        );
+    }
+}
+
+/// mermaid.js 静态资产经 /__/static/js/ 服务 (前端懒加载同一路径);
+/// 字节长度锁定版本: 升级 mermaid 必须同步替换文件并更新 THIRD_PARTY_NOTICES.
+#[tokio::test]
+async fn mermaid_js_static_asset_served() {
+    let dir = fixture();
+    let res = get(app(dir.path()), "/__/static/js/mermaid.min.js").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(content_type(&res), "application/javascript");
+    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        bytes.len(),
+        3_572_661,
+        "mermaid.min.js 应为官方 v11.17.2 dist (升级需同步 THIRD_PARTY_NOTICES)"
+    );
+}
+
 /// YAML front matter: title 进 <title> 与 title-block-header, front matter 本身不显示.
 #[tokio::test]
 async fn markdown_front_matter_title() {
@@ -1447,7 +1547,7 @@ async fn trusted_pages_have_anti_frame_and_no_sandbox() {
             .to_str()
             .unwrap()
             .to_string();
-        assert_eq!(csp, "frame-ancestors 'none'", "{uri}");
+        assert_eq!(csp, "frame-ancestors 'none'; script-src 'self'", "{uri}");
         assert_eq!(
             res.headers().get(header::X_FRAME_OPTIONS).unwrap(),
             "DENY",
@@ -2564,7 +2664,7 @@ async fn fragment_and_static_assets_lack_anti_frame_headers() {
         assert_eq!(res.status(), StatusCode::OK, "{uri}");
         assert_eq!(
             res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
-            "frame-ancestors 'none'",
+            "frame-ancestors 'none'; script-src 'self'",
             "{uri}"
         );
         assert_eq!(
