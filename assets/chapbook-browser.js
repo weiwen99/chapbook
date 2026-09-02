@@ -2647,11 +2647,44 @@
   let mermaidLoading = null; // 加载 Promise 缓存; 失败复位以允许下次重试
   let mermaidSeq = 0; // mermaid.render 要求的唯一 id 序列
 
-  function mermaidTheme() {
-    return window.matchMedia &&
-      window.matchMedia('(prefers-color-scheme: dark)').matches
-      ? 'dark'
-      : 'default';
+  // 主题色板真源在 CSS 变量 (chapbook-doc.css :root --cb-*; 目录页另有
+  // chapbook-theme.css 同名同值双份), 亮暗随 prefers-color-scheme 翻转.
+  // 每次渲染/重渲现场读取 computed 值, 杜绝 CSS 与 JS 两份色表漂移;
+  // 变量空值 → 省略该键, 交回 base 预设派生.
+  function mermaidConfig(el) {
+    const style = window.getComputedStyle(document.documentElement);
+    const dark =
+      window.matchMedia &&
+      window.matchMedia('(prefers-color-scheme: dark)').matches;
+    function cbVar(name) {
+      const v = style.getPropertyValue(name).trim();
+      return v || undefined;
+    }
+    // 字体族: 图所在 .cb-doc (doc.css 的正文栈), 无则任意 .cb-doc, 最后 document.body.
+    const host =
+      (el && el.closest && el.closest('.cb-doc')) ||
+      document.querySelector('.cb-doc') ||
+      document.body;
+    const fontFamily = window.getComputedStyle(host).fontFamily;
+    const themeVariables = {
+      // darkMode 必须在 themeVariables 内: theme-base 读 overrides.darkMode
+      // 计算派生色, 顶层 MermaidConfig.darkMode 不传入主题计算 (DesignGate).
+      darkMode: !!dark,
+      background: cbVar('--cb-bg'),
+      primaryColor: cbVar('--cb-soft-bg'),
+      primaryTextColor: cbVar('--cb-text'),
+      primaryBorderColor: cbVar('--cb-border'),
+      lineColor: cbVar('--cb-muted'),
+      textColor: cbVar('--cb-text'),
+      fontFamily: fontFamily || undefined,
+    };
+    return {
+      startOnLoad: false, // 手动驱动; 库是懒加载的, load 事件早已过去
+      securityLevel: 'strict', // 文件可来自局域网分享: 禁 click/HTML label
+      suppressErrorRendering: true, // 错误图由 catch 分支的源码回退取代
+      theme: 'base', // 官方自定义打底预设; 站点色板全靠上方 themeVariables (源自 CSS)
+      themeVariables: themeVariables,
+    };
   }
 
   function loadMermaid() {
@@ -2718,12 +2751,7 @@
     loadMermaid().then(
       function () {
         if (!window.mermaid) return;
-        window.mermaid.initialize({
-          startOnLoad: false, // 手动驱动; 库是懒加载的, load 事件早已过去
-          securityLevel: 'strict', // 文件可来自局域网分享: 禁 click/HTML label
-          suppressErrorRendering: true, // 错误图由 catch 分支的源码回退取代
-          theme: mermaidTheme(),
-        });
+        window.mermaid.initialize(mermaidConfig(els[0]));
         els.forEach(renderOneMermaid);
       },
       function () {
@@ -2736,12 +2764,7 @@
   // 用保存的源码按新主题重渲全部仍在文档中的图.
   function rethemeMermaids() {
     if (!window.mermaid) return; // 从未加载: 下次扫描自会按新主题初始化
-    window.mermaid.initialize({
-      startOnLoad: false,
-      securityLevel: 'strict',
-      suppressErrorRendering: true,
-      theme: mermaidTheme(),
-    });
+    window.mermaid.initialize(mermaidConfig());
     Array.from(document.querySelectorAll('pre.mermaid')).forEach(function (el) {
       el.classList.remove('cb-mermaid-rendered');
       renderOneMermaid(el);

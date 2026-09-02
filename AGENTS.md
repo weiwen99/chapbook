@@ -102,7 +102,11 @@ tests/
    （不传容器元素——v11 会先清空传入元素，失败即丢源码），成功且节点仍 `isConnected` 才提交
    SVG；`securityLevel: 'strict'`、`suppressErrorRendering: true`。降级约定与数学一致：
    无 JS / 库加载失败 / 图语法错误一律显示原始源码，不出现 mermaid 红色错误图。
-   主题按 `prefers-color-scheme` 选 `default`/`dark` 并监听切换重渲（主题色渲染时烘焙进 SVG）。
+   主题固定 `base` 预设：`themeVariables` 每次渲染现场从 `chapbook-doc.css` :root 的 `--cb-*`
+   变量读取（GitHub 色板亮/暗自适应，CSS 是唯一真源，JS 不复制色表；`darkMode` 写在
+   themeVariables 内——theme-base 读 `overrides.darkMode` 计算派生色，顶层
+   `MermaidConfig.darkMode` 不参与主题计算），字体取图所在 `.cb-doc` 的 computed fontFamily；
+   监听 `prefers-color-scheme` 切换全量重渲（主题色渲染时烘焙进 SVG）。
    预览面板与树模式 fragment 注入后由同一驱动扫描渲染；Office/CSV 与 .md 同管线自动获得支持。
    已废弃：Markdeep 客户端渲染与 pandoc/emacs 子进程管线（提案
    docs/2026-08-05-proposal-remove-dependency-of-pandoc.org，Phase 1/2 已实施）。
