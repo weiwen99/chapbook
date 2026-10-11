@@ -7,7 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::rejection::ExtensionRejection;
+use axum::extract::path::ErrorKind;
+use axum::extract::rejection::{ExtensionRejection, PathRejection};
 use axum::extract::{ConnectInfo, Form, FromRequest, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
@@ -18,6 +19,7 @@ use tokio::sync::Semaphore;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
+use crate::listing::ListingOptions;
 use crate::meta::{
     content_disposition, display_path_markup, display_path_text, encode_relative_path,
     escape_os_name,
@@ -273,51 +275,84 @@ async fn native_open(
     }
 }
 
-/// 递归搜索页: `GET /__/search?q=...` (可信 UI, anti-framing 头).
-/// 空/纯空白查询直接返回提示页, 不遍历; 非空查询经进程级并发门
+/// 递归搜索页: `GET /__/search?q=...` (可信 UI, anti-framing 头);
+/// `?fragment=1` 时改为安全搜索片段 (无 token/head/工具区, HTML + nosniff).
+/// 空/纯空白查询直接返回对应空结果, 不遍历; 非空查询经进程级并发门
 /// (容量 1): 忙 -> 429 + Retry-After: 1, 不排队第二次扫描.
+/// 完整页与片段使用同一 `listing::search` 结果、同一选项过滤/排序与截断语义;
+/// 片段永不携带 token, 也不从完整页抽取 token.
 async fn serve_search(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
     connect: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     headers: HeaderMap,
 ) -> Response {
+    // final Fragment 出口 (download/raw 键在场时不降级为片段): 决定错误样式
+    let fragment = parse_response_mode(&query) == Some(ResponseMode::Fragment);
+    let options = match parse_listing_options(&query) {
+        Ok(options) => options,
+        Err(status) => return early_error(status, fragment, "无效的请求参数"),
+    };
     // 仅 loopback peer + 字面 loopback Host 才嵌入 native token; 其余 fail closed
     let native_token = native_controls_allowed(&connect, headers.get(header::HOST))
         .then_some(state.token.as_str());
     let q = query.get("q").cloned().unwrap_or_default();
     let trimmed = q.trim().to_string();
     if trimmed.is_empty() {
-        // 空/纯空白查询: 不遍历, 直接返回提示页
+        // 空/纯空白查询: 不遍历, 直接返回提示页/空片段
         let empty = listing::SearchResult {
             entries: Vec::new(),
             truncated: false,
         };
-        return trusted_ui_response(
-            render::search_page(&state.root, &trimmed, &empty, native_token).into_string(),
-        );
+        return if fragment {
+            fragment_response(render::search_fragment(&trimmed, &empty, options))
+        } else {
+            trusted_ui_response(
+                render::search_page(&state.root, &trimmed, &empty, options, native_token)
+                    .into_string(),
+            )
+        };
     }
     // 归一化一次; listing::search 不再做逐候选归一化
     let normalized = trimmed.to_lowercase();
     let root = state.root.clone();
     match run_blocking_job(state.search_gate.clone(), move || {
-        listing::search(&root, &normalized)
+        listing::search(&root, &normalized, options)
     })
     .await
     {
-        Ok(result) => trusted_ui_response(
-            render::search_page(&state.root, &trimmed, &result, native_token).into_string(),
-        ),
+        Ok(result) => {
+            if fragment {
+                fragment_response(render::search_fragment(&trimmed, &result, options))
+            } else {
+                trusted_ui_response(
+                    render::search_page(&state.root, &trimmed, &result, options, native_token)
+                        .into_string(),
+                )
+            }
+        }
         Err(BlockingJobError::Busy) => {
-            let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-            response
+            if fragment {
+                fragment_failure(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Some(HeaderValue::from_static("1")),
+                    "搜索繁忙，请稍后重试",
+                )
+            } else {
+                let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                response
+            }
         }
         Err(BlockingJobError::Task(e)) => {
             tracing::warn!(error = %e, "search task panicked or was cancelled");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            if fragment {
+                fragment_failure(StatusCode::INTERNAL_SERVER_ERROR, None, "搜索失败")
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
         }
     }
 }
@@ -408,84 +443,131 @@ fn asset_bytes_response(content: &'static [u8], content_type: &'static str) -> R
 
 /// 列出目录内容或者返回文件.
 ///
-/// 响应模式集中解析 (download > raw > fragment > view, 见 [`parse_response_mode`]):
+/// 响应模式**最先**集中解析一次 (download > raw > fragment > view, 见
+/// [`parse_response_mode`]): 它决定之后一切提前失败 (参数 / Path 提取 / 越界 /
+/// metadata) 的错误出口 — 最终模式为 Fragment 时, 成功与错误都必须是 CB 生成的
+/// HTML + nosniff, 不能只检查 fragment 键是否存在.
+///
 /// - Download/Raw: 全部经 [`serve_file`] 单一 ServeFile 出口 (attachment / 原文);
 /// - Fragment: 全部经 [`serve_fragment`] 严格接口 (生成 HTML, 绝不裸内容);
 /// - Full/默认: 目录 -> md -> org -> Office -> 代码 -> ServeFile 顺序分派,
 ///   Office/代码在默认模式下按 Accept 协商 (含 text/html -> 渲染页).
 async fn serve_path(
     State(state): State<AppState>,
-    path: Option<AxumPath<String>>,
+    path: Result<AxumPath<String>, PathRejection>,
     Query(query): Query<HashMap<String, String>>,
     connect: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     headers: HeaderMap,
 ) -> Response {
+    let mode = parse_response_mode(&query);
+    let fragment = mode == Some(ResponseMode::Fragment);
+
+    // 统一显示规则 (sort 严格语法 / hidden 仅 0|1), 全条目出口共用
+    let options = match parse_listing_options(&query) {
+        Ok(options) => options,
+        Err(status) => return early_error(status, fragment, "无效的请求参数"),
+    };
+
     // 仅 loopback peer + 字面 loopback Host 才嵌入 native token; 其余 fail closed
     let native_token = native_controls_allowed(&connect, headers.get(header::HOST))
         .then_some(state.token.as_str());
-    // sort 参数非法时返回 404 (而非 400), 保持既有行为
-    let sort_by = match query.get("sort") {
-        Some(s) => match s.parse::<SortBy>() {
-            Ok(sort_by) => sort_by,
-            Err(_) => return StatusCode::NOT_FOUND.into_response(),
-        },
-        None => SortBy::default(),
+
+    // Path 提取的框架拒绝 (非法 UTF-8 路径等) 不得绕过最终模式出口:
+    // Fragment -> 400 CB HTML + nosniff; 其余保留框架 rejection 既有 400 text/plain.
+    let decoded = match path {
+        Ok(AxumPath(decoded)) => decoded,
+        // 无捕获段 (根路由) 的 WrongNumberOfParameters{got:0} 是合法根请求
+        Err(rejection) if path_rejection_is_root_route(&rejection) => String::new(),
+        Err(rejection) => {
+            if fragment {
+                return fragment_failure(StatusCode::BAD_REQUEST, None, "无效的路径编码");
+            }
+            return rejection.into_response();
+        }
     };
 
-    let decoded = path.map(|AxumPath(p)| p).unwrap_or_default();
     // 防路径穿越: 逐分量解析, 拒绝溢出根目录 (返回 403).
     // 注意: 词法的 startsWith(root) 前缀比较不会消除 `..` 分量,
     // `GET /%2e%2e/%2e%2e/etc/passwd` 可以绕过检查读到根目录外的文件.
     // `..` 分量弹到根目录时直接拒绝. 符号链接保持跟随语义.
     let Some(fs_path) = resolve_within_root(&state.root, &decoded) else {
-        return StatusCode::FORBIDDEN.into_response();
+        return early_error(StatusCode::FORBIDDEN, fragment, "路径越界");
     };
 
     // 如果文件不存在，返回 404 Not Found (metadata 跟随符号链接, 悬空链接 -> 404)
     let Ok(metadata) = std::fs::metadata(&fs_path) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return early_error(StatusCode::NOT_FOUND, fragment, "未找到目标");
     };
 
-    // 响应模式: 类型分派前集中解析一次 (优先级 download > raw > fragment > view)
-    let mode = parse_response_mode(&query);
+    // 只有生成完整阅读页时才编码位置, 原始字节/目录出口不做额外分配.
+    let encode_path =
+        || encode_relative_path(fs_path.strip_prefix(&state.root).unwrap_or(Path::new("")));
 
     if metadata.is_dir() {
         // 目录忽略 download/raw/view (对目录无意义), 恒返回可信完整目录页;
         // 唯一例外: fragment 模式返回迷你列表片段 (面板下钻)
         if mode == Some(ResponseMode::Fragment) {
-            return serve_fragment(&state, &fs_path, &metadata, FragmentKind::Dir).await;
+            return serve_fragment(&state, &fs_path, &metadata, FragmentKind::Dir, options).await;
         }
-        let files = listing::list_dir(&fs_path, &state.root, sort_by);
+        let files = listing::list_dir(&fs_path, &state.root, options);
         trusted_ui_response(
-            render::dir_page(&state.root, &fs_path, &files, sort_by, native_token).into_string(),
+            render::dir_page(&state.root, &fs_path, &files, options, native_token).into_string(),
         )
     } else {
         match mode {
             Some(ResponseMode::Download) => serve_file(&fs_path, headers, true).await,
             Some(ResponseMode::Raw) => serve_file(&fs_path, headers, false).await,
             Some(ResponseMode::Fragment) => {
-                serve_fragment(&state, &fs_path, &metadata, classify_fragment(&fs_path)).await
+                serve_fragment(
+                    &state,
+                    &fs_path,
+                    &metadata,
+                    classify_fragment(&fs_path),
+                    options,
+                )
+                .await
             }
             // Full (?view=1 强制渲染) 与默认 (无模式键): 类型分派;
             // 仅 Office/代码在默认且 Accept 不含 text/html 时按 Raw 返回原文
             Some(ResponseMode::Full) | None => {
-                if fs_path.to_string_lossy().ends_with(".md") {
+                if fs_path.extension() == Some(std::ffi::OsStr::new("md")) {
+                    let encoded = encode_path();
                     // 如果是 .md 文件，使用 comrak 渲染 (headers 透传供非 UTF-8 回退)
-                    serve_markdown(&fs_path, headers).await
-                } else if fs_path.to_string_lossy().ends_with(".org") {
+                    serve_markdown(&fs_path, headers, encoded.as_deref(), options).await
+                } else if fs_path.extension() == Some(std::ffi::OsStr::new("org")) {
+                    let encoded = encode_path();
                     // 如果是 .org 文件，使用 orgize 渲染 (headers 透传供非 UTF-8 回退)
-                    serve_org(&fs_path, headers).await
+                    serve_org(&fs_path, headers, encoded.as_deref(), options).await
                 } else if let Some(format) = office::format_for_path(&fs_path) {
                     // Office 文档 / CSV: 浏览器 -> anydoc 转 markdown 渲染, 脚本 -> 原文
                     if mode == Some(ResponseMode::Full) || accepts_html(&headers) {
-                        serve_office(&state, &fs_path, format, &metadata, headers).await
+                        let encoded = encode_path();
+                        serve_office(
+                            &state,
+                            &fs_path,
+                            format,
+                            &metadata,
+                            headers,
+                            encoded.as_deref(),
+                            options,
+                        )
+                        .await
                     } else {
                         serve_file(&fs_path, headers, false).await
                     }
                 } else if let Some(lang) = highlight::language_for_path(&fs_path) {
                     // 源代码文件: 浏览器 -> 高亮 HTML, 脚本 -> 原文
                     if mode == Some(ResponseMode::Full) || accepts_html(&headers) {
-                        serve_code(&fs_path, lang, &metadata, headers).await
+                        let encoded = encode_path();
+                        serve_code(
+                            &fs_path,
+                            lang,
+                            &metadata,
+                            headers,
+                            encoded.as_deref(),
+                            options,
+                        )
+                        .await
                     } else {
                         serve_file(&fs_path, headers, false).await
                     }
@@ -502,10 +584,27 @@ async fn serve_path(
 /// 与 serve_path 同模式). 请求路径逐分量复用 resolve_within_root (与文件服务同一
 /// 防线); 越界 403, 不存在/非目录 404 (小 JSON 错误体). 全部文件系统活
 /// (metadata/read_dir/identity) 在单个 spawn_blocking job 内执行, 不阻塞 Tokio
-/// worker. 子项固定排序: 目录在前, 组内名字升序. 目录携带 expandable: 非 UTF-8
+/// worker. 子项按统一显示规则 (sort/hidden, 与目录片段同一 comparator) 排序过滤;
+/// 非法 sort/hidden 404 (既有 JSON 错误体). 目录携带 expandable: 非 UTF-8
 /// (href None) 或 identity 与任一祖先相同 (符号链接环) 时为 false — 树内联展开
 /// 终止, 但条目仍显示、仍可按 URL 导航.
-async fn serve_tree(State(state): State<AppState>, path: Option<AxumPath<String>>) -> Response {
+async fn serve_tree(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    path: Option<AxumPath<String>>,
+) -> Response {
+    let options = match parse_listing_options(&query) {
+        Ok(options) => options,
+        Err(status) => {
+            return (
+                status,
+                Json(TreeError {
+                    error: "invalid query",
+                }),
+            )
+                .into_response();
+        }
+    };
     let decoded = path.map(|p| p.0).unwrap_or_default();
     let Some(fs_path) = resolve_within_root(&state.root, &decoded) else {
         return (
@@ -517,7 +616,7 @@ async fn serve_tree(State(state): State<AppState>, path: Option<AxumPath<String>
             .into_response();
     };
     let root = state.root.clone();
-    match tokio::task::spawn_blocking(move || build_tree_entries(&root, &fs_path)).await {
+    match tokio::task::spawn_blocking(move || build_tree_entries(&root, &fs_path, options)).await {
         Ok(Ok(entries)) => Json(TreeResponse { entries }).into_response(),
         Ok(Err(reason)) => (
             StatusCode::NOT_FOUND,
@@ -540,10 +639,15 @@ async fn serve_tree(State(state): State<AppState>, path: Option<AxumPath<String>
 }
 
 /// 树列表的同步核心 (在 spawn_blocking 内执行): metadata 判定、祖先 identity
-/// 集合与环检测、子项收集与排序. Err 为 404 理由 (见 TreeBuildError). 任一祖先
-/// identity 不可得 (非 Unix canonicalize 失败) 时 ancestor_identities_complete
-/// 置 false — 此后所有子目录一律终止展开, fail-closed, 绝不拿不完整集合做环判定.
-fn build_tree_entries(root: &Path, fs_path: &Path) -> Result<Vec<TreeEntry>, TreeBuildError> {
+/// 集合与环检测、子项收集与统一选项排序. Err 为 404 理由 (见 TreeBuildError).
+/// 任一祖先 identity 不可得 (非 Unix canonicalize 失败) 时
+/// ancestor_identities_complete 置 false — 此后所有子目录一律终止展开,
+/// fail-closed, 绝不拿不完整集合做环判定.
+fn build_tree_entries(
+    root: &Path,
+    fs_path: &Path,
+    options: ListingOptions,
+) -> Result<Vec<TreeEntry>, TreeBuildError> {
     let Ok(meta) = std::fs::metadata(fs_path) else {
         return Err(TreeBuildError::NotFound);
     };
@@ -578,12 +682,8 @@ fn build_tree_entries(root: &Path, fs_path: &Path) -> Result<Vec<TreeEntry>, Tre
             Err(_) => ancestor_identities_complete = false,
         }
     }
-    let mut files = listing::list_dir(fs_path, root, SortBy::default());
-    files.sort_by(|a, b| {
-        b.is_directory
-            .cmp(&a.is_directory)
-            .then_with(|| a.display_name.cmp(&b.display_name))
-    });
+    // 统一过滤与排序 (目录优先 + 选项), 不再有本地固定的“目录优先、名称升序”整表排序
+    let files = listing::list_dir(fs_path, root, options);
     Ok(files
         .into_iter()
         .map(|f| {
@@ -646,8 +746,8 @@ struct TreeError {
     error: &'static str,
 }
 
-/// 响应模式: 在 serve_path 内集中解析一次, 先于类型分派.
-/// 优先级 (查询键存在性): download > raw > fragment > view;
+/// 响应模式: 在 serve_path / serve_search 内集中解析一次, 先于类型分派与一切
+/// 提前失败. 优先级 (查询键存在性): download > raw > fragment > view;
 /// 无任何键时返回 None, 由类型默认裁定 (md/org Full; Office/代码按 Accept; 其余 Raw).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ResponseMode {
@@ -669,6 +769,47 @@ fn parse_response_mode(query: &HashMap<String, String>) -> Option<ResponseMode> 
     } else {
         None
     }
+}
+
+/// 统一显示规则解析 (完整目录、目录 fragment、树 JSON、搜索完整页与 fragment 共用):
+/// `sort=Column:Order` 保持精确大小写敏感语法, 非法值 404; `hidden` 仅接受
+/// `0`/`1`, 缺省 false, 非法值同样 404.
+fn parse_listing_options(query: &HashMap<String, String>) -> Result<ListingOptions, StatusCode> {
+    let sort_by = match query.get("sort") {
+        Some(raw) => raw.parse::<SortBy>().map_err(|_| StatusCode::NOT_FOUND)?,
+        None => SortBy::default(),
+    };
+    let show_hidden = match query.get("hidden").map(String::as_str) {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(_) => return Err(StatusCode::NOT_FOUND),
+    };
+    Ok(ListingOptions {
+        sort_by,
+        show_hidden,
+    })
+}
+
+/// 提前失败出口: 最终模式为 Fragment 时必须仍是 CB HTML + nosniff;
+/// 其余模式保留既有裸状态样式 (完整页/JSON 各自的既有错误样式).
+fn early_error(status: StatusCode, fragment: bool, message: &str) -> Response {
+    if fragment {
+        fragment_failure(status, None, message)
+    } else {
+        status.into_response()
+    }
+}
+
+/// 路由无捕获段 (根请求 `/`) 的 Path 提取失败是合法的“根路径”, 不是拒绝:
+/// 其余拒绝 (非法 UTF-8 路径等) 必须原样保留框架状态/样式.
+fn path_rejection_is_root_route(rejection: &PathRejection) -> bool {
+    let PathRejection::FailedToDeserializePathParams(err) = rejection else {
+        return false;
+    };
+    matches!(
+        err.kind(),
+        ErrorKind::WrongNumberOfParameters { got: 0, .. }
+    )
 }
 
 /// fragment 类型分派: 与 serve_path 的类型判定顺序一致
@@ -722,14 +863,17 @@ fn media_kind_for_path(path: &Path) -> Option<MediaKind> {
 /// 成功返回生成的安全 HTML fragment, 失败返回占位 fragment (200),
 /// 绝不回退 ServeFile / text/plain.
 ///
-/// 成功 fragment 的外层 wrapper 携带当前路径的 encoded identity
-/// (data-native-path-encoded, ASCII-only), 供 JS 安装面板 action;
-/// 路径不可编码时省略该属性 (action 保持禁用).
+/// 成功 fragment 的外层 wrapper (文件类型) 携带当前路径的 encoded identity
+/// (data-native-path-encoded, ASCII-only) 与 reading 语义 (data-cb-surface /
+/// data-cb-sort / data-cb-hidden), 供 JS 安装面板 action 与规则恢复;
+/// 路径不可编码时省略 identity 属性 (action 保持禁用). 目录 fragment 由
+/// `render::dir_fragment` 自带 wrapper (含 directory 语义与统一选项).
 async fn serve_fragment(
     state: &AppState,
     path: &Path,
     metadata: &std::fs::Metadata,
     kind: FragmentKind,
+    options: ListingOptions,
 ) -> Response {
     let rel = path.strip_prefix(&state.root).unwrap_or(Path::new(""));
     let encoded = encode_relative_path(rel);
@@ -738,8 +882,8 @@ async fn serve_fragment(
     match kind {
         FragmentKind::Dir => {
             // 目录 fragment 自带 encoded wrapper (render::dir_fragment), 不重复包装
-            let files = listing::list_dir(path, &state.root, SortBy::default());
-            fragment_response(render::dir_fragment(&state.root, path, &files))
+            let files = listing::list_dir(path, &state.root, options);
+            fragment_response(render::dir_fragment(&state.root, path, &files, options))
         }
         FragmentKind::Markdown => {
             let inner = match read_utf8(path).await {
@@ -750,7 +894,7 @@ async fn serve_fragment(
                 }
                 Err(reason) => no_preview(&reason),
             };
-            fragment_response(fragment_wrapper(encoded.as_deref(), rel, inner))
+            fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
         }
         FragmentKind::Org => {
             let inner = match read_utf8(path).await {
@@ -761,7 +905,7 @@ async fn serve_fragment(
                 }
                 Err(reason) => no_preview(&reason),
             };
-            fragment_response(fragment_wrapper(encoded.as_deref(), rel, inner))
+            fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
         }
         FragmentKind::Office(format) => {
             let inner = if metadata.len() > office::MAX_RENDER_BYTES {
@@ -801,7 +945,7 @@ async fn serve_fragment(
                     }
                 }
             };
-            fragment_response(fragment_wrapper(encoded.as_deref(), rel, inner))
+            fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
         }
         FragmentKind::Code(lang) => {
             let inner = if metadata.len() > highlight::MAX_RENDER_BYTES {
@@ -812,22 +956,27 @@ async fn serve_fragment(
                     Err(reason) => no_preview(&reason),
                 }
             };
-            fragment_response(fragment_wrapper(encoded.as_deref(), rel, inner))
+            fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
         }
         FragmentKind::Media(kind) => {
             let inner = media_fragment(encoded.as_deref(), &title, kind);
-            fragment_response(fragment_wrapper(encoded.as_deref(), rel, inner))
+            fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
         }
         FragmentKind::Unsupported => {
             let inner = no_preview("不支持预览此文件类型");
-            fragment_response(fragment_wrapper(encoded.as_deref(), rel, inner))
+            fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
         }
     }
 }
 
-/// fragment 响应的统一头: 200, text/html; charset=utf-8, nosniff.
+/// fragment 成功响应: 200, text/html; charset=utf-8, nosniff.
 fn fragment_response(html: String) -> Response {
-    let mut response = Html(html).into_response();
+    fragment_status_response(StatusCode::OK, html)
+}
+
+/// fragment 模式的状态出口: 状态与 nosniff 固定, 内容恒为 CB 生成的 HTML.
+fn fragment_status_response(status: StatusCode, html: String) -> Response {
+    let mut response = (status, Html(html)).into_response();
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -835,22 +984,53 @@ fn fragment_response(html: String) -> Response {
     response
 }
 
-/// 外层 fragment wrapper: 携带当前路径的 encoded identity, 显示 title (文本 attr)
-/// 与逐段 bdi 隔离的标题 markup (供 JS 安装到预览标题);
-/// encoded 为 None (路径不可编码) 时省略 data 属性, JS action 保持禁用.
-fn fragment_wrapper(encoded: Option<&str>, rel: &Path, inner: String) -> String {
+/// fragment 模式错误/忙出口: 真实 HTTP 状态 + CB 生成的占位 HTML + nosniff,
+/// 可选 Retry-After; 绝不返回裸字节或框架默认文本.
+fn fragment_failure(
+    status: StatusCode,
+    retry_after: Option<HeaderValue>,
+    message: &str,
+) -> Response {
+    let body = html! {
+        div class="cb-doc" data-cb-content-state="placeholder" {
+            p class="cb-no-preview" { (message) }
+        }
+    }
+    .into_string();
+    let mut response = fragment_status_response(status, body);
+    if let Some(value) = retry_after {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// 外层 fragment wrapper: 携带当前路径的 encoded identity 与 reading 语义
+/// (surface/有效显示规则), 显示 title (文本 attr) 与逐段 bdi 隔离的标题 markup
+/// (供 JS 安装到预览标题); encoded 为 None (路径不可编码) 时省略 data 属性,
+/// JS action 保持禁用.
+fn fragment_wrapper(
+    encoded: Option<&str>,
+    rel: &Path,
+    options: ListingOptions,
+    inner: String,
+) -> String {
     let inner = maud::PreEscaped(inner);
     let title = display_path_text(rel);
     let title_markup = display_path_markup(rel);
+    let sort = format!("{}:{}", options.sort_by.column, options.sort_by.order);
+    let hidden = if options.show_hidden { "1" } else { "0" };
     let wrapper = match encoded {
         Some(enc) => html! {
-            div class="cb-fragment" data-native-path-encoded=(enc) title=(title) {
+            div class="cb-fragment" data-cb-surface="reading"
+                data-cb-sort=(sort) data-cb-hidden=(hidden)
+                data-native-path-encoded=(enc) title=(title) {
                 span.cb-frag-title hidden { (title_markup) }
                 (inner)
             }
         },
         None => html! {
-            div class="cb-fragment" title=(title) {
+            div class="cb-fragment" data-cb-surface="reading"
+                data-cb-sort=(sort) data-cb-hidden=(hidden) title=(title) {
                 span.cb-frag-title hidden { (title_markup) }
                 (inner)
             }
@@ -860,9 +1040,11 @@ fn fragment_wrapper(encoded: Option<&str>, rel: &Path, inner: String) -> String 
 }
 
 /// 占位 fragment: 200, maud 转义文案, 不含任何原始文件字节.
+/// `data-cb-content-state=placeholder` 供 JS 识别非成功内容 (不靠文案猜测),
+/// 忙/错误占位不得冒充可跳过重取的成功内容.
 fn no_preview(reason: &str) -> String {
     html! {
-        div class="cb-doc" {
+        div class="cb-doc" data-cb-content-state="placeholder" {
             p class="cb-no-preview" { "无法预览：" (reason) }
         }
     }
@@ -946,10 +1128,15 @@ fn resolve_within_root(root: &Path, decoded: &str) -> Option<PathBuf> {
 /// 数学公式按原文显示; raw HTML 转义显示 (安全). 非 UTF-8 文件回退
 /// ServeFile 裸字节 (单一 raw 出口, 带 sandbox CSP), 原请求头
 /// (Range/条件请求) 原样透传.
-async fn serve_markdown(path: &Path, headers: HeaderMap) -> Response {
+async fn serve_markdown(
+    path: &Path,
+    headers: HeaderMap,
+    encoded: Option<&str>,
+    options: ListingOptions,
+) -> Response {
     match tokio::fs::read(path).await {
         Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(source) => render_markdown_response(&source, path).await,
+            Ok(source) => render_markdown_response(&source, path, encoded, options).await,
             Err(_) => serve_file(path, headers, false).await,
         },
         Err(e) => {
@@ -961,10 +1148,17 @@ async fn serve_markdown(path: &Path, headers: HeaderMap) -> Response {
 
 /// 共享: 把 markdown 源渲染为完整文档页 (.md 与 anydoc 转换结果共用).
 /// comrak 纯 Rust 渲染 (表格/任务列表/footnotes 等 GFM 扩展), 不会失败.
-async fn render_markdown_response(source: &str, path: &Path) -> Response {
+/// encoded (root-relative, 既有编码器) 与 options 交给 `render::doc_page`,
+/// 由渲染层输出独立阅读页的规范 identity 与有效显示规则.
+async fn render_markdown_response(
+    source: &str,
+    path: &Path,
+    encoded: Option<&str>,
+    options: ListingOptions,
+) -> Response {
     let file_name = file_name_text(path);
     let (title, body) = markdown::render(source, &file_name);
-    let page = render::doc_page(&title, &body);
+    let page = render::doc_page(&title, &body, encoded, options);
     trusted_ui_response(render::inject_doc_style(&page))
 }
 
@@ -978,6 +1172,8 @@ async fn serve_code(
     lang: &str,
     metadata: &std::fs::Metadata,
     headers: HeaderMap,
+    encoded: Option<&str>,
+    options: ListingOptions,
 ) -> Response {
     // 大文件保护: 超过阈值不做渲染
     if metadata.len() > highlight::MAX_RENDER_BYTES {
@@ -988,7 +1184,7 @@ async fn serve_code(
             Ok(source) => {
                 let title = file_name_text(path);
                 let body = highlight::code_block(&source, Some(lang));
-                let page = render::doc_page(&title, &body);
+                let page = render::doc_page(&title, &body, encoded, options);
                 trusted_ui_response(render::inject_doc_style(&page))
             }
             // 非 UTF-8: 不做编码猜测, 裸字节透传
@@ -1022,6 +1218,8 @@ async fn serve_office(
     format: office::Format,
     metadata: &std::fs::Metadata,
     headers: HeaderMap,
+    encoded: Option<&str>,
+    options: ListingOptions,
 ) -> Response {
     // 大文件保护: 转换是 CPU 活, 超过阈值不做渲染
     if metadata.len() > office::MAX_RENDER_BYTES {
@@ -1033,7 +1231,9 @@ async fn serve_office(
     })
     .await
     {
-        Ok(OfficeConvert::Markdown(markdown)) => render_markdown_response(&markdown, path).await,
+        Ok(OfficeConvert::Markdown(markdown)) => {
+            render_markdown_response(&markdown, path, encoded, options).await
+        }
         Ok(OfficeConvert::ConvertFailed(e)) => {
             tracing::warn!(error = %e, path = %path.display(), "failed to convert office document, serving raw");
             serve_file(path, headers, false).await
@@ -1065,13 +1265,18 @@ async fn serve_office(
 /// (内容完整); 4 级标题完整保留 (pandoc/emacs 会结构性丢失); 无子进程/超时兜底.
 /// 非 UTF-8 文件回退 ServeFile 裸字节 (orgize 需要 UTF-8 输入; 单一 raw 出口),
 /// 原请求头 (Range/条件请求) 原样透传.
-async fn serve_org(path: &Path, headers: HeaderMap) -> Response {
+async fn serve_org(
+    path: &Path,
+    headers: HeaderMap,
+    encoded: Option<&str>,
+    options: ListingOptions,
+) -> Response {
     match tokio::fs::read(path).await {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(source) => {
                 let file_name = file_name_text(path);
                 let (title, body) = org::render(&source, &file_name);
-                let page = render::doc_page(&title, &body);
+                let page = render::doc_page(&title, &body, encoded, options);
                 trusted_ui_response(render::inject_doc_style(&page))
             }
             Err(_) => serve_file(path, headers, false).await,
@@ -1435,9 +1640,345 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert!(
-            body_to_string(res).await.contains(r#"href="/1.txt""#),
+            body_to_string(res).await.contains("/1.txt"),
             "recovery search must list the match"
         );
+    }
+
+    /// 响应头取文本值 (缺省空串), 供状态/类型/安全头断言.
+    fn header_str(res: &Response, name: axum::http::HeaderName) -> String {
+        res.headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// 搜索片段忙: 429 + Retry-After: 1 + nosniff + 安全占位 HTML (无 token/裸字节);
+    /// 释放 permit 后片段恢复正常结果, 与完整页同一数据出口.
+    #[tokio::test]
+    async fn search_fragment_busy_429_with_retry_after_and_safe_html() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("1.txt"), "1").unwrap();
+        let gate = Arc::new(Semaphore::new(1));
+        let held = gate.clone().try_acquire_owned().expect("preheld permit");
+        let state = AppState {
+            root: dir.path().to_path_buf(),
+            search_gate: gate.clone(),
+            office_gate: Arc::new(Semaphore::new(1)),
+            token: "test-token".to_string(),
+            opener: Arc::new(RecordingOpener::new()),
+        };
+
+        let fragment_query = || {
+            let mut query = HashMap::new();
+            query.insert("q".to_string(), "1.txt".to_string());
+            query.insert("fragment".to_string(), "1".to_string());
+            query
+        };
+
+        let res = serve_search(
+            State(state.clone()),
+            Query(fragment_query()),
+            connect_info_missing().await,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(header_str(&res, header::RETRY_AFTER), "1");
+        assert_eq!(
+            header_str(&res, header::CONTENT_TYPE),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(header_str(&res, header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+        let body = body_to_string(res).await;
+        assert!(
+            body.contains(r#"data-cb-content-state="placeholder""#),
+            "{body}"
+        );
+        assert!(!body.contains("cb-native-open-token"), "{body}");
+
+        drop(held);
+        let res = serve_search(
+            State(state),
+            Query(fragment_query()),
+            connect_info_missing().await,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(header_str(&res, header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+        let recovered = body_to_string(res).await;
+        assert!(recovered.contains("/1.txt"), "释放后片段必须展示同一匹配");
+    }
+
+    /// 搜索片段经真实路由: 与完整页同一匹配集合; 片段永不携带 native token,
+    /// 完整搜索页在 loopback 门禁允许时仍携带 (既有能力保持).
+    #[tokio::test]
+    async fn search_fragment_router_shares_result_without_token() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("1.txt"), "1").unwrap();
+        let app = app_with(
+            dir.path().to_path_buf(),
+            TOKEN.to_string(),
+            Arc::new(RecordingOpener::new()),
+        );
+
+        let res = app
+            .clone()
+            .oneshot(page_request(
+                Some(loopback_peer()),
+                "localhost",
+                "/__/search?q=1.txt&fragment=1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            header_str(&res, header::CONTENT_TYPE),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(header_str(&res, header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+        let fragment_body = body_to_string(res).await;
+        let fragment_has_token = fragment_body.contains("cb-native-open-token");
+        assert!(!fragment_has_token, "片段不得携带 token: {fragment_body}");
+        assert!(
+            fragment_body.contains("/1.txt"),
+            "片段与完整页共享同一匹配: {fragment_body}"
+        );
+        assert!(
+            !fragment_body.contains("<html"),
+            "片段不得是完整文档: {fragment_body}"
+        );
+
+        let res = app
+            .clone()
+            .oneshot(page_request(
+                Some(loopback_peer()),
+                "localhost",
+                "/__/search?q=1.txt",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let full_body = body_to_string(res).await;
+        assert!(
+            full_body.contains("cb-native-open-token"),
+            "完整搜索页保持 native 能力"
+        );
+        assert!(full_body.contains("/1.txt"));
+
+        // 空查询片段: 不遍历, 200 安全 HTML + nosniff
+        let res = app
+            .oneshot(page_request(
+                Some(loopback_peer()),
+                "localhost",
+                "/__/search?q=&fragment=1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(header_str(&res, header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+        let body = body_to_string(res).await;
+        assert!(!body.contains("cb-native-open-token"), "{body}");
+    }
+
+    /// 最终 Fragment 模式下参数 / Path 提取 / 越界 / metadata 失败的错误出口:
+    /// 状态保留, 内容恒为 CB HTML + nosniff + placeholder 标记;
+    /// 非 fragment 保留既有裸样式; download/raw 优先级不被 fragment 键绕过.
+    #[tokio::test]
+    async fn fragment_mode_early_errors_are_safe_html_with_preserved_status() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("1.txt"), "hello").unwrap();
+        let app = app_with(
+            dir.path().to_path_buf(),
+            TOKEN.to_string(),
+            Arc::new(RecordingOpener::new()),
+        );
+
+        // 非法 sort / hidden -> 404 安全 HTML
+        for uri in ["/?fragment=1&sort=bogus", "/?fragment=1&hidden=2"] {
+            let res = app
+                .clone()
+                .oneshot(page_request(None, "localhost", uri))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+            let content_type = header_str(&res, header::CONTENT_TYPE);
+            assert_eq!(content_type, "text/html; charset=utf-8", "{uri}");
+            assert_eq!(
+                header_str(&res, header::X_CONTENT_TYPE_OPTIONS),
+                "nosniff",
+                "{uri}"
+            );
+            let body = body_to_string(res).await;
+            assert!(
+                body.contains(r#"data-cb-content-state="placeholder""#),
+                "{uri}: {body}"
+            );
+        }
+
+        // 越界 -> 403 安全 HTML; 缺失目标 -> 404 安全 HTML
+        for (uri, status) in [
+            ("/%2e%2e/secret?fragment=1", StatusCode::FORBIDDEN),
+            ("/nope.txt?fragment=1", StatusCode::NOT_FOUND),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(page_request(None, "localhost", uri))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), status, "{uri}");
+            assert_eq!(
+                header_str(&res, header::X_CONTENT_TYPE_OPTIONS),
+                "nosniff",
+                "{uri}"
+            );
+            assert!(
+                body_to_string(res)
+                    .await
+                    .contains(r#"data-cb-content-state="placeholder""#),
+                "{uri}"
+            );
+        }
+
+        // 非法 UTF-8 Path 提取: fragment -> 400 安全 HTML; 其余 -> 既有 400 text/plain
+        let res = app
+            .clone()
+            .oneshot(page_request(None, "localhost", "/%FF.txt?fragment=1"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            header_str(&res, header::CONTENT_TYPE),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(header_str(&res, header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+        assert!(
+            body_to_string(res)
+                .await
+                .contains(r#"data-cb-content-state="placeholder""#)
+        );
+
+        let res = app
+            .clone()
+            .oneshot(page_request(None, "localhost", "/%FF.txt"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            header_str(&res, header::CONTENT_TYPE),
+            "text/plain; charset=utf-8",
+            "非 fragment 保留框架 rejection 样式"
+        );
+
+        // 非 fragment 非法 sort: 既有裸 404 (无内容类型)
+        let res = app
+            .clone()
+            .oneshot(page_request(None, "localhost", "/?sort=bogus"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(res.headers().get(header::CONTENT_TYPE).is_none());
+
+        // download > raw > fragment: 键混用时按最终优先级选择字节出口
+        let res = app
+            .clone()
+            .oneshot(page_request(None, "localhost", "/1.txt?raw=1&fragment=1"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            header_str(&res, header::CONTENT_TYPE),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(body_to_string(res).await, "hello");
+
+        let res = app
+            .oneshot(page_request(
+                None,
+                "localhost",
+                "/1.txt?download=1&fragment=1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(header_str(&res, header::CONTENT_DISPOSITION).starts_with("attachment"));
+        assert_eq!(body_to_string(res).await, "hello");
+    }
+
+    /// 树 JSON 接受统一 sort/hidden (不再固定目录优先/名称升序的旧排序);
+    /// 非法值沿用既有 JSON 错误体 404.
+    #[tokio::test]
+    async fn tree_json_honors_shared_sort_and_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt", ".secret.txt"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("zdir")).unwrap();
+        let app = app_with(
+            dir.path().to_path_buf(),
+            TOKEN.to_string(),
+            Arc::new(RecordingOpener::new()),
+        );
+
+        fn names(body: &str) -> Vec<String> {
+            let value: serde_json::Value = serde_json::from_str(body).expect("tree json");
+            value["entries"]
+                .as_array()
+                .expect("entries array")
+                .iter()
+                .map(|entry| entry["name"].as_str().expect("name").to_string())
+                .collect()
+        }
+
+        let body = body_to_string(
+            app.clone()
+                .oneshot(page_request(None, "localhost", "/__/tree"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(names(&body), ["zdir", "a.txt", "b.txt"], "默认过滤+排序");
+
+        let body = body_to_string(
+            app.clone()
+                .oneshot(page_request(
+                    None,
+                    "localhost",
+                    "/__/tree?sort=Name:Desc&hidden=1",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            names(&body),
+            ["zdir", "b.txt", "a.txt", ".secret.txt"],
+            "显式 hidden=1 与 Name:Desc 实际生效"
+        );
+
+        for uri in ["/__/tree?sort=bogus", "/__/tree?hidden=2"] {
+            let res = app
+                .clone()
+                .oneshot(page_request(None, "localhost", uri))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(
+                header_str(&res, header::CONTENT_TYPE),
+                "application/json",
+                "{uri}"
+            );
+            let body = body_to_string(res).await;
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&body)
+                    .expect("json error body")
+                    .get("error")
+                    .is_some(),
+                "{uri}: {body}"
+            );
+        }
     }
 
     /// 构造私有 AppState (同模块直构): office_gate 由调用方预持有, busy 判定确定化.
@@ -1469,6 +2010,7 @@ mod tests {
             &csv_path,
             &metadata,
             FragmentKind::Office(office::Format::Csv),
+            ListingOptions::default(),
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
@@ -1494,6 +2036,18 @@ mod tests {
             "busy fragment must be a safe placeholder: {body}"
         );
         assert!(
+            body.contains(r#"data-cb-content-state="placeholder""#),
+            "busy placeholder must be identifiable without wording: {body}"
+        );
+        assert!(
+            body.contains(r#"data-cb-surface="reading""#),
+            "file fragment wrapper must carry reading surface metadata: {body}"
+        );
+        assert!(
+            body.contains(r#"data-cb-sort="Name:Asc""#) && body.contains(r#"data-cb-hidden="0""#),
+            "file fragment wrapper must carry effective display rules: {body}"
+        );
+        assert!(
             !body.contains("Alice"),
             "busy placeholder must not leak raw content: {body}"
         );
@@ -1505,6 +2059,8 @@ mod tests {
             office::Format::Csv,
             &metadata,
             HeaderMap::new(),
+            None,
+            ListingOptions::default(),
         )
         .await;
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1524,6 +2080,7 @@ mod tests {
             &csv_path,
             &metadata,
             FragmentKind::Office(office::Format::Csv),
+            ListingOptions::default(),
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
@@ -1537,6 +2094,8 @@ mod tests {
             office::Format::Csv,
             &metadata,
             HeaderMap::new(),
+            None,
+            ListingOptions::default(),
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
@@ -1614,7 +2173,8 @@ mod tests {
     #[tokio::test]
     async fn markdown_and_office_title_escapes_unsafe_filename() {
         let path = Path::new("\u{202E}evil\u{200B}name.md");
-        let res = render_markdown_response("# hello\nbody", path).await;
+        let res =
+            render_markdown_response("# hello\nbody", path, None, ListingOptions::default()).await;
         let html = body_to_string(res).await;
         assert!(
             html.contains("\\u{202E}evil\\u{200B}name.md"),
@@ -1633,7 +2193,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let name = "\u{202E}evil\u{200B}report.org";
         std::fs::write(dir.path().join(name), "* Head\nbody").unwrap();
-        let res = serve_org(&dir.path().join(name), HeaderMap::new()).await;
+        let res = serve_org(
+            &dir.path().join(name),
+            HeaderMap::new(),
+            None,
+            ListingOptions::default(),
+        )
+        .await;
         let html = body_to_string(res).await;
         assert!(
             html.contains("\\u{202E}evil\\u{200B}report.org"),
@@ -1653,7 +2219,15 @@ mod tests {
         let name = "\u{202E}evil\u{200B}main.rs";
         std::fs::write(dir.path().join(name), "fn main() {}\n").unwrap();
         let metadata = std::fs::metadata(dir.path().join(name)).unwrap();
-        let res = serve_code(&dir.path().join(name), "rust", &metadata, HeaderMap::new()).await;
+        let res = serve_code(
+            &dir.path().join(name),
+            "rust",
+            &metadata,
+            HeaderMap::new(),
+            None,
+            ListingOptions::default(),
+        )
+        .await;
         let html = body_to_string(res).await;
         assert!(
             html.contains("\\u{202E}evil\\u{200B}main.rs"),

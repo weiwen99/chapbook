@@ -60,7 +60,8 @@ Linux/macOS 本地文件浏览器"演进，核心壁垒是渲染质量而非文�
 
 ** 响应模式 ResponseMode（统一解析，先于类型分派）[门槛 5]
 
-所有 =/{*path}= 请求在文件类型 handler 之前集中解析响应意图，形成单一内部接口：
+所有 =/{*path}= 请求先于路径提取错误、参数校验、metadata 与类型分派解析最终响应意图，
+形成单一内部接口；出现 fragment 键不等于最终模式（download/raw 优先）：
 
 #+begin_src rust
 enum ResponseMode {
@@ -104,7 +105,7 @@ enum ResponseMode {
   Fragment 返回 =<img>/<video>/<audio>= 包装片段。
   扩展名集合：图片 =png jpg jpeg gif webp svg avif ico=；视频 =mp4 webm mov m4v=；
   音频 =mp3 flac ogg opus wav m4a=。
-- 非法 sort 返回 404 等既有行为契约不变。
+- 目录/树/搜索/目录 fragment 共用 =sort= 与 =hidden=0|1=，非法值一律 404。
 - ConnectInfo plumbing：=main.rs= 改为
   =axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())= [门槛 1]。
 
@@ -123,6 +124,9 @@ fragment 是预览面板的唯一内容来源，必须是严格接口——**任
   =<div class="cb-doc"><p class="cb-no-preview">无法预览：<原因></p></div>=（200，
   maud 转义文案，**不含原始文件字节**）。fragment 模式禁止回退到 ServeFile 或
   text/plain 原文。
+- 最终 fragment 模式的路径提取/越界/缺失/参数/搜索忙等失败也只输出 CB HTML +
+  nosniff，保留 400/403/404/429 等真实状态及 Retry-After。搜索 fragment 同样不含 token，
+  不从完整页 head 截取内容，也不因早期错误退回 text/plain 或裸字节。
 - 渲染安全性由各生成管线明确保证：
   - Markdown raw HTML 与危险 URL 继续由 Comrak 默认的 =unsafe=false= 处理。
   - Org 的 =OrgHtmlHandler= 必须显式覆盖三类元素，Full 与 Fragment 复用同一
@@ -218,9 +222,10 @@ peer/Host 是否满足 token 嵌入条件都带相同 header，避免安全行�
   helper/error 全部 private，不给 =AppState= 增加 test runner 或第二套 adapter。
 - 实现（=listing.rs= 新增 =search= 阻塞函数；handler 仅负责参数、helper 调用与 HTTP 映射）：
   - 迭代式 BFS 队列（=VecDeque<PathBuf>=，seed 为 root），不用递归，避免深目录爆栈。
-  - 在处理每个目录前先收集全部 =DirEntry=，按 Unix 原始文件名 bytes
-    （=OsStrExt::as_bytes()=）升序排序，再进行匹配与入队。全局顺序定义为：
-    深度升序；同一深度按父目录既有 BFS 顺序；同一目录按上述 bytes 顺序。
+  - 先收集各目录的原始文件名，按 Unix bytes（=OsStrExt::as_bytes()=）升序遍历。
+    这决定候选的 BFS 顺序：深度升序、同深度按父目录 BFS 顺序、同目录按 raw basename。
+    隐藏关闭时，basename 以 =.= 开头的条目在 identity、入队与匹配计数前过滤；
+    可见符号链接按链接名判断，仍可进入隐藏目标；服务 root 与父目录行不参与过滤。
   - root identity 预先加入 =visited_dirs=。每个成功读取 metadata 的目录项都先独立执行
     名称匹配并可进入结果；普通文件从不加入 identity set，因此 hard link 的每个名称/路径
     都保留。
@@ -232,8 +237,8 @@ peer/Host 是否满足 token 嵌入条件都带相同 header，避免安全行�
     不使整个搜索 500。
   - 查询字符串在 handler 内 =to_lowercase()= 一次；候选项逐个
     =display_name.to_lowercase().contains(q)=。非 UTF-8 名称因此可用 escaped label 搜索。
-  - 结果直接使用确定性遍历顺序，不做“截断后再排序”。遇到第 501 个 match 立即停止，
-    返回前 500 项 + truncated。确定性保证以扫描期间文件树未变化为前提。
+  - 遇到第 501 个可见 match 即停止，候选集为前 500 项 + truncated，再按共享显示规则
+    排序展示；不是扫描全根后取最新/最大 500 项。确定性以扫描期间文件树未变化为前提。
 - =spawn_blocking= 扫描启动后不可 abort；Ctrl-C 可能等待当前一次有限遍历结束。这是同步
   文件系统 API 的已知边界，并发门确保最多只有一次扫描占用 blocking pool。
 - 结果页：页头搜索框（q 预填）+ 面包屑（root / 搜索："q"）+ 复用 striped 表格，
@@ -268,7 +273,7 @@ peer/Host 是否满足 token 嵌入条件都带相同 header，避免安全行�
 | =Enter= | 当前 tab 打开选中行 |
 | =o= | 新 tab 打开选中行 |
 | =p= | 预览选中行/切换预览面板 |
-| =v= | 切换列表/网格视图 |
+| =v= | 仅浏览表面按列表→网格→树→列表循环（输入框/可编辑区/修饰键不触发） |
 | =Backspace= | 上级目录 |
 | =/= | 聚焦搜索框 |
 | =Esc= | 关闭预览；搜索框聚焦时先失焦 |
@@ -293,11 +298,30 @@ peer/Host 是否满足 token 嵌入条件都带相同 header，避免安全行�
   本机打开（仅当页面嵌入了 token，见下节）。
 - 面板内目录迷你列表的条目链接由 JS 拦截为面板内下钻；下钻同样保存 encodedPath，
   不保存 decoded URL target。工具栏“当前 tab 打开”用于离开面板进入完整页。
-- 视图切换：列表/网格 toggle，localStorage 持久化；网格项图片用
-  =<img loading="lazy" decoding="async">= 客户端缩放（零新依赖），非图片显示扩展名标签。
-- 页头常驻搜索框，普通 form GET 提交到 =/__/search=（无 JS 可用）。
-- 渐进增强：无 JS 时文件名链接、搜索、面包屑、排序、下载均可用；JS 只叠加
-  键盘/面板/视图切换/行尾图标行为。
+- 统一顶部工具区：树/列表/网格三个同级互斥 SVG 图标，hover/focus 提示；隐藏开关与
+  六键双向排序共用显示规则。网格图片用 =<img loading="lazy" decoding="async">=，
+  非图片显示扩展名标签。独立阅读页不选中任何视图，隐藏/排序禁用；树打开文档，
+  列表/网格进入父目录并定位文档。目录迷你列表不复制工具区。
+- 共享 =ListingOptions=：默认 Name:Asc、隐藏关闭；六键均目录优先，方向只作用主键，
+  同值按 raw basename、完整 root-relative raw path 升序。Type 取末尾扩展名、ASCII
+  大小写不敏感，无扩展名独立分组；目录忽略后缀，大小是 metadata.len()、不递归，
+  时间沿用既有 fallback。
+- 页头搜索框普通 GET 表单包含实际 sort/hidden 字段；搜索、条目、父目录、面包屑导航
+  延续规则，只有真正离开搜索才移除 q。无 JS 时列表隐藏/排序/搜索/导航正常可用，
+  只采用 URL 与默认值，不读 localStorage、不使用 cookie；树与网格依赖 JS。
+- 同源偏好只在用户操作时保存被改字段；无有效历史快照的冷进入按显式 URL > 偏好 > 默认。
+  reload/popstate/BFCache 优先恢复自己的快照，不被其他 tab 的偏好覆盖、不回写偏好。
+  同位置控制变化 replace，真实目录/文件/搜索导航 push；URL 分享路径/q/sort/hidden/hash，
+  不携带浏览布局，=view=1= 仍是文件渲染响应模式。
+- 规则变化只重取受影响的条目区，保持打开文档的 live DOM、不重新转换；树分支按规则版本
+  丢弃旧成功和旧错误，独立分支分别恢复，失败显示安全错误、保留展开意图、不自动重试。
+  空分支只表示当前规则下无孩子，不永久变成叶子。隐藏焦点回退不打开回退项，再显示不抢焦点。
+- 树目录显式折叠后，刷新与显示规则更新尊重该状态；子树展开记忆保留，但不能反向打开
+  折叠祖先，当前文档定位也不覆盖折叠。重新展开父目录时恢复子树，失败子分支不自动重试；
+  实际文件导航或新进入树视图定位目标时仍展开目标路径。
+- 导航目标与成功安装的内容标记分离：历史加载失败保留目标 URL/快照，成功标记失效，
+  同路径后续恢复必须能重取。快照/fragment/存储不携带 token；树切回列表/网格需完整可信页
+  恢复 native-open，保留当前目录或搜索上下文，不另加历史项。
 
 ** 本机打开与安全（关键）[门槛 1、6]
 
@@ -400,9 +424,9 @@ path codec，也不把 lossy Unicode 当作 identity。
   任何 renderer/JS 禁止把 raw basename、=Path::display()= 或 =to_string_lossy= 写入
   用户可见文本。私有 =display_path_text= / =display_path_markup= 集中完成逐 segment join，
   不允许各页面自行拼接。
-- 非 UTF-8 名称仍按 escaped =display_name= 参与列表排序与大小写不敏感搜索；命中结果同样
-  display-only。root 本身由 =/= 表示，root basename 若非 UTF-8 以同一规则生成 breadcrumb
-  label，不影响其 UTF-8 子路径的 actionability。
+- 非 UTF-8 名称按原始 bytes 排序，按 escaped =display_name= 大小写不敏感搜索，
+  命中结果仍 display-only。root 由 =/= 表示；其 basename 若非 UTF-8，用同一安全规则
+  生成 breadcrumb label，不影响 UTF-8 子路径的 actionability。
 - browser actionability 以 **整个 root-relative Path 的 =to_str()=** 为准，不只检查 basename。
   任一祖先 segment 非 UTF-8 时，该行在目录页、搜索结果和网格中都：
   - 以 =<span>= 显示 escaped label，不渲染文件名 anchor；

@@ -1,4 +1,13 @@
 //! HTML 生成 (maud).
+//!
+//! - 目录/搜索完整页共用 [`page_shell`]: 同一套顶部工具区 ([`topbar`])、面包屑、
+//!   预览面板与 native token meta; 独立阅读页由 [`doc_page`] 输出同一工具区.
+//! - 列表/网格/fragment 的全部导航链接与搜索表单统一保留有效显示规则
+//!   (`sort=Column:Order&hidden=0|1`; 搜索页带 q), 实际离开搜索才移除 q.
+//! - 非 UTF-8 名称一律 display-only (无 anchor / 无 action identity), 仅显示
+//!   codec 转义文本; 规范 filesystem identity 只用 `data-native-path-encoded`.
+//! - 工具区不含 inline handler: 视图图标组/隐藏项开关/排序入口在无 JS 时以
+//!   真实链接或原生 details/summary 工作 (树/网格按真实能力渐进增强).
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -6,37 +15,288 @@ use std::path::{Path, PathBuf};
 
 use maud::{DOCTYPE, Markup, html};
 
-use crate::listing::SearchResult;
+use crate::listing::{ListingOptions, SearchResult};
 use crate::meta::{
     FileMeta, display_path_markup, display_path_text, display_segment, encode_relative_path,
-    escape_os_name, format_time,
+    escape_os_name, format_time, percent_encode_segment,
 };
 use crate::sort::{SortBy, SortColumn, SortOrder};
 
-/// 目录列表页面 (可信 UI): 共享页面骨架 + 面包屑 + 辅助技术可读的隐藏 h1 +
-/// 6 列 striped 表格 + 网格 + 预览面板. native_token 为 Some 时 head 嵌入 token meta
-/// 并渲染 native-open 控制; None 时无 token meta 也无 native 按钮.
+/// 有效显示规则的 query 片段: `sort=Column:Order&hidden=0|1` (sort 在前, 精确大小写).
+fn listing_query(options: ListingOptions) -> String {
+    format!(
+        "sort={}:{}&hidden={}",
+        options.sort_by.column,
+        options.sort_by.order,
+        hidden_value(options)
+    )
+}
+
+/// 排序 query 值 (`Column:Order`): 隐藏字段与 `data-cb-sort` 同一格式.
+fn sort_value(options: ListingOptions) -> String {
+    format!("{}:{}", options.sort_by.column, options.sort_by.order)
+}
+
+/// 布尔 → `1`/`0` (hidden query 与 `data-cb-hidden` 同一编码).
+fn hidden_value(options: ListingOptions) -> &'static str {
+    if options.show_hidden { "1" } else { "0" }
+}
+
+/// canonical 绝对路径链接 + 有效显示规则: root 为 `/`, 其余 `/{encoded}`.
+fn path_href(encoded: &str, options: ListingOptions) -> String {
+    if encoded.is_empty() {
+        format!("/?{}", listing_query(options))
+    } else {
+        format!("/{encoded}?{}", listing_query(options))
+    }
+}
+
+/// 当前路径不变的相对 query 链接: `?sort=…&hidden=…`, 搜索页带 q (`?q=…&…`).
+/// 覆盖视图/隐藏项开关与完整页的列表入口 (离开搜索的条目链接不调用本函数).
+fn browse_href(q: Option<&str>, options: ListingOptions) -> String {
+    match q {
+        Some(q) => format!(
+            "?q={}&{}",
+            percent_encode_segment(q),
+            listing_query(options)
+        ),
+        None => format!("?{}", listing_query(options)),
+    }
+}
+
+/// 排序入口/表头快捷入口的目标链接: 目标排序 + 保留有效 hidden (与 q).
+fn sort_href(q: Option<&str>, options: ListingOptions, target: SortBy) -> String {
+    let next = ListingOptions {
+        sort_by: target,
+        show_hidden: options.show_hidden,
+    };
+    match q {
+        Some(q) => format!("?q={}&{}", percent_encode_segment(q), listing_query(next)),
+        None => format!("?{}", listing_query(next)),
+    }
+}
+
+/// 排序菜单的十二个 (列, 方向) 选项.
+/// `enabled` 为 false (独立阅读表面) 时省略 href: 无 JS 不可导航 (禁用),
+/// 客户端启用时再补 href.
+struct SortChoice {
+    /// `Column:Order` (data-cb-sort 与 query 值).
+    value: String,
+    href: Option<String>,
+    label: String,
+    active: bool,
+}
+
+fn sort_choices(q: Option<&str>, options: ListingOptions, enabled: bool) -> Vec<SortChoice> {
+    let mut choices = Vec::with_capacity(12);
+    for column in SortColumn::ALL {
+        for order in [SortOrder::Asc, SortOrder::Desc] {
+            let target = SortBy { column, order };
+            choices.push(SortChoice {
+                value: format!("{column}:{order}"),
+                href: enabled.then(|| sort_href(q, options, target)),
+                label: sort_option_label(column, order),
+                active: target == options.sort_by,
+            });
+        }
+    }
+    choices
+}
+
+/// 排序菜单/摘要的列名 (query key 之外的显示文本).
+fn sort_column_label(column: SortColumn) -> &'static str {
+    match column {
+        SortColumn::Name => "名称",
+        SortColumn::Type => "类型",
+        SortColumn::Size => "大小",
+        SortColumn::LastModified => "修改时间",
+        SortColumn::LastAccess => "访问时间",
+        SortColumn::Creation => "创建时间",
+    }
+}
+
+fn sort_order_arrow(order: SortOrder) -> &'static str {
+    match order {
+        SortOrder::Asc => "▲",
+        SortOrder::Desc => "▼",
+    }
+}
+
+fn sort_option_label(column: SortColumn, order: SortOrder) -> String {
+    format!("{} {}", sort_column_label(column), sort_order_arrow(order))
+}
+
+fn sort_state_label(sort_by: SortBy) -> String {
+    sort_option_label(sort_by.column, sort_by.order)
+}
+
+/// 自包含图标: 无外部字体/CDN, 颜色继承 currentColor, 由 aria-label 提供名称.
+fn icon(glyph: Markup) -> Markup {
+    html! {
+        svg class="cb-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"
+            focusable="false" fill="none" stroke="currentColor" stroke-width="1.5"
+            stroke-linecap="round" stroke-linejoin="round" {
+            (glyph)
+        }
+    }
+}
+
+fn icon_tree() -> Markup {
+    icon(html! {
+        path d="M2.5 2.5v11" {}
+        path d="M2.5 5.5h3.5" {}
+        path d="M2.5 10.5h3.5" {}
+        rect x="6" y="3.5" width="7.5" height="4" {}
+        rect x="6" y="8.5" width="7.5" height="4" {}
+    })
+}
+
+fn icon_list() -> Markup {
+    icon(html! {
+        path d="M5.5 4h8" {}
+        path d="M5.5 8h8" {}
+        path d="M5.5 12h8" {}
+        circle cx="2.6" cy="4" r="1.1" fill="currentColor" stroke="none" {}
+        circle cx="2.6" cy="8" r="1.1" fill="currentColor" stroke="none" {}
+        circle cx="2.6" cy="12" r="1.1" fill="currentColor" stroke="none" {}
+    })
+}
+
+fn icon_grid() -> Markup {
+    icon(html! {
+        rect x="2.5" y="2.5" width="4.5" height="4.5" {}
+        rect x="9" y="2.5" width="4.5" height="4.5" {}
+        rect x="2.5" y="9" width="4.5" height="4.5" {}
+        rect x="9" y="9" width="4.5" height="4.5" {}
+    })
+}
+
+fn icon_eye() -> Markup {
+    icon(html! {
+        path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8s-2.4 4.5-6.5 4.5S1.5 8 1.5 8z" {}
+        circle cx="8" cy="8" r="2" {}
+    })
+}
+
+/// 统一顶部工具区 (目录/搜索/独立阅读共用): 左搜索, 右树/列表/网格图标组 +
+/// 隐藏项开关 + 排序入口.
+///
+/// - 树/网格图标服务端 `aria-disabled` (无 JS 不伪造树/网格), 由客户端启用;
+///   列表入口是真实 anchor (阅读页指向父目录), 无 JS 可用.
+/// - 隐藏项开关在浏览表面是 anchor (href = 切换后的 hidden, 保留 sort/q),
+///   阅读表面是 `aria-disabled` button (href 缺失, 保留 hover/focus 提示).
+/// - 排序入口是原生 details/summary (键盘可打开, 无 JS 可用), 十二个链接
+///   保留 q/hidden; 阅读表面 `aria-disabled` 且链接不带 href (客户端启用时补).
+/// - hover 与键盘焦点提示统一由 `data-cb-tip` + CSS ::after 呈现.
+fn topbar(
+    surface: &str,
+    q: Option<&str>,
+    options: ListingOptions,
+    list_href: Option<&str>,
+) -> Markup {
+    let reading = surface == "reading";
+    let hidden_pressed = if options.show_hidden { "true" } else { "false" };
+    let list_pressed = if reading { "false" } else { "true" };
+    let toggled = ListingOptions {
+        sort_by: options.sort_by,
+        show_hidden: !options.show_hidden,
+    };
+    let hidden_toggle_href = (!reading).then(|| browse_href(q, toggled));
+    let choices = sort_choices(q, options, !reading);
+    html! {
+        header.cb-topbar {
+            form.cb-search action="/__/search" method="get" role="search" {
+                input type="search" name="q" id="cb-search-q" placeholder="搜索文件"
+                    aria-label="搜索文件" autocomplete="off" value=(q.unwrap_or(""));
+                input type="hidden" name="sort" value=(sort_value(options));
+                input type="hidden" name="hidden" value=(hidden_value(options));
+            }
+            div.cb-view-group role="group" aria-label="浏览视图" {
+                button type="button" class="cb-icon-btn cb-view-btn" data-cb-view="tree"
+                    aria-pressed="false" aria-disabled="true" aria-label="树视图"
+                    data-cb-tip="树视图（需启用 JavaScript）" {
+                    (icon_tree())
+                }
+                @if let Some(href) = list_href {
+                    a class="cb-icon-btn cb-view-btn" data-cb-view="list" href=(href)
+                        aria-pressed=(list_pressed) aria-label="列表视图" data-cb-tip="列表视图" {
+                        (icon_list())
+                    }
+                } @else {
+                    button type="button" class="cb-icon-btn cb-view-btn" data-cb-view="list"
+                        aria-pressed="false" aria-disabled="true" aria-label="列表视图"
+                        data-cb-tip="列表视图（需启用 JavaScript）" {
+                        (icon_list())
+                    }
+                }
+                button type="button" class="cb-icon-btn cb-view-btn" data-cb-view="grid"
+                    aria-pressed="false" aria-disabled="true" aria-label="网格视图"
+                    data-cb-tip="网格视图（需启用 JavaScript）" {
+                    (icon_grid())
+                }
+            }
+            @if let Some(href) = hidden_toggle_href {
+                a class="cb-icon-btn cb-hidden-toggle" data-cb-hidden-toggle href=(href)
+                    aria-pressed=(hidden_pressed) aria-label="显示隐藏项"
+                    data-cb-tip="显示隐藏项" {
+                    (icon_eye())
+                }
+            } @else {
+                button type="button" class="cb-icon-btn cb-hidden-toggle" data-cb-hidden-toggle
+                    aria-pressed=(hidden_pressed) aria-disabled="true" aria-label="显示隐藏项"
+                    data-cb-tip="阅读模式不适用：请先在目录或搜索中使用" {
+                    (icon_eye())
+                }
+            }
+            details class="cb-sort" aria-disabled=[reading.then_some("true")] {
+                summary data-cb-sort-summary
+                    data-cb-tip=(if reading { "阅读模式不适用：请先在目录或搜索中使用" } else { "排序" }) {
+                    "排序"
+                    span class="cb-sort-state" data-cb-sort-state { (sort_state_label(options.sort_by)) }
+                }
+                div class="cb-sort-menu" role="group" aria-label="排序方式" {
+                    @for choice in choices {
+                        a href=[choice.href.as_deref()] data-cb-sort=(&choice.value)
+                            aria-current=[choice.active.then_some("true")] {
+                            (&choice.label)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 目录完整页 (可信 UI): 共享页面骨架 + 面包屑 + 隐藏 h1 + 6 列 striped 表格 +
+/// 网格 + 预览面板; native_token 为 Some 时 head 嵌入 token meta 并渲染
+/// native-open 控制. 列表入口是当前目录 + 有效显示规则.
 pub fn dir_page(
     root: &Path,
     path: &Path,
     files: &[FileMeta],
-    sort_by: SortBy,
+    options: ListingOptions,
     native_token: Option<&str>,
 ) -> Markup {
     let title = dir_title(root, path);
+    let identity = encode_relative_path(path.strip_prefix(root).unwrap_or(Path::new("")));
     let content = html! {
         h1 class="cb-visually-hidden" { "目录 " (title) " 中的文件" }
-        (dir_table(root, path, files, sort_by, native_token))
-        (entry_grid(files))
+        (dir_table(root, path, files, options, native_token))
+        (entry_grid(files, options, true))
     };
-    page_shell(
-        &title,
-        native_token,
-        breadcrumb_markup(root, path),
+    page_shell(PageShell {
+        title,
+        surface: "directory",
+        q: None,
+        options,
+        identity,
+        kind: Some("dir"),
+        native_token: native_token.map(str::to_string),
+        breadcrumb: breadcrumb_markup(root, path, options),
         content,
-        "",
-        None,
-    )
+        list_href: Some(browse_href(None, options)),
+        parent_href: None,
+    })
 }
 
 /// 目录完整页 <title> / heading: root-relative 路径逐段经显示 codec 转义 join.
@@ -45,49 +305,54 @@ fn dir_title(root: &Path, path: &Path) -> String {
     format!("/{}", display_path_text(rel))
 }
 
-/// 搜索页 (可信 UI): 同一共享骨架 + 面包屑 (root 链接 + 纯文本 搜索) + 4 列结果表
-/// (名称/位置/大小/修改时间) + 网格 + 截断/空结果提示. 行序即 SearchResult 的
-/// 确定性 BFS 顺序.
+/// 搜索完整页 (可信 UI): 同一共享骨架 + 面包屑 (root 链接 + 纯文本 搜索) +
+/// 4 列结果表 + 网格 + 截断/空结果提示; 行序即 SearchResult 的确定性顺序.
 pub fn search_page(
     root: &Path,
     query: &str,
     result: &SearchResult,
+    options: ListingOptions,
     native_token: Option<&str>,
 ) -> Markup {
     let content = html! {
         h6.cb-heading { "搜索：" (query) }
-        @if result.truncated {
-            p.cb-notice { "结果超过 500 条，已截断显示前 500 条。" }
-        }
-        @if result.entries.is_empty() {
-            p.cb-empty { "没有找到匹配的文件。" }
-        } @else {
-            (search_table(result, native_token))
-            (entry_grid(&result.entries))
-        }
+        (search_results(result, options, true, native_token))
     };
     let breadcrumb = html! {
         nav.cb-breadcrumb aria-label="面包屑" {
-            a href="/" { (display_segment(root.file_name().unwrap_or_else(|| OsStr::new("/")))) }
+            a href=(path_href("", options)) {
+                (display_segment(root.file_name().unwrap_or_else(|| OsStr::new("/"))))
+            }
             span.cb-crumb-sep { "/" }
             span.cb-current { "搜索" }
         }
     };
-    page_shell(
-        &format!("搜索：{query}"),
-        native_token,
+    page_shell(PageShell {
+        title: format!("搜索：{query}"),
+        surface: "search",
+        q: Some(query.to_string()),
+        options,
+        identity: Some(String::new()),
+        kind: None,
+        native_token: native_token.map(str::to_string),
         breadcrumb,
         content,
-        query,
-        Some("/"),
-    )
+        list_href: Some(browse_href(Some(query), options)),
+        parent_href: Some(path_href("", options)),
+    })
 }
 
-/// 目录 fragment: 恰好一个外层 wrapper (`<div class="cb-doc cb-dir-fragment">`) 携带
-/// 当前目录的 ASCII encoded path (root 为合法空串); 无 doctype/head/style.
-/// 迷你列表含名称+大小; 可操作条目渲染 anchor + 自身 encoded identity (供面板下钻);
+/// 目录 fragment: 恰好一个外层 wrapper (`<div class="cb-doc cb-dir-fragment">`)
+/// 携带当前目录的 ASCII encoded path (root 为合法空串) 与 page_shell 相同的
+/// surface/选项 metadata; 无 doctype/head/style/工具栏. 迷你列表含名称+大小;
+/// 可操作条目渲染 anchor + 自身 encoded identity (供面板下钻) 与有效显示规则,
 /// 非 UTF-8 条目 display-only.
-pub fn dir_fragment(root: &Path, path: &Path, files: &[FileMeta]) -> String {
+pub fn dir_fragment(
+    root: &Path,
+    path: &Path,
+    files: &[FileMeta],
+    options: ListingOptions,
+) -> String {
     let rel = path.strip_prefix(root).unwrap_or(Path::new(""));
     let encoded = encode_relative_path(rel);
     let title = display_path_text(rel);
@@ -96,10 +361,11 @@ pub fn dir_fragment(root: &Path, path: &Path, files: &[FileMeta]) -> String {
         ul class="cb-dir-mini" {
             @for f in files {
                 li data-kind=(if f.is_directory { "dir" } else { "file" }) {
-                    // 可操作条目: anchor + 自身 encoded identity (供面板内下钻);
-                    // href 恒为 "/" + encoded (同一编码器), 非 UTF-8 条目 display-only
+                    // 可操作条目: anchor + 自身 encoded identity (供面板下钻);
+                    // href 用共享编码器 + 有效显示规则, 非 UTF-8 条目 display-only
                     @if let Some(enc) = f.browser_path_encoded() {
-                        a href=(format!("/{enc}")) data-native-path-encoded=(enc) {
+                        a href=(format!("/{enc}?{}", listing_query(options)))
+                            data-native-path-encoded=(enc) {
                             (entry_label(f))
                         }
                     } @else {
@@ -113,42 +379,84 @@ pub fn dir_fragment(root: &Path, path: &Path, files: &[FileMeta]) -> String {
             }
         }
     };
-    // wrapper 携带当前目录 encoded path (root 为合法空串); maud 不支持 Option 属性,
-    // 用分支显式省略
-    let wrapper = match encoded {
-        Some(enc) => html! {
-            div class="cb-doc cb-dir-fragment" data-native-path-encoded=(enc) title=(title) {
-                span.cb-frag-title hidden { (title_markup) }
-                (body)
-            }
-        },
-        None => html! {
-            div class="cb-doc cb-dir-fragment" title=(title) {
-                span.cb-frag-title hidden { (title_markup) }
-                (body)
-            }
-        },
-    };
-    wrapper.into_string()
+    html! {
+        div class="cb-doc cb-dir-fragment"
+            data-cb-surface="directory"
+            data-cb-sort=(sort_value(options))
+            data-cb-hidden=(hidden_value(options))
+            data-native-path-encoded=[encoded.as_deref()]
+            title=(title) {
+            span.cb-frag-title hidden { (title_markup) }
+            (body)
+        }
+    }
+    .into_string()
 }
 
-/// 共享页面骨架 (目录页/搜索页共用): head (Materialize CSS / theme / chapbook-doc.css /
-/// browser JS defer / title / viewport / 可选 token meta), 常驻 GET 搜索表单,
-fn page_shell(
-    title: &str,
+/// 搜索 fragment: 与完整搜索页同一 `SearchResult`、同一过滤/排序规则与同一
+/// 截断/空结果提示; wrapper 携带 search 语义 + q + root 空 identity.
+/// 无 doctype/head/token/工具栏/重复 id (id 只属于完整页).
+pub fn search_fragment(query: &str, result: &SearchResult, options: ListingOptions) -> String {
+    html! {
+        div class="cb-doc cb-search-fragment"
+            data-cb-surface="search"
+            data-cb-sort=(sort_value(options))
+            data-cb-hidden=(hidden_value(options))
+            data-cb-query=(query)
+            data-native-path-encoded="" {
+            (search_results(result, options, false, None))
+        }
+    }
+    .into_string()
+}
+
+/// 搜索/目录完整页共用的结果区: 截断与空结果提示 + 列表/网格 sections.
+/// 完整页带稳定 id (客户端切换视图), fragment 不带 id (可能嵌入已有页面);
+/// native_token 只在完整搜索页 (受门禁) 传入, fragment 恒为 None.
+fn search_results(
+    result: &SearchResult,
+    options: ListingOptions,
+    with_ids: bool,
     native_token: Option<&str>,
+) -> Markup {
+    html! {
+        @if result.truncated {
+            p.cb-notice { "结果超过 500 条，已截断显示前 500 条。" }
+        }
+        @if result.entries.is_empty() {
+            p.cb-empty { "没有找到匹配的文件。" }
+        } @else {
+            (search_table(result, options, with_ids, native_token))
+            (entry_grid(&result.entries, options, with_ids))
+        }
+    }
+}
+
+/// 共享页面骨架 (目录页/搜索页共用): head (Materialize CSS / theme /
+/// chapbook-doc.css / browser JS defer / title / viewport / 可选 token meta),
+/// 顶部工具区, 面包屑, main (搜索页带 `data-cb-parent`) 与预览面板.
+struct PageShell {
+    title: String,
+    surface: &'static str,
+    q: Option<String>,
+    options: ListingOptions,
+    identity: Option<String>,
+    kind: Option<&'static str>,
+    native_token: Option<String>,
     breadcrumb: Markup,
     content: Markup,
-    q: &str,
-    parent_href: Option<&str>,
-) -> Markup {
+    list_href: Option<String>,
+    parent_href: Option<String>,
+}
+
+fn page_shell(shell: PageShell) -> Markup {
     html! {
         (DOCTYPE)
         html lang="zh-CN" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1, minimum-scale=1";
-                title { (title) }
+                title { (shell.title) }
                 link rel="stylesheet" href="/__/static/css/materialize.min.css";
                 link rel="stylesheet" href="/__/static/css/chapbook-theme.css";
                 link rel="stylesheet" href="/__/static/css/chapbook-doc.css";
@@ -156,29 +464,28 @@ fn page_shell(
                 // 预加载样式表 (字体按需加载); 与 doc_page 同一资产.
                 link rel="stylesheet" href="/__/static/katex/katex.min.css";
                 script src="/__/static/js/chapbook-browser.js" defer {}
-                @if let Some(token) = native_token {
+                @if let Some(token) = &shell.native_token {
                     meta name="cb-native-open-token" content=(token);
                 }
             }
-            body class="cb-browser-page" {
-                header.cb-topbar {
-                    form.cb-search action="/__/search" method="get" role="search" {
-                        input type="search" name="q" id="cb-search-q" placeholder="搜索文件" aria-label="搜索文件" value=(q) autocomplete="off";
-                    }
-                    div.cb-view-toggle role="group" aria-label="视图切换" {
-                        button type="button" data-cb-view="list" aria-pressed="true" { "列表" }
-                        button type="button" data-cb-view="grid" aria-pressed="false" { "网格" }
-                    }
-                }
-                (breadcrumb)
-                // 搜索页 Backspace 目标: root; 目录页由 ../ 行链接承担同一职责.
-                @if let Some(parent) = parent_href {
+            body class="cb-browser-page"
+                data-cb-surface=(shell.surface)
+                data-cb-sort=(sort_value(shell.options))
+                data-cb-hidden=(hidden_value(shell.options))
+                data-native-path-encoded=[shell.identity.as_deref()]
+                data-cb-query=[shell.q.as_deref()]
+                data-kind=[shell.kind] {
+                (topbar(shell.surface, shell.q.as_deref(), shell.options, shell.list_href.as_deref()))
+                (shell.breadcrumb)
+                // 搜索页 Backspace 目标: root (保留有效显示规则); 目录页由 ../ 行
+                // 链接承担同一职责.
+                @if let Some(parent) = &shell.parent_href {
                     main.cb-main data-cb-parent=(parent) {
-                        (content)
+                        (shell.content)
                     }
                 } @else {
                     main.cb-main {
-                        (content)
+                        (shell.content)
                     }
                 }
                 aside.cb-preview id="cb-preview" hidden {
@@ -188,7 +495,7 @@ fn page_shell(
                             button type="button" data-cb-action="full" title="当前 tab 打开" { "打开" }
                             button type="button" data-cb-action="new" title="新 tab 打开" { "新标签" }
                             button type="button" data-cb-action="download" title="下载" { "下载" }
-                            @if native_token.is_some() {
+                            @if shell.native_token.is_some() {
                                 button type="button" data-cb-action="native" title="本机默认应用打开" { "本机打开" }
                             }
                             button type="button" data-cb-action="close" title="关闭" { "✕" }
@@ -202,21 +509,24 @@ fn page_shell(
     }
 }
 
-/// 面包屑: 根节点 (root basename label, href "/"), 中间节点为逐级累计的 exact
-/// UTF-8 路径 (共享编码器); 当前节点纯文本. 祖先路径非 UTF-8 时该段及其后
-/// remainder display-only (不生成链接). 每 segment 经显示 codec + bdi 隔离.
-fn breadcrumb_markup(root: &Path, path: &Path) -> Markup {
+/// 面包屑: 根节点 (root basename label, href "/" + 有效显示规则), 中间节点为
+/// 逐级累计的 exact UTF-8 路径 (共享编码器 + 有效显示规则); 当前节点纯文本.
+/// 祖先路径非 UTF-8 时该段及其后 remainder display-only (不生成链接).
+/// 每 segment 经显示 codec + bdi 隔离.
+fn breadcrumb_markup(root: &Path, path: &Path, options: ListingOptions) -> Markup {
     let crumbs = breadcrumb_crumbs(root, path);
     let last = crumbs.len().saturating_sub(1);
     html! {
         nav.cb-breadcrumb aria-label="面包屑" {
-            a href="/" { (display_segment(root.file_name().unwrap_or_else(|| OsStr::new("/")))) }
+            a href=(path_href("", options)) {
+                (display_segment(root.file_name().unwrap_or_else(|| OsStr::new("/"))))
+            }
             @for (i, (seg, href)) in crumbs.iter().enumerate() {
                 span.cb-crumb-sep { "/" }
                 @if i == last {
                     span.cb-current { (display_segment(seg)) }
                 } @else if let Some(h) = href {
-                    a href=(h.clone()) { (display_segment(seg)) }
+                    a href=(path_href(h, options)) { (display_segment(seg)) }
                 } @else {
                     span.cb-current { (display_segment(seg)) }
                 }
@@ -225,14 +535,15 @@ fn breadcrumb_markup(root: &Path, path: &Path) -> Markup {
     }
 }
 
-/// 面包屑数据: (segment, 累计路径的 encoded href); 累计路径非 UTF-8 时 href 为 None.
+/// 面包屑数据: (segment, 累计路径的 encoded href 片段); 累计路径非 UTF-8 时
+/// href 为 None.
 fn breadcrumb_crumbs(root: &Path, path: &Path) -> Vec<(OsString, Option<String>)> {
     let mut crumbs = Vec::new();
     if let Ok(rel) = path.strip_prefix(root) {
         let mut acc = PathBuf::new();
         for seg in rel.iter() {
             acc.push(seg);
-            let href = encode_relative_path(&acc).map(|encoded| format!("/{encoded}"));
+            let href = encode_relative_path(&acc);
             crumbs.push((seg.to_os_string(), href));
         }
     }
@@ -240,36 +551,30 @@ fn breadcrumb_crumbs(root: &Path, path: &Path) -> Vec<(OsString, Option<String>)
 }
 
 /// 目录表格: 6 列保持既有结构 (thead 排序链接 + tbody 条纹行 + 父行 colspan=6);
-/// 行尾 action 放在最后单元格内, 不新增第 7 列.
+/// 行尾 action 放在最后单元格内, 不新增第 7 列. 所有链接保留有效显示规则.
 fn dir_table(
     root: &Path,
     path: &Path,
     files: &[FileMeta],
-    sort_by: SortBy,
+    options: ListingOptions,
     native_token: Option<&str>,
 ) -> Markup {
     let parent_href = path
         .parent()
         .and_then(|parent| parent.strip_prefix(root).ok())
         .and_then(encode_relative_path)
-        .map(|encoded| {
-            if encoded.is_empty() {
-                "/".to_string()
-            } else {
-                format!("/{encoded}")
-            }
-        });
+        .map(|encoded| path_href(&encoded, options));
     html! {
-        section.cb-view.cb-view-list id="cb-view-list" {
+        section class="cb-view cb-view-list" id="cb-view-list" {
             table class="striped" {
                 // 表头放进 thead: 浏览器会把 table 下的裸 tr 包进隐式 tbody,
                 // 导致表头被条纹染色 (v2 的灰色带就是这么来的)
-                thead { (table_header(sort_by)) }
+                thead { (table_header(options.sort_by, options, None)) }
                 tbody {
                     @if path != root {
                         // colspan 覆盖全行: 单 td 行的条纹/背景只会染到单元格区域;
                         // 绝对 root-relative URL 同供原生 ../ 链接与 JS Backspace,
-                        // 避免 slashless 当前 URL 把相对 "../" 多解析一级。
+                        // 避免 slashless 当前 URL 把相对 "../" 多解析一级.
                         tr {
                             td colspan="6" {
                                 @if let Some(href) = &parent_href {
@@ -284,12 +589,13 @@ fn dir_table(
                         (entry_row(
                             f,
                             vec![
-                                html! { (f.type_str()) },
+                                html! { (f.type_label()) },
                                 html! { (f.human_size()) },
                                 html! { (format_time(f.last_modified_time)) },
                                 html! { (format_time(f.last_access_time)) },
                             ],
                             html! { (format_time(f.creation_time)) },
+                            options,
                             native_token,
                         ))
                     }
@@ -300,10 +606,16 @@ fn dir_table(
 }
 
 /// 搜索结果表: 4 列 (名称/位置/大小/修改时间). 行尾 action 与目录表同一簇
-/// (最后单元格内). 位置列: 父目录整条 UTF-8 时链接, 否则逐段显示 codec.
-fn search_table(result: &SearchResult, native_token: Option<&str>) -> Markup {
+/// (最后单元格内); native-open 只在完整搜索页有 token 时出现. 位置列: 父目录
+/// 整条 UTF-8 时链接 (保留 hidden, 不带 q), 否则逐段显示 codec.
+fn search_table(
+    result: &SearchResult,
+    options: ListingOptions,
+    with_ids: bool,
+    native_token: Option<&str>,
+) -> Markup {
     html! {
-        section.cb-view.cb-view-list id="cb-view-list" {
+        section class="cb-view cb-view-list" id=[with_ids.then_some("cb-view-list")] {
             table class="striped" {
                 thead {
                     tr { th { "名称" } th { "位置" } th { "大小" } th { "修改时间" } }
@@ -312,8 +624,9 @@ fn search_table(result: &SearchResult, native_token: Option<&str>) -> Markup {
                     @for f in &result.entries {
                         (entry_row(
                             f,
-                            vec![search_location_cell(f), html! { (f.human_size()) }],
+                            vec![search_location_cell(f, options), html! { (f.human_size()) }],
                             html! { (format_time(f.last_modified_time)) },
+                            options,
                             native_token,
                         ))
                     }
@@ -326,19 +639,24 @@ fn search_table(result: &SearchResult, native_token: Option<&str>) -> Markup {
 /// 数据行 (目录表/搜索表共用): 行级 identity (data-browser-entry /
 /// ASCII-only encoded path / 安全 label attributes), 名称单元格 (可操作 anchor
 /// 或 display-only + 提示), 中间单元格, 以及放在最后单元格内的行尾 action 簇.
+/// 名称 anchor 的 href 保留有效显示规则 (进入子目录/打开文件不丢规则);
 /// href() 为 None 的路径 (非 UTF-8) 是 display-only 行: 只渲染名称, 不产生锚点,
 /// 更不能 emit href="" (空 href 点击会导航回当前目录).
 fn entry_row(
     f: &FileMeta,
     middle: Vec<Markup>,
     last: Markup,
+    options: ListingOptions,
     native_token: Option<&str>,
 ) -> Markup {
     let label = entry_label_text(f);
     let encoded = f.browser_path_encoded();
     let kind = if f.is_directory { "dir" } else { "file" };
+    let name_href = f
+        .href()
+        .map(|href| format!("{href}?{}", listing_query(options)));
     let body = html! {
-        @if let Some(href) = f.href() {
+        @if let Some(href) = name_href {
             td { a href=(href) { (entry_label(f)) } }
         } @else {
             td {
@@ -351,25 +669,19 @@ fn entry_row(
         }
         td { (last) (entry_actions(f, native_token)) }
     };
-    // 只有可操作路径携带 data-native-path-encoded (maud 不支持 Option 属性, 显式分支);
-    // data-kind (dir|file) 两个分支都携带 — JS 的 PDF 判定是 kind + 后缀双条件
-    match encoded {
-        Some(enc) => html! {
-            tr class="cb-row" data-browser-entry data-kind=(kind) data-native-path-encoded=(enc) title=(label) aria-label=(label) {
-                (body)
-            }
-        },
-        None => html! {
-            tr class="cb-row" data-browser-entry data-kind=(kind) title=(label) aria-label=(label) {
-                (body)
-            }
-        },
+    // data-native-path-encoded 只在可操作路径出现 (None 时属性整个省略);
+    // data-kind (dir|file) 恒携带 — JS 的 PDF 判定是 kind + 后缀双条件
+    html! {
+        tr class="cb-row" data-browser-entry data-kind=(kind)
+            data-native-path-encoded=[encoded.as_deref()] title=(label) aria-label=(label) {
+            (body)
+        }
     }
 }
 
 /// 行尾 action 簇 (仅 actionable 行): 预览 / 新 tab (target=_blank rel=noopener) /
 /// 下载 (?download=1, 仅文件 — 目录忽略 download 模式) / native-open (仅 token
-/// 存在时). 只渲染于最后单元格内.
+/// 存在时). 只渲染于最后单元格内; action 不携带显示规则 (响应模式语义不变).
 fn entry_actions(f: &FileMeta, native_token: Option<&str>) -> Markup {
     let Some(encoded) = f.browser_path_encoded() else {
         return html! {};
@@ -390,25 +702,29 @@ fn entry_actions(f: &FileMeta, native_token: Option<&str>) -> Markup {
 }
 
 /// 网格视图: 与表格同一 entry 数据 (data-browser-entry / kind / encoded / label);
-/// 图片用 lazy img + 精确 raw URL (无模式 query), 非图片/目录用扩展名 badge.
-/// 默认 hidden, 由 JS 切换 (列表/网格都渲染).
-fn entry_grid(files: &[FileMeta]) -> Markup {
+/// 图片用 lazy img + 精确 raw URL (无模式 query), 非图片/目录用扩展名 badge;
+/// 可操作 label 是原生 anchor (href 保留有效显示规则). 默认 hidden, 由 JS 切换
+/// (列表/网格都渲染). id 只出现在完整页 (fragment 可嵌入已有页面).
+fn entry_grid(files: &[FileMeta], options: ListingOptions, with_ids: bool) -> Markup {
     html! {
-        section.cb-view.cb-view-grid id="cb-view-grid" hidden {
+        section class="cb-view cb-view-grid" id=[with_ids.then_some("cb-view-grid")] hidden {
             div.cb-grid {
                 @for f in files {
-                    (grid_item(f))
+                    (grid_item(f, options))
                 }
             }
         }
     }
 }
 
-fn grid_item(f: &FileMeta) -> Markup {
+fn grid_item(f: &FileMeta, options: ListingOptions) -> Markup {
     let label = entry_label_text(f);
     let encoded = f.browser_path_encoded();
     let kind = if f.is_directory { "dir" } else { "file" };
     let img_src = is_image_entry(f).then(|| f.href()).flatten();
+    let name_href = f
+        .href()
+        .map(|href| format!("{href}?{}", listing_query(options)));
     let body = html! {
         @if let Some(src) = img_src {
             div.cb-grid-thumb { img loading="lazy" decoding="async" src=(src) alt=""; }
@@ -416,7 +732,7 @@ fn grid_item(f: &FileMeta) -> Markup {
             (grid_badge(f))
         }
         div.cb-grid-label {
-            @if let Some(href) = f.href() {
+            @if let Some(href) = name_href {
                 a href=(href) { (entry_label(f)) }
             } @else {
                 (entry_label(f))
@@ -425,17 +741,11 @@ fn grid_item(f: &FileMeta) -> Markup {
         }
         div.cb-grid-size { (f.human_size()) }
     };
-    match encoded {
-        Some(enc) => html! {
-            div class="cb-grid-item" data-browser-entry data-kind=(kind) data-native-path-encoded=(enc) title=(label) aria-label=(label) {
-                (body)
-            }
-        },
-        None => html! {
-            div class="cb-grid-item" data-browser-entry data-kind=(kind) title=(label) aria-label=(label) {
-                (body)
-            }
-        },
+    html! {
+        div class="cb-grid-item" data-browser-entry data-kind=(kind)
+            data-native-path-encoded=[encoded.as_deref()] title=(label) aria-label=(label) {
+            (body)
+        }
     }
 }
 
@@ -458,14 +768,16 @@ fn grid_badge(f: &FileMeta) -> Markup {
 }
 
 /// 位置单元格 (搜索表): 父目录整条路径 UTF-8 时渲染链接 (顶层条目 -> "/"),
-/// 否则逐段显示 codec 显示.
-fn search_location_cell(f: &FileMeta) -> Markup {
+/// 否则逐段显示 codec. 位置导航延续有效显示规则但移除 q (实际离开搜索).
+fn search_location_cell(f: &FileMeta, options: ListingOptions) -> Markup {
     match f.relative_to_root.parent() {
         None => html! { "/" },
-        Some(parent) if parent.as_os_str().is_empty() => html! { a href="/" { "/" } },
+        Some(parent) if parent.as_os_str().is_empty() => {
+            html! { a href=(path_href("", options)) { "/" } }
+        }
         Some(parent) => match encode_relative_path(parent) {
             Some(encoded) => html! {
-                a href=(format!("/{encoded}")) { (path_label_markup(parent)) }
+                a href=(path_href(&encoded, options)) { (path_label_markup(parent)) }
             },
             None => html! { (path_label_markup(parent)) },
         },
@@ -519,8 +831,9 @@ fn is_image_entry(f: &FileMeta) -> bool {
     )
 }
 
-/// 表头: 每列一个排序链接, 当前列带 ▲/▼ 箭头, 再次点击切换方向.
-fn table_header(sort_by: SortBy) -> Markup {
+/// 表头: 每列一个排序链接 (完整 `?sort=…&hidden=…` query), 当前列带 ▲/▼ 箭头
+/// 与 aria-sort, 再次点击切换方向; 链接与工具区排序入口共用同一状态流程.
+fn table_header(sort_by: SortBy, options: ListingOptions, q: Option<&str>) -> Markup {
     html! {
         tr {
             @for column in SortColumn::ALL {
@@ -529,15 +842,16 @@ fn table_header(sort_by: SortBy) -> Markup {
                 } else {
                     SortOrder::Asc
                 };
-                @let arrow = if column == sort_by.column {
-                    match sort_by.order {
-                        SortOrder::Asc => "▲",
-                        SortOrder::Desc => "▼",
+                @let active = column == sort_by.column;
+                th aria-sort=[active.then_some(match sort_by.order {
+                    SortOrder::Asc => "ascending",
+                    SortOrder::Desc => "descending",
+                })] {
+                    a href=(sort_href(q, options, SortBy { column, order: next_order }))
+                        data-cb-sort=(format!("{column}:{next_order}")) {
+                        (format!("{column}{}", if active { sort_order_arrow(sort_by.order) } else { "" }))
                     }
-                } else {
-                    ""
-                };
-                th { a href=(format!("?sort={column}:{next_order}")) { (format!("{column}{arrow}")) } }
+                }
             }
         }
     }
@@ -545,7 +859,7 @@ fn table_header(sort_by: SortBy) -> Markup {
 
 /// 文档内容片段: 恰好一个外层 `<div class="cb-doc">…</div>`, 无 doctype/head/style.
 /// 内容样式全部作用域在 `.cb-doc` 下 (chapbook-doc.css), 可嵌入宿主页面;
-/// 完整页与未来 Fragment 路由共用此包装.
+/// 完整页与 Fragment 路由共用此包装.
 pub fn doc_fragment(body: &str) -> String {
     html! {
         div class="cb-doc" {
@@ -555,10 +869,18 @@ pub fn doc_fragment(body: &str) -> String {
     .into_string()
 }
 
-/// 文档/代码页面骨架: 自组 `<!DOCTYPE>` / head / title / body.
-/// org 路径的页面骨架由这里接管 (pandoc -s 不再参与); body 已由调用方转义,
-/// 以 PreEscaped 原样嵌入, 并经 `doc_fragment` 包装 (恰好一次).
-pub fn doc_page(title: &str, body: &str) -> String {
+/// 文档/代码页面骨架 (独立阅读表面): 自组 `<!DOCTYPE>` / head / title / body.
+/// body 已由调用方转义, 以 PreEscaped 原样嵌入, 并经 `doc_fragment` 包装
+/// (恰好一次). 工具区随 body 输出统一 surface/选项 metadata: 三个视图图标
+/// 均无选中态, 隐藏/排序禁用; 列表入口指向父目录 (identity 由 routes 提供,
+/// 绝不从显示标题重建). no native token.
+pub fn doc_page(
+    title: &str,
+    body: &str,
+    encoded_path: Option<&str>,
+    options: ListingOptions,
+) -> String {
+    let list_href = encoded_path.map(|encoded| parent_dir_href(encoded, options));
     html! {
         (DOCTYPE)
         html lang="zh-CN" {
@@ -571,12 +893,28 @@ pub fn doc_page(title: &str, body: &str) -> String {
                 // 文档/代码/Office 页是树模式外壳宿主 (渐进增强; defer)
                 script src="/__/static/js/chapbook-browser.js" defer {}
             }
-            body class="cb-doc-page" {
+            body class="cb-doc-page"
+                data-cb-surface="reading"
+                data-cb-sort=(sort_value(options))
+                data-cb-hidden=(hidden_value(options))
+                data-native-path-encoded=[encoded_path]
+                data-kind="file" {
+                (topbar("reading", None, options, list_href.as_deref()))
                 (maud::PreEscaped(doc_fragment(body)))
             }
         }
     }
     .into_string()
+}
+
+/// 阅读页列表入口目标: encoded 文件 identity 去掉最后一段的父目录 + 有效显示规则;
+/// 顶层文件指向 root (`/`).
+fn parent_dir_href(encoded: &str, options: ListingOptions) -> String {
+    let parent = encoded
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    path_href(parent, options)
 }
 
 /// pandoc 行为对齐: 文档标题块 `<header id="title-block-header"><h1 class="title">…</h1></header>`.
@@ -719,91 +1057,16 @@ mod tests {
 
     use super::*;
 
-    fn meta(rel: PathBuf) -> FileMeta {
+    fn meta(rel: PathBuf, is_directory: bool) -> FileMeta {
         FileMeta {
             relative_to_root: rel,
             display_name: String::new(),
-            is_directory: false,
+            is_directory,
             size: 0,
             last_modified_time: SystemTime::UNIX_EPOCH,
             last_access_time: SystemTime::UNIX_EPOCH,
             creation_time: SystemTime::UNIX_EPOCH,
         }
-    }
-
-    /// 提取首个 `selector` 后的平衡 `{...}` 规则块 (含嵌套 media 查询), 对真实规则体
-    /// 做敏感断言 — 注释/排版差异不会误报, 同一选择器出现在不同规则时取首个.
-    fn css_block<'a>(css: &'a str, selector: &str) -> &'a str {
-        let at = css
-            .find(selector)
-            .unwrap_or_else(|| panic!("css 必须包含选择器 {selector}"));
-        let open = css[at..]
-            .find('{')
-            .unwrap_or_else(|| panic!("css 选择器 {selector}: 规则块必须含 {{"));
-        let start = at + open;
-        let mut depth = 0usize;
-        for (i, ch) in css[start..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &css[start..=start + i];
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("css 选择器 {selector}: 未闭合规则块");
-    }
-
-    #[test]
-    fn dir_page_renders_bdi_label_inside_anchor_for_utf8() {
-        let page = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv"),
-            &[meta(PathBuf::from("My File.txt"))],
-            SortBy::default(),
-            None,
-        )
-        .into_string();
-        assert!(
-            page.contains(r#"<a href="/My%20File.txt"><bdi dir="auto">My File.txt</bdi></a>"#),
-            "page: {page}"
-        );
-    }
-
-    /// 非 UTF-8 basename 的 display-only 行: 名称必须出现 (bdi 隔离),
-    /// 但不得有 `<a href>` 锚点, 更不得有空 href (空 href 点击会导航回当前目录).
-    #[cfg(unix)]
-    #[test]
-    fn dir_page_non_utf8_row_has_no_anchor() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        let bad = PathBuf::from(OsString::from_vec(b"\xFFbad.txt".to_vec()));
-        let page = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv"),
-            &[meta(bad)],
-            SortBy::default(),
-            None,
-        )
-        .into_string();
-        // 名称经显示 codec 转义后出现在 bdi 中, 带 display-only 提示, 且没有被 <a> 包裹
-        assert!(
-            page.contains(r#"<td><bdi dir="auto">\xFFbad.txt</bdi><span class="cb-non-utf8">非 UTF-8 名称（仅显示）</span></td>"#),
-            "page: {page}"
-        );
-        assert!(!page.contains(r#"href="""#), "page: {page}");
-        // 无 action identity 与行尾控制
-        assert!(!page.contains("data-native-path-encoded"), "page: {page}");
-        assert!(
-            !page.contains(r#"data-cb-action="preview""#),
-            "page: {page}"
-        );
-        assert!(!page.contains("rel=\"noopener\""), "page: {page}");
-        assert!(!page.contains("?download=1"), "page: {page}");
     }
 
     /// 片段 helper: 恰好一个外层 `.cb-doc` 包装, 无 doctype/head/style/body 骨架.
@@ -824,725 +1087,143 @@ mod tests {
         assert!(!frag.contains("<body"), "frag: {frag}");
     }
 
-    /// 完整页: body 带 cb-doc-page 类, 正文经同一 doc_fragment 恰好包装一次,
-    /// KaTeX 链接保留, inject_doc_style 样式标记保留.
-    #[test]
-    fn doc_page_wraps_body_once_with_page_class() {
-        let page = doc_page("T", "<p>hi</p>");
-        assert!(page.starts_with("<!DOCTYPE html>"), "page: {page}");
-        assert!(page.contains("<title>T</title>"), "page: {page}");
-        assert!(
-            page.contains(r#"<body class="cb-doc-page">"#),
-            "page: {page}"
-        );
-        assert_eq!(
-            page.matches("<div class=\"cb-doc\">").count(),
-            1,
-            "page: {page}"
-        );
-        assert!(
-            page.contains(r#"href="/__/static/katex/katex.min.css""#),
-            "page: {page}"
-        );
-        assert!(
-            page.contains(r#"src="/__/static/js/chapbook-browser.js" defer"#),
-            "doc page must load the browser script (tree shell host): {page}"
-        );
-        let styled = inject_doc_style(&page);
-        assert!(
-            styled.contains("/* chapbook-doc-style */"),
-            "styled: {styled}"
-        );
-    }
-
-    /// CSS 重构静态守卫: 页面布局挂在 .cb-doc-page, 内容排版选择器全部作用域化到
-    /// .cb-doc, 盒模型作用域化, :root 变量保持全局, .cb-doc 不设置 transform/filter/perspective.
-    #[test]
-    fn doc_css_scopes_layout_and_content() {
-        let css = DOC_STYLE;
-        assert!(css.contains(":root"), "css: {css}");
-        assert!(
-            css.contains(
-                ".cb-doc *, .cb-doc *::before, .cb-doc *::after { box-sizing: border-box; }"
-            ),
-            "css: {css}"
-        );
-        assert!(css.contains(".cb-doc-page"), "css: {css}");
-        // 文档布局 (ticket 02): TOC 是命名网格的兄弟列, 旧 fixed rail (完整页) 与
-        // float rail (pane) 必须彻底移除 — 正文不得环绕/流入 TOC 列, rail 不得叠在正文上.
-        // 规则块切片断言 (非全局 contains): 窄屏单列是基础规则, 宽屏 (≥ 75rem)
-        // 覆盖为 内容区 + 右侧 240px TOC 列.
-        let layout_rule = css_block(css, ".cb-doc-layout {");
-        assert!(
-            layout_rule.contains("display: grid"),
-            "base layout rule must be a grid: {layout_rule}"
-        );
-        assert!(
-            layout_rule.contains("grid-template-areas: \"toc\" \"content\""),
-            "narrow single-column grid must be the base rule: {layout_rule}"
-        );
-        assert!(
-            layout_rule.contains("grid-template-columns: minmax(0, 1fr)"),
-            "base layout rule: {layout_rule}"
-        );
-        assert!(
-            layout_rule.contains("min-width: 0"),
-            "base layout rule: {layout_rule}"
-        );
-        let content_rule = css_block(css, ".cb-doc-content {");
-        assert!(
-            content_rule.contains("grid-area: content"),
-            "content rule: {content_rule}"
-        );
-        assert!(
-            content_rule.contains("min-width: 0"),
-            "content rule: {content_rule}"
-        );
-        assert!(
-            content_rule.contains("overflow-wrap: anywhere"),
-            "long unbroken prose/URL must wrap inside the content column: {content_rule}"
-        );
-        let toc_rule = css_block(css, ".cb-doc-toc {");
-        assert!(toc_rule.contains("grid-area: toc"), "toc rule: {toc_rule}");
-        assert!(toc_rule.contains("min-width: 0"), "toc rule: {toc_rule}");
-        assert!(
-            !toc_rule.contains("position: fixed") && !toc_rule.contains("float"),
-            "base TOC rule must not be fixed/float: {toc_rule}"
-        );
-        let wide_rule = css_block(css, "@media screen and (min-width: 75rem)");
-        assert!(
-            wide_rule.contains("grid-template-areas: \"content toc\""),
-            "wide layout must be content-left toc-right: {wide_rule}"
-        );
-        assert!(
-            wide_rule.contains("grid-template-columns: minmax(0, 1fr) 240px"),
-            "wide TOC column must be 240px: {wide_rule}"
-        );
-        assert!(
-            wide_rule.contains("gap: 20px") && wide_rule.contains("align-items: start"),
-            "wide layout must set gap/align-items: {wide_rule}"
-        );
-        let wide_toc_rule = css_block(wide_rule, ".cb-doc-toc {");
-        assert!(
-            wide_toc_rule.contains("position: sticky") && wide_toc_rule.contains("top: 0"),
-            "wide TOC must be sticky at top: {wide_toc_rule}"
-        );
-        assert!(
-            wide_toc_rule.contains("overflow-y: auto"),
-            "wide TOC must scroll internally: {wide_toc_rule}"
-        );
-        assert!(
-            wide_toc_rule.contains("max-height: calc(100vh - 2rem)"),
-            "wide TOC scroll height must be viewport-capped: {wide_toc_rule}"
-        );
-        assert!(
-            !wide_toc_rule.contains("position: fixed") && !wide_toc_rule.contains("float"),
-            "wide TOC rule must not be fixed/float: {wide_toc_rule}"
-        );
-        // 旧 max-width: 74.999rem 窄屏查询必须移除 (74.999 vs 75rem 交界处产生
-        // 分数像素空洞), 窄屏是基础规则, 宽屏只在 ≥ 75rem 覆盖.
-        assert!(
-            !css.contains("74.999rem"),
-            "legacy `max-width: 74.999rem` narrow query must be gone: {css}"
-        );
-        assert!(
-            !css.contains("float"),
-            "TOC must not float over document text: {css}"
-        );
-        // 旧 fixed rail (完整页) 的组合/拆分选择器不允许回归: 早期版本同时使用
-        // `.cb-doc-page:has(#TOC)` (纯组合器) 与 `.cb-doc-page #TOC` (后代), 以及
-        // `#table-of-contents` 变体, 且旧期望文本带 `position: fixed` 后缀 — 这里按
-        // 选择器字符串本身敏感地锁死 (哪怕只少一个空格/换行也会命中).
-        assert!(
-            !css.contains(".cb-doc-page:has(#TOC)"),
-            "legacy full-page fixed rail selector `.cb-doc-page:has(#TOC)` must stay gone: {css}"
-        );
-        assert!(
-            !css.contains(".cb-doc-page:has(#table-of-contents)"),
-            "legacy full-page fixed rail selector `.cb-doc-page:has(#table-of-contents)` must stay gone: {css}"
-        );
-        assert!(
-            !css.contains(".cb-doc-page #TOC"),
-            "legacy full-page fixed rail selector `.cb-doc-page #TOC` must stay gone: {css}"
-        );
-        assert!(
-            !css.contains(".cb-doc-page #table-of-contents"),
-            "legacy full-page fixed rail selector `.cb-doc-page #table-of-contents` must stay gone: {css}"
-        );
-        assert!(!css.contains("body:has(#TOC)"), "css: {css}");
-        assert!(!css.contains("\nhtml {"), "css: {css}");
-        assert!(!css.contains("\nbody {"), "css: {css}");
-        // 视口滚动声明在根元素上且限定完整文档页 (body 上的 scroll-* 不会传播到视口),
-        // 且是移动而非复制 (全表仅各出现一次)
-        assert!(css.contains("html:has(> body.cb-doc-page)"), "css: {css}");
-        assert!(
-            css.contains(
-                "html:has(> body.cb-doc-page) {\n  scroll-behavior: smooth;\n  scroll-padding-top: 1.5rem;\n}"
-            ),
-            "css: {css}"
-        );
-        assert_eq!(
-            css.matches("scroll-behavior: smooth").count(),
-            1,
-            "css: {css}"
-        );
-        assert_eq!(
-            css.matches("scroll-padding-top: 1.5rem").count(),
-            1,
-            "css: {css}"
-        );
-        let page_rule = css
-            .split(".cb-doc-page {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("css has a `.cb-doc-page {` rule");
-        let doc_rule = css
-            .split("\n.cb-doc {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("css has a `.cb-doc {` rule");
-        // 页面规则: border-box + 背景/栏宽/外边距/内边距, 不携带滚动或排版声明
-        assert!(
-            page_rule.contains("box-sizing: border-box"),
-            "page rule: {page_rule}"
-        );
-        assert!(
-            page_rule.contains("background-color: var(--cb-bg)"),
-            "page rule: {page_rule}"
-        );
-        assert!(
-            page_rule.contains("max-width: 100rem"),
-            "page rule: {page_rule}"
-        );
-        assert!(
-            page_rule.contains("margin: 0 auto"),
-            "page rule: {page_rule}"
-        );
-        assert!(
-            page_rule.contains("padding: 1.2rem 1.5rem 5rem"),
-            "page rule: {page_rule}"
-        );
-        assert!(!page_rule.contains("scroll"), "page rule: {page_rule}");
-        assert!(!page_rule.contains("\n  color:"), "page rule: {page_rule}");
-        assert!(!page_rule.contains("font-"), "page rule: {page_rule}");
-        assert!(!page_rule.contains("line-height"), "page rule: {page_rule}");
-        // .cb-doc 规则: 基础排版 (颜色/字体/字号/行高) 整页与片段共用, 不携带页面布局
-        assert!(
-            doc_rule.contains("color: var(--cb-text)"),
-            "doc rule: {doc_rule}"
-        );
-        assert!(
-            doc_rule.contains(
-                "font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Helvetica Neue\", Arial, \"PingFang SC\", \"Hiragino Sans GB\", \"Microsoft YaHei\", \"Noto Sans CJK SC\", sans-serif"
-            ),
-            "doc rule: {doc_rule}"
-        );
-        assert!(
-            doc_rule.contains("font-size: 12.8px"),
-            "doc rule: {doc_rule}"
-        );
-        assert!(
-            doc_rule.contains("line-height: 1.75"),
-            "doc rule: {doc_rule}"
-        );
-        assert!(!doc_rule.contains("background-"), "doc rule: {doc_rule}");
-        assert!(!doc_rule.contains("max-width"), "doc rule: {doc_rule}");
-        assert!(!doc_rule.contains("\n  margin:"), "doc rule: {doc_rule}");
-        assert!(!doc_rule.contains("\n  padding:"), "doc rule: {doc_rule}");
-        assert!(
-            css.contains(".cb-doc h1, .cb-doc h2, .cb-doc h3, .cb-doc h4, .cb-doc h5, .cb-doc h6"),
-            "css: {css}"
-        );
-        assert!(css.contains(".cb-doc pre.src"), "css: {css}");
-        assert!(css.contains(".cb-doc pre code span.keyword"), "css: {css}");
-        assert!(css.contains(".cb-doc #TOC a:hover"), "css: {css}");
-        assert!(css.contains(".cb-doc .katex-display"), "css: {css}");
-        // 区内的单个平移函数声明: 窄屏抽屉 .cb-tree 位移 + 折叠/恢复按钮居中
-        // (translate/translateX/translateY 三选一, 一行只允许一个); rotate/scale/
-        // matrix/perspective/translate3d 显式拒绝 — 即使同行出现 translate 也不
-        // 放行 (translate3d 是 3D 位移, 同样拒绝); transition: transform 是过渡
-        // 声明, 与 transform 值声明区分对待. 文档内容区恒禁止 transform.
-        assert!(!css.contains("filter"), "css: {css}");
-        assert!(!css.contains("perspective"), "css: {css}");
-        let (doc_part, shell_part) = css
-            .split_once("/* ---------- 树模式外壳")
-            .expect("tree shell section marker");
-        assert!(!doc_part.contains("transform"), "doc part: {doc_part}");
-        for line in shell_part.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.contains("transform") && !trimmed.starts_with('*') {
-                let is_transition = trimmed.contains("transition: transform");
-                let translate_forms = ["translate(", "translateX(", "translateY("];
-                let translate_count = translate_forms
-                    .iter()
-                    .filter(|form| trimmed.contains(*form))
-                    .count();
-                let banned = [
-                    "rotate(",
-                    "scale(",
-                    "matrix(",
-                    "perspective",
-                    "translate3d(",
-                ];
-                let has_banned = banned.iter().any(|b| trimmed.contains(b));
-                assert!(
-                    is_transition || (translate_count == 1 && !has_banned),
-                    "unexpected transform: {line}"
-                );
-            }
-        }
-        // 区内的平移位移: 窄屏抽屉 .cb-tree 位移 + 折叠/恢复按钮居中
-        // (translateX/translateY/translate, 无 rotate/scale/matrix); 文档内容区恒禁止.
-        assert!(!css.contains("filter"), "css: {css}");
-        assert!(!css.contains("perspective"), "css: {css}");
-        let (doc_part, shell_part) = css
-            .split_once("/* ---------- 树模式外壳")
-            .expect("tree shell section marker");
-        assert!(!doc_part.contains("transform"), "doc part: {doc_part}");
-        for line in shell_part.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.contains("transform") && !trimmed.starts_with('*') {
-                assert!(
-                    trimmed.contains("translate") || trimmed.contains("transition: transform"),
-                    "unexpected transform: {line}"
-                );
-            }
-        }
-    }
-
-    /// 视觉收尾 (tree-ui-polish): 树列与分隔线契约.
-    /// - 宽屏树列基础规则无右边框 (分隔线唯一来自调整器伪元素, 不得出现树边 +
-    ///   把手双线); 调整器列保持 8px, ::before 是唯一 2px 居中分隔线 (left: 3px);
-    /// - 折叠按钮移入 .cb-tree-toolbar (flex 顶栏: 8px gap + 居中 + 指定内边距),
-    ///   搜索表单 flex:1 且无自带内边距; 折叠按钮方角 (border-radius: 0)、
-    ///   约 1.6rem x 2rem, 不得再绝对定位悬浮;
-    /// - TOC 方角 (border-radius: 0);
-    /// - 内容侧呼吸: 宽屏 pane 左内边距 4px (px 精确 — 配合树列右内边距 4px +
-    ///   调整器列左右 3px 半宽, 线心距两侧文本各 8px, 树-内容总间隙 16px); 树侧
-    ///   呼吸同样 px 精确: 根列表右内边距 4px (压过 .cb-tree ul 的右 0) + 顶栏
-    ///   水平内边距 4px; 窄屏抽屉无分隔线, 不加内容内边距 (抽屉行为不变);
-    /// - 窄屏抽屉: 单边右边框 (无左边框); 抽屉内折叠按钮 (宽屏控件) 隐藏且
-    ///   不可聚焦/点击.
-    #[test]
-    fn doc_css_tree_separator_and_square_corners() {
-        let css = DOC_STYLE;
-        // 树列 (宽屏基础规则): 无右边框.
-        let tree_rule = css_block(css, "body.cb-tree-mode .cb-tree {");
-        assert!(
-            !tree_rule.contains("border-right"),
-            "tree rule must not carry border-right (single separator line): {tree_rule}"
-        );
-        // 调整器列保持 8px; 2px 分隔线在列内居中 (left: 3px, 两侧各 3px).
-        let mode_rule = css_block(css, "body.cb-tree-mode {");
-        assert!(
-            mode_rule
-                .contains("grid-template-columns: var(--cb-tree-width, 238px) 8px minmax(0, 1fr)"),
-            "resizer column must stay the 8px gutter: {mode_rule}"
-        );
-        let resizer_line = css_block(css, ".cb-tree-resizer::before {");
-        assert!(
-            resizer_line.contains("width: 2px") && resizer_line.contains("left: 3px"),
-            "separator must be the single 2px centered pseudo line: {resizer_line}"
-        );
-        // 顶栏: flex, 8px gap, 居中, 指定内边距 (水平呼吸 px 精确).
-        let toolbar_rule = css_block(css, ".cb-tree-toolbar {");
-        for needle in [
-            "display: flex",
-            "gap: 8px",
-            "align-items: center",
-            "padding: 0.4rem 4px 0.6rem",
-        ] {
-            assert!(
-                toolbar_rule.contains(needle),
-                "toolbar rule must keep {needle}: {toolbar_rule}"
-            );
-        }
-        // 树侧呼吸: 根列表右内边距 4px — 必须压过 .cb-tree ul 的右 0 (同元素
-        // 匹配时更高优先级), 否则线心距树侧仅 4px.
-        let root_rule = css_block(css, ".cb-tree ul.cb-tree-root {");
-        assert!(
-            root_rule.contains("padding: 0 4px 0 1.1em"),
-            "root list must carry the 4px right breathing padding: {root_rule}"
-        );
-        // 搜索表单: 顶栏内 flex:1, 无自带内边距.
-        let search_rule = css_block(css, ".cb-tree-search {");
-        assert!(
-            search_rule.contains("flex: 1") && search_rule.contains("padding: 0"),
-            "search rule must flex-fill toolbar without own padding: {search_rule}"
-        );
-        // 折叠按钮: 方角, 约 1.6rem x 2rem, 不再绝对定位悬浮.
-        let collapse_rule = css_block(css, ".cb-tree-collapse {");
-        assert!(
-            !collapse_rule.contains("position: absolute"),
-            "collapse button must not be absolutely positioned: {collapse_rule}"
-        );
-        assert!(
-            collapse_rule.contains("border-radius: 0"),
-            "collapse button must be square: {collapse_rule}"
-        );
-        assert!(
-            collapse_rule.contains("width: 1.6rem") && collapse_rule.contains("height: 2rem"),
-            "collapse button must be ~1.6rem x 2rem: {collapse_rule}"
-        );
-        // TOC 方角.
-        let toc_rule = css_block(css, ".cb-doc #TOC, .cb-doc #table-of-contents {");
-        assert!(
-            toc_rule.contains("border-radius: 0"),
-            "TOC must be square: {toc_rule}"
-        );
-        // 内容侧呼吸: 宽屏 pane 左内边距 4px (px 精确, 不得用 rem — 线心距
-        // 内容恰 8px: 调整器列右半 3px + 线半宽 1px + pane 4px).
-        let wide_pane = css_block(css, "@media (width >= 64rem)");
-        assert!(
-            wide_pane.contains("body.cb-tree-mode .cb-pane {")
-                && wide_pane.contains("padding-left: 4px"),
-            "wide pane must carry the exact 4px breathing padding: {wide_pane}"
-        );
-        assert!(
-            !wide_pane.contains("0.25rem"),
-            "wide pane breathing must be px-exact, not rem: {wide_pane}"
-        );
-        // 窄屏抽屉: 单边右边框 (无左边框) — 抽屉自带分隔线, 宽屏才走调整器伪线.
-        let narrow_block = css_block(css, "@media (width < 64rem)");
-        let drawer_rule = css_block(narrow_block, "body.cb-tree-mode .cb-tree {");
-        assert!(
-            drawer_rule.contains("border-right: 1px"),
-            "narrow drawer must carry a single right border: {drawer_rule}"
-        );
-        assert!(
-            !drawer_rule.contains("border-left"),
-            "narrow drawer must not carry a left border: {drawer_rule}"
-        );
-        let collapse_narrow = css_block(narrow_block, "body.cb-tree-mode .cb-tree-collapse {");
-        assert!(
-            collapse_narrow.contains("display: none")
-                || collapse_narrow.contains("visibility: hidden"),
-            "narrow drawer must hide the wide collapse button: {collapse_narrow}"
-        );
-    }
-
-    /// 模式切换按钮移入左侧工具栏 (不再浮动右上角): CSS 契约 —
-    /// 模式切换按钮移入左侧工具栏 (不再浮动右上角): CSS 契约 —
-    /// - .cb-mode-toggle 规则块: 绝无 position: fixed / top / right / z-index
-    ///   (浮动定位来源), 方角 border-radius: 0, flex: none 紧凑, 与折叠按钮
-    ///   同高 2rem (树顶栏垂直对齐一致);
-    /// - .cb-mode-toolbar 目录工具栏行: flex + 8px gap + 居中 + 树同款字号
-    ///   (12.8px 固定 px, 两宿主一致); [hidden] 必须 display: none
-    ///   (display:flex 会覆盖 UA hidden 默认样式);
-    /// - 行内迁入的顶栏搜索表单增长: .cb-mode-toolbar .cb-search flex: 1,
-    ///   输入框与树搜索同款 (方角 0.3em / 继承字号);
-    /// - 焦点可见性保留: .cb-mode-toggle:focus-visible 仍在统一 outline 组;
-    /// - 树网格选择器不再需要排除 .cb-mode-toggle (按钮不再是 body 直系子级).
-    #[test]
-    fn doc_css_mode_toolbar_layout_is_locked() {
-        let css = DOC_STYLE;
-        // 切换按钮: 绝不固定定位悬浮.
-        let toggle_rule = css_block(css, ".cb-mode-toggle {");
-        for bad in ["position: fixed", "top:", "right:", "z-index"] {
-            assert!(
-                !toggle_rule.contains(bad),
-                "toggle rule must not float ({bad}): {toggle_rule}"
-            );
-        }
-        assert!(
-            toggle_rule.contains("border-radius: 0"),
-            "toggle button must be square: {toggle_rule}"
-        );
-        assert!(
-            toggle_rule.contains("flex: none"),
-            "toggle button must stay compact (flex: none): {toggle_rule}"
-        );
-        assert!(
-            toggle_rule.contains("height: 2rem"),
-            "toggle button must match collapse button height (2rem): {toggle_rule}"
-        );
-        // 目录工具栏行: flex 行 + 树同款字号 (固定 px, 两宿主一致).
-        let toolbar_rule = css_block(css, ".cb-mode-toolbar {");
-        for needle in [
-            "display: flex",
-            "gap: 8px",
-            "align-items: center",
-            "font-size: 12.8px",
-        ] {
-            assert!(
-                toolbar_rule.contains(needle),
-                "mode toolbar rule must keep {needle}: {toolbar_rule}"
-            );
-        }
-        // [hidden] 显式 display:none: display:flex 基规则会覆盖 UA hidden 样式.
-        let hidden_rule = css_block(css, ".cb-mode-toolbar[hidden] {");
-        assert!(
-            hidden_rule.contains("display: none"),
-            "hidden toolbar row must be display:none (flex base rule overrides UA): {hidden_rule}"
-        );
-        // 迁入的顶栏搜索表单在行内增长, 输入框与树搜索一致.
-        let search_rule = css_block(css, ".cb-mode-toolbar .cb-search {");
-        assert!(
-            search_rule.contains("flex: 1"),
-            "moved topbar search must flex-fill the toolbar row: {search_rule}"
-        );
-        let input_rule = css_block(css, ".cb-mode-toolbar .cb-search input[type=\"search\"] {");
-        assert!(
-            input_rule.contains("border-radius: 0.3em")
-                && input_rule.contains("font-size: inherit"),
-            "moved search input must match tree search look: {input_rule}"
-        );
-        // 焦点可见性保留: 统一 outline 组仍含切换按钮.
-        let focus_rule = css_block(css, ".cb-mode-toggle:focus-visible {");
-        assert!(
-            focus_rule.contains("outline: 2px solid var(--cb-accent)"),
-            "toggle focus-visible outline must remain: {focus_rule}"
-        );
-        // 按钮不再是 body 直系子级: 网格选择器不得再排除 .cb-mode-toggle.
-        assert!(
-            !css.contains(":not(.cb-mode-toggle)"),
-            "grid selectors must not exclude .cb-mode-toggle anymore: {css}"
-        );
-    }
-
-    use crate::listing::SearchResult;
-
-    fn meta2(rel: PathBuf, is_directory: bool) -> FileMeta {
-        FileMeta {
-            relative_to_root: rel,
-            display_name: String::new(),
-            is_directory,
-            size: 0,
-            last_modified_time: SystemTime::UNIX_EPOCH,
-            last_access_time: SystemTime::UNIX_EPOCH,
-            creation_time: SystemTime::UNIX_EPOCH,
-        }
-    }
-
-    /// 共享页面 head: Materialize CSS / theme / chapbook-doc.css / browser JS (defer) /
-    /// title / viewport; token meta 只在 Some 时出现, 无 token 时不渲染 native 控制.
-    #[test]
-    fn dir_page_shared_head_and_native_token_meta() {
-        let with = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv"),
-            &[],
-            SortBy::default(),
-            Some("tok123"),
-        )
-        .into_string();
-        assert!(
-            with.contains(r#"<link rel="stylesheet" href="/__/static/css/materialize.min.css">"#),
-            "with: {with}"
-        );
-        assert!(
-            with.contains(r#"<link rel="stylesheet" href="/__/static/css/chapbook-theme.css">"#),
-            "with: {with}"
-        );
-        assert!(
-            with.contains(r#"<link rel="stylesheet" href="/__/static/katex/katex.min.css">"#),
-            "with: {with}"
-        );
-        assert!(
-            with.contains(r#"<link rel="stylesheet" href="/__/static/css/chapbook-doc.css">"#),
-            "with: {with}"
-        );
-        assert!(
-            with.contains(r#"src="/__/static/js/chapbook-browser.js""#),
-            "with: {with}"
-        );
-        assert!(with.contains("defer"), "with: {with}");
-        assert!(
-            with.contains("<meta name=\"viewport\" content=\"width=device-width"),
-            "with: {with}"
-        );
-        assert!(
-            with.contains(r#"<meta name="cb-native-open-token" content="tok123">"#),
-            "with: {with}"
-        );
-        // 常驻搜索表单 / 视图切换 / 预览面板骨架
-        assert!(with.contains(r#"action="/__/search""#), "with: {with}");
-        assert!(with.contains("cb-search-q"), "with: {with}");
-        assert!(with.contains("cb-preview"), "with: {with}");
-        assert!(with.contains(r#"data-cb-action="native""#), "with: {with}");
-
-        let without = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv"),
-            &[],
-            SortBy::default(),
-            None,
-        )
-        .into_string();
-        assert!(
-            !without.contains("cb-native-open-token"),
-            "without: {without}"
-        );
-        assert!(
-            !without.contains(r#"data-cb-action="native""#),
-            "without: {without}"
-        );
-    }
-
-    #[test]
-    fn dir_page_hides_semantic_heading_instead_of_repeating_visible_path() {
-        let page = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv/nested"),
-            &[],
-            SortBy::default(),
-            None,
-        )
-        .into_string();
-
-        assert!(
-            page.contains(r#"<h1 class="cb-visually-hidden">目录 /nested 中的文件</h1>"#),
-            "page: {page}"
-        );
-        assert!(!page.contains("Index of"), "page: {page}");
-    }
-
-    /// 面包屑: 根节点 href "/" + root basename label; 中间节点逐级累计编码
-    /// (空格 %20, + %2B, = %3D, # %23, 中文 percent-encoded), 与 FileMeta::href 同一编码器;
-    /// 当前节点纯文本不生成链接.
-    #[test]
-    fn dir_page_breadcrumb_special_segments_and_current_plain() {
-        let page = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv/a b/c+d/e=f/g#h/中文"),
-            &[],
-            SortBy::default(),
-            None,
-        )
-        .into_string();
-        assert!(page.contains(r#"<a href="/">"#), "page: {page}");
-        assert!(page.contains("<bdi dir=\"auto\">srv</bdi>"), "page: {page}");
-        assert!(page.contains(r#"<a href="/a%20b">"#), "page: {page}");
-        assert!(page.contains(r#"<a href="/a%20b/c%2Bd">"#), "page: {page}");
-        assert!(
-            page.contains(r#"<a href="/a%20b/c%2Bd/e%3Df">"#),
-            "page: {page}"
-        );
-        assert!(
-            page.contains(r#"<a href="/a%20b/c%2Bd/e%3Df/g%23h">"#),
-            "page: {page}"
-        );
-        // 当前节点 (中文): 纯文本, 不生成链接
-        assert!(
-            page.contains("<bdi dir=\"auto\">中文</bdi>"),
-            "page: {page}"
-        );
-        assert!(
-            !page.contains(r#"href="/a%20b/c%2Bd/e%3Df/g%23h/%E4%B8%AD%E6%96%87""#),
-            "current segment must not link: {page}"
-        );
-    }
-
-    /// root 目录的面包屑: 只有根链接, 无中间/当前节点.
-    #[test]
-    fn dir_page_breadcrumb_at_root_is_root_link_only() {
-        let page = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv"),
-            &[],
-            SortBy::default(),
-            None,
-        )
-        .into_string();
-        assert!(page.contains(r#"<a href="/">"#), "page: {page}");
-        assert!(!page.contains("cb-crumb-sep"), "page: {page}");
-    }
-
+    /// 安全契约: 非 UTF-8 名称在所有条目出口都是 display-only — 名称经显示
+    /// codec 出现在 bdi 中, 但不产生 anchor (更没有空 href) 与 action identity.
     #[cfg(unix)]
     #[test]
-    fn dir_page_breadcrumb_non_utf8_ancestor_is_display_only() {
+    fn non_utf8_entries_are_display_only_without_identity() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
-        let p = PathBuf::from(OsString::from_vec(b"/srv/bad\xFF/leaf".to_vec()));
-        let page = dir_page(Path::new("/srv"), &p, &[], SortBy::default(), None).into_string();
-        // 非 UTF-8 段及其后 remainder 均不产生链接, 只显示 (显示 codec 转义)
-        assert!(
-            page.contains("<bdi dir=\"auto\">bad\\xFF</bdi>"),
-            "page: {page}"
-        );
-        assert!(
-            page.contains("<bdi dir=\"auto\">leaf</bdi>"),
-            "page: {page}"
-        );
-        assert!(!page.contains("href=\"/bad"), "page: {page}");
-    }
 
-    /// 行 identity: data-browser-entry + ASCII-only encoded path + 安全 label.
-    /// href 与 dataset 是同一 RFC 3986 编码值 (仅前导斜杠不同).
-    #[test]
-    fn dir_page_row_identity_and_label_attributes() {
-        let img = meta2(PathBuf::from("a b/photo.png"), false);
-        let page = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv"),
-            &[img],
-            SortBy::default(),
-            None,
-        )
-        .into_string();
-        assert!(page.contains(r#"data-browser-entry"#), "page: {page}");
-        assert!(page.contains(r#"data-kind="file""#), "page: {page}");
-        assert!(
-            page.contains(r#"data-native-path-encoded="a%20b/photo.png""#),
-            "page: {page}"
-        );
-        assert!(
-            page.contains(r#"<a href="/a%20b/photo.png">"#),
-            "page: {page}"
-        );
-        // 安全 label attributes: basename 经显示 codec
-        assert!(page.contains(r#"title="photo.png""#), "page: {page}");
-        assert!(page.contains(r#"aria-label="photo.png""#), "page: {page}");
-    }
+        let bad = PathBuf::from(OsString::from_vec(b"\xFFbad.txt".to_vec()));
+        let files = [meta(bad, false)];
 
-    /// data-kind (dir|file) 标记行/网格/迷你条目: JS 的 PDF 判定是
-    /// kind + 后缀双条件 — 目录名 `folder.pdf` 必须仍是 dir.
-    #[test]
-    fn entry_kind_attribute_marks_dirs_and_files() {
-        let files = [
-            meta2(PathBuf::from("doc.pdf"), false),
-            meta2(PathBuf::from("folder.pdf"), true),
-        ];
+        // 目录页: 行 display-only, 无空 href, 无行 identity / 行尾控制.
+        // body 自身携带 root 的合法空 identity, 条目行不得再出现 identity.
         let page = dir_page(
             Path::new("/srv"),
             Path::new("/srv"),
             &files,
-            SortBy::default(),
+            ListingOptions::default(),
             None,
         )
         .into_string();
-        // 目录表行 + 网格项各一份 (共 2 行 + 2 网格项)
-        assert_eq!(
-            page.matches(r#"data-kind="file""#).count(),
-            2,
+        assert!(
+            page.contains("<bdi dir=\"auto\">\\xFFbad.txt</bdi>"),
             "page: {page}"
         );
+        assert!(page.contains("非 UTF-8 名称（仅显示）"), "page: {page}");
+        assert!(!page.contains(r#"href="""#), "page: {page}");
         assert_eq!(
-            page.matches(r#"data-kind="dir""#).count(),
-            2,
+            page.matches("data-native-path-encoded").count(),
+            1,
+            "only the body identity remains: {page}"
+        );
+        assert!(
+            !page.contains(r#"data-cb-action="preview""#),
             "page: {page}"
         );
-        // 迷你列表 li 同样携带 (可操作 anchor 分支)
-        let frag = dir_fragment(Path::new("/srv"), Path::new("/srv"), &files);
-        assert!(frag.contains(r#"<li data-kind="file">"#), "frag: {frag}");
-        assert!(frag.contains(r#"<li data-kind="dir">"#), "frag: {frag}");
-        // 非 UTF-8 display-only 分支: li 仍携带 data-kind, 只是无 anchor
-        #[cfg(unix)]
-        {
-            use std::ffi::OsString;
-            use std::os::unix::ffi::OsStringExt;
-            let bad = FileMeta {
-                relative_to_root: PathBuf::from(OsString::from_vec(b"\xFFbad.pdf".to_vec())),
-                display_name: String::new(),
-                is_directory: false,
-                size: 0,
-                last_modified_time: SystemTime::UNIX_EPOCH,
-                last_access_time: SystemTime::UNIX_EPOCH,
-                creation_time: SystemTime::UNIX_EPOCH,
-            };
-            let frag = dir_fragment(Path::new("/srv"), Path::new("/srv"), &[bad]);
-            assert!(frag.contains(r#"<li data-kind="file">"#), "frag: {frag}");
-        }
+        assert!(!page.contains("?download=1"), "page: {page}");
+
+        // 目录 fragment: wrapper identity 保留, 迷你条目无 anchor.
+        let frag = dir_fragment(
+            Path::new("/srv"),
+            Path::new("/srv"),
+            &files,
+            ListingOptions::default(),
+        );
+        assert!(
+            frag.contains("<bdi dir=\"auto\">\\xFFbad.txt</bdi>"),
+            "frag: {frag}"
+        );
+        assert!(!frag.contains(r#"<a href="/"#), "frag: {frag}");
+        assert_eq!(
+            frag.matches("data-native-path-encoded").count(),
+            1,
+            "frag: {frag}"
+        );
+
+        // 搜索页: 名称 display-only, 位置链接仍保留有效显示规则.
+        let result = SearchResult {
+            entries: vec![meta(
+                PathBuf::from(OsString::from_vec(b"dir/\xFFleaf.txt".to_vec())),
+                false,
+            )],
+            truncated: false,
+        };
+        let page = search_page(
+            Path::new("/srv"),
+            "leaf",
+            &result,
+            ListingOptions {
+                sort_by: SortBy {
+                    column: SortColumn::Size,
+                    order: SortOrder::Desc,
+                },
+                show_hidden: true,
+            },
+            None,
+        )
+        .into_string();
+        assert!(
+            page.contains("<bdi dir=\"auto\">\\xFFleaf.txt</bdi>"),
+            "page: {page}"
+        );
+        assert!(
+            page.contains(r#"<a href="/dir?sort=Size:Desc&amp;hidden=1">"#),
+            "page: {page}"
+        );
+        assert!(!page.contains(r#"href="""#), "page: {page}");
+    }
+
+    /// codec + query 边界: RFC 3986 sub-delims 原样保留在 identity/href 中,
+    /// 且行/网格 label 的 href 附加有效显示规则 (无 JS 导航不丢 hidden/sort).
+    #[test]
+    fn entry_links_preserve_encoded_identity_and_listing_options() {
+        let options = ListingOptions {
+            sort_by: SortBy {
+                column: SortColumn::Size,
+                order: SortOrder::Desc,
+            },
+            show_hidden: true,
+        };
+        let page = dir_page(
+            Path::new("/srv"),
+            Path::new("/srv"),
+            &[meta(PathBuf::from("a!b$c(d)e*f.txt"), false)],
+            options,
+            None,
+        )
+        .into_string();
+        assert!(
+            page.contains(r#"data-native-path-encoded="a!b$c(d)e*f.txt""#),
+            "page: {page}"
+        );
+        assert!(
+            page.contains(r#"<a href="/a!b$c(d)e*f.txt?sort=Size:Desc&amp;hidden=1">"#),
+            "page: {page}"
+        );
+        // 表头快捷入口保留同一 hidden 并携带 data-cb-sort.
+        assert!(page.contains(r#"data-cb-sort="Size:Asc""#), "page: {page}");
+        assert!(
+            page.contains(r#"href="?sort=Size:Asc&amp;hidden=1""#),
+            "page: {page}"
+        );
+    }
+
+    /// root 的 fragment wrapper: encodedPath 是合法空字符串而不是属性缺失.
+    #[test]
+    fn dir_fragment_root_wrapper_empty_encoded_path() {
+        let frag = dir_fragment(
+            Path::new("/srv"),
+            Path::new("/srv"),
+            &[],
+            ListingOptions::default(),
+        );
+        assert!(
+            frag.contains(r#"data-native-path-encoded="""#),
+            "frag: {frag}"
+        );
     }
 
     /// 网格缩略图判定: 仅图片扩展名, 大小写不敏感; 目录/音视频/无扩展名一律 false.
@@ -1564,274 +1245,10 @@ mod tests {
         ];
         for (name, is_dir, expect_image) in cases {
             assert_eq!(
-                is_image_entry(&meta2(PathBuf::from(name), *is_dir)),
+                is_image_entry(&meta(PathBuf::from(name), *is_dir)),
                 *expect_image,
                 "{name}"
             );
         }
-    }
-
-    /// 保持 6 列 striped 表 + 父行 colspan=6；父链接为精确绝对 root-relative URL，
-    /// 行尾 action 放进最后单元格，不新增第 7 列。
-    #[test]
-    fn dir_page_keeps_six_columns_and_actions_in_last_cell() {
-        let page = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv/a/b"),
-            &[meta2(PathBuf::from("f.txt"), false)],
-            SortBy::default(),
-            None,
-        )
-        .into_string();
-        assert!(page.contains(r#"<td colspan="6">"#), "page: {page}");
-        assert!(
-            page.contains(r#"<a href="/a" data-cb-parent"#),
-            "page: {page}"
-        );
-        // ../ 行 (colspan) + 1 数据行 * 6 单元格
-        assert_eq!(page.matches("<td").count(), 7, "page: {page}");
-        // 行尾 action: preview / new tab (target=_blank rel=noopener) / download
-        assert!(page.contains(r#"data-cb-action="preview""#), "page: {page}");
-        assert!(page.contains(r#"rel="noopener""#), "page: {page}");
-        assert!(page.contains("?download=1"), "page: {page}");
-        // 无 token -> 无 native 控制
-        assert!(!page.contains(r#"data-cb-action="native""#), "page: {page}");
-    }
-
-    /// 网格: 图片项用 lazy img + 精确 raw URL (无模式 query); 非图片/目录用 badge;
-    /// 列表与网格容器都渲染, 网格默认 hidden.
-    #[test]
-    fn dir_page_grid_image_attrs_and_badges() {
-        let files = [
-            meta2(PathBuf::from("photo.png"), false),
-            meta2(PathBuf::from("notes.txt"), false),
-            meta2(PathBuf::from("folder"), true),
-            meta2(PathBuf::from("README"), false),
-        ];
-        let page = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv"),
-            &files,
-            SortBy::default(),
-            None,
-        )
-        .into_string();
-        assert!(page.contains(r#"id="cb-view-list""#), "page: {page}");
-        assert!(page.contains(r#"id="cb-view-grid" hidden"#), "page: {page}");
-        assert!(
-            page.contains(r#"<img loading="lazy" decoding="async" src="/photo.png" alt="">"#),
-            "page: {page}"
-        );
-        assert!(page.contains(">DIR<"), "page: {page}");
-        assert!(page.contains(">txt<"), "page: {page}");
-        assert!(page.contains(">FILE<"), "page: {page}");
-        assert!(!page.contains("src=\"/notes.txt\""), "page: {page}");
-    }
-
-    /// 可操作网格 label 必须是原生 anchor, href 为 exact Full href (无 query):
-    /// Ctrl/Meta/中键/新 tab 行为由浏览器原生提供。同时锁定服务端编码器原样
-    /// 保留 RFC 3986 sub-delims !$()* (与 JS 校验器接受表一致)。
-    #[test]
-    fn grid_actionable_label_is_native_anchor_with_exact_href() {
-        let page = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv"),
-            &[meta(PathBuf::from("a!b$c(d)e*f.txt"))],
-            SortBy::default(),
-            None,
-        )
-        .into_string();
-        assert!(
-            page.contains(r#"data-native-path-encoded="a!b$c(d)e*f.txt""#),
-            "page: {page}"
-        );
-        assert!(
-            page.contains(
-                r#"<div class="cb-grid-label"><a href="/a!b$c(d)e*f.txt"><bdi dir="auto">a!b$c(d)e*f.txt</bdi></a>"#
-            ),
-            "page: {page}"
-        );
-        assert!(
-            !page.contains(r#"<div class="cb-grid-label"><a href="/a!b$c(d)e*f.txt?"#),
-            "网格 label 不得携带 fragment/download query: {page}"
-        );
-    }
-
-    /// 非 actionable 网格 label 保持 span 形态: 无 anchor、无 action identity。
-    #[cfg(unix)]
-    #[test]
-    fn grid_non_utf8_label_is_span_without_anchor() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        let bad = PathBuf::from(OsString::from_vec(b"\xFFbad.txt".to_vec()));
-        let page = dir_page(
-            Path::new("/srv"),
-            Path::new("/srv"),
-            &[meta(bad)],
-            SortBy::default(),
-            None,
-        )
-        .into_string();
-        assert!(
-            page.contains(
-                r#"<div class="cb-grid-label"><bdi dir="auto">\xFFbad.txt</bdi><span class="cb-non-utf8">非 UTF-8 名称（仅显示）</span></div>"#
-            ),
-            "page: {page}"
-        );
-        assert!(
-            !page.contains(r#"<div class="cb-grid-label"><a"#),
-            "page: {page}"
-        );
-        assert!(
-            !page.contains(r#"data-native-path-encoded"#),
-            "page: {page}"
-        );
-    }
-
-    fn search_result(entries: Vec<FileMeta>, truncated: bool) -> SearchResult {
-        SearchResult { entries, truncated }
-    }
-
-    /// 搜索页: 面包屑 (root 链接 + 纯文本 搜索), 4 列 (名称/位置/大小/修改时间),
-    /// 行序保持结果序, 位置列: 顶层条目链接到 "/", 子目录条目链接到父目录.
-    #[test]
-    fn search_page_columns_order_and_location_links() {
-        let entries = vec![
-            meta2(PathBuf::from("sub/a.txt"), false),
-            meta2(PathBuf::from("b c.png"), false),
-        ];
-        let page =
-            search_page(Path::new("/srv"), "a", &search_result(entries, false), None).into_string();
-        assert!(page.contains(r#"<a href="/">"#), "page: {page}");
-        assert!(page.contains(">搜索<"), "page: {page}");
-        assert!(page.contains("<th>名称</th>"), "page: {page}");
-        assert!(page.contains("<th>位置</th>"), "page: {page}");
-        assert!(page.contains("<th>大小</th>"), "page: {page}");
-        assert!(page.contains("<th>修改时间</th>"), "page: {page}");
-        assert!(page.contains(r#"<a href="/sub">"#), "page: {page}");
-        assert!(page.contains(r#"<a href="/">"#), "page: {page}");
-        // 结果顺序保持 (a.txt 行先于 b c.png 行)
-        let first = page.find("a.txt").expect("first entry");
-        let second = page.find("b%20c.png").expect("second entry");
-        assert!(first < second, "page: {page}");
-    }
-
-    #[test]
-    fn search_page_truncated_and_empty_notices() {
-        let trunc =
-            search_page(Path::new("/srv"), "q", &search_result(vec![], true), None).into_string();
-        assert!(trunc.contains("已截断"), "trunc: {trunc}");
-        let empty =
-            search_page(Path::new("/srv"), "q", &search_result(vec![], false), None).into_string();
-        assert!(empty.contains("没有找到匹配的文件"), "empty: {empty}");
-        assert!(!empty.contains("<table"), "empty: {empty}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn search_page_non_utf8_entry_display_only_but_location_linked() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-        let bad = FileMeta {
-            relative_to_root: PathBuf::from(OsString::from_vec(b"dir/\xFFleaf.txt".to_vec())),
-            display_name: String::new(),
-            is_directory: false,
-            size: 0,
-            last_modified_time: SystemTime::UNIX_EPOCH,
-            last_access_time: SystemTime::UNIX_EPOCH,
-            creation_time: SystemTime::UNIX_EPOCH,
-        };
-        let page = search_page(
-            Path::new("/srv"),
-            "leaf",
-            &search_result(vec![bad], false),
-            None,
-        )
-        .into_string();
-        // 名称 display-only + 提示; 无 action identity/控制
-        assert!(
-            page.contains("<bdi dir=\"auto\">\\xFFleaf.txt</bdi>"),
-            "page: {page}"
-        );
-        assert!(page.contains("非 UTF-8 名称（仅显示）"), "page: {page}");
-        assert!(!page.contains("data-native-path-encoded"), "page: {page}");
-        assert!(
-            !page.contains(r#"data-cb-action="preview""#),
-            "page: {page}"
-        );
-        // 父目录是合法 UTF-8: 位置仍链接到 /dir
-        assert!(page.contains(r#"<a href="/dir">"#), "page: {page}");
-    }
-
-    /// 目录 fragment: 恰好一个外层 wrapper 携带当前目录的 ASCII encoded path,
-    /// 无 doctype/head/style/body; 迷你列表含名称/大小与可操作 anchor (带自身 identity).
-    #[test]
-    fn dir_fragment_wrapper_encoded_path_and_mini_list() {
-        let files = vec![
-            meta2(PathBuf::from("a.txt"), false),
-            meta2(PathBuf::from("sub"), true),
-        ];
-        let frag = dir_fragment(Path::new("/srv"), Path::new("/srv/sub dir"), &files);
-        assert!(
-            frag.starts_with(
-                r#"<div class="cb-doc cb-dir-fragment" data-native-path-encoded="sub%20dir""#
-            ),
-            "frag: {frag}"
-        );
-        assert_eq!(
-            frag.matches(r#"<div class="cb-doc cb-dir-fragment""#)
-                .count(),
-            1,
-            "frag: {frag}"
-        );
-        assert!(!frag.contains("<!DOCTYPE"), "frag: {frag}");
-        assert!(!frag.contains("<head"), "frag: {frag}");
-        assert!(!frag.contains("<style"), "frag: {frag}");
-        assert!(!frag.contains("<body"), "frag: {frag}");
-        assert!(
-            frag.contains(r#"<a href="/a.txt" data-native-path-encoded="a.txt">"#),
-            "frag: {frag}"
-        );
-        assert!(frag.contains("0 B"), "frag: {frag}");
-    }
-
-    /// root 的 fragment wrapper: encodedPath 是合法空字符串而不是属性缺失.
-    #[test]
-    fn dir_fragment_root_wrapper_empty_encoded_path() {
-        let frag = dir_fragment(Path::new("/srv"), Path::new("/srv"), &[]);
-        assert!(
-            frag.contains(r#"data-native-path-encoded="""#),
-            "frag: {frag}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dir_fragment_non_utf8_entry_display_only() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-        let bad = FileMeta {
-            relative_to_root: PathBuf::from(OsString::from_vec(b"\xFFbad.txt".to_vec())),
-            display_name: String::new(),
-            is_directory: false,
-            size: 0,
-            last_modified_time: SystemTime::UNIX_EPOCH,
-            last_access_time: SystemTime::UNIX_EPOCH,
-            creation_time: SystemTime::UNIX_EPOCH,
-        };
-        let frag = dir_fragment(Path::new("/srv"), Path::new("/srv"), &[bad]);
-        assert!(
-            frag.contains("<bdi dir=\"auto\">\\xFFbad.txt</bdi>"),
-            "frag: {frag}"
-        );
-        assert!(frag.contains("非 UTF-8 名称（仅显示）"), "frag: {frag}");
-        // 只有 wrapper 携带 identity; 迷你条目无 anchor / 无 action identity
-        assert_eq!(
-            frag.matches("data-native-path-encoded").count(),
-            1,
-            "frag: {frag}"
-        );
-        assert!(!frag.contains(r#"<a href="/"#), "frag: {frag}");
     }
 }

@@ -1,13 +1,24 @@
-/* chapbook-browser.js — 目录页/搜索页渐进增强 (vanilla IIFE, 无依赖/构建).
+/* chapbook-browser.js — 目录/搜索/文档页渐进增强 (vanilla IIFE, 无依赖/构建).
  *
  * 安全契约 (docs/2026-08-12-design-readonly-file-browser.org, browser action path
- * contract): `element.dataset.nativePathEncoded` 是行/面板唯一的 action target。
+ * contract): `element.dataset.nativePathEncoded` 是行/面板唯一的 action target.
  * - URL actions (当前 tab / 新 tab / 预览 / 目录下钻 / 下载) 全程不 decode
  *   encodedPath: 统一经 actionUrl() 构造 URL, 模式只经 URL.searchParams 添加;
  * - native-open 独占唯一一次 decodeURIComponent, 随后交给 URLSearchParams 做
  *   application/x-www-form-urlencoded 编码 (含 token);
  * - 缺失/非法 target 一律 fail-closed: 清空面板 target, 禁用全部 action,
  *   不发送请求, 不复用旧 target。
+ *
+ * 浏览状态模型 (浏览视图控件计划 issue 04):
+ * - tree/list/grid 只有一个真源 state.view; 独立阅读页 state.view === null,
+ *   不是第四种浏览视图. 显示偏好 (cb-browse-view / cb-sort / cb-hidden) 只在
+ *   用户操作控件时写入; 显式 URL、初始化规范化和历史恢复绝不回写偏好.
+ * - 有效恢复快照优先; 冷访问按显式 URL > 偏好 > 默认. 内容安装键包含上下文、
+ *   查询与显示规则版本 (文档正文不含规则), 只有一致且成功安装才可跳过重取;
+ *   过期成功与过期错误一律丢弃, 不加自动重试.
+ * - managed 历史快照 (history.state.cb) 保存表面/视图/路径/查询/hash/规则以及
+ *   打开与选中条目各自的 encoded identity; 绝不含 token 或正文, 分享 URL 不含
+ *   layout. 同一位置控件变化 replace 当前历史项, 真实导航只新增一个目标项.
  *
  * 测试钩子: 纯函数在 CommonJS 环境 (Node/Bun) 下经 module.exports 暴露,
  * 浏览器环境无任何全局污染。
@@ -180,26 +191,117 @@
     return activePointerId !== null && event.pointerId === activePointerId;
   }
 
-  /* ---------- DOM 状态与渲染 ---------- */
+  /* ---------- 显示规则与偏好 (纯 seam) ---------- */
 
-  const ENTRY_SELECTOR = '[data-browser-entry]';
-  const ACTION_SELECTOR = '[data-cb-action]';
-  const PANEL_SELECTOR = '#cb-preview';
-  // 需要 panel target 才能启用的工具栏按钮 (close 永远可用)
-  const TARGET_ACTIONS = { full: true, new: true, download: true, native: true };
-  const VIEW_KEY = 'cb-view';
+  const SORT_COLUMNS = ['Name', 'Type', 'Size', 'LastModified', 'LastAccess', 'Creation'];
+  const SORT_ORDERS = ['Asc', 'Desc'];
+  const DEFAULT_SORT = 'Name:Asc';
+  const DEFAULT_VIEW = 'list';
+  const DEFAULT_HIDDEN = false;
 
-  let selectedIndex = -1;
-  let panelTarget = null; // 合法 encodedPath 或 null (fail-closed)
-  let nativeToken = null;
-  const previewGuard = createGenerationGuard(); // 并发预览 generation 守卫
-
-  let view = 'list';
-  try {
-    view = localStorage.getItem(VIEW_KEY) === 'grid' ? 'grid' : 'list';
-  } catch (err) {
-    view = 'list';
+  // sort 精确语法 `Column:Order` (大小写敏感; 非法值服务端 404, 客户端不入状态).
+  function isValidSort(value) {
+    if (typeof value !== 'string') return false;
+    const parts = value.split(':');
+    if (parts.length !== 2) return false;
+    return SORT_COLUMNS.indexOf(parts[0]) >= 0 && SORT_ORDERS.indexOf(parts[1]) >= 0;
   }
+
+  function isValidHidden(value) {
+    return value === '0' || value === '1';
+  }
+
+  // v 键循环: list → grid → tree → list (未知视同一 list 的下一步).
+  function nextBrowseView(view) {
+    if (view === 'list') return 'grid';
+    if (view === 'grid') return 'tree';
+    return 'list';
+  }
+
+  // 父目录 encoded path: 'a' → '', 'a/b' → 'a'; root/非法 → null.
+  function parentEncodedPath(encodedPath) {
+    if (!isValidEncodedPath(encodedPath) || encodedPath === '') return null;
+    const idx = encodedPath.lastIndexOf('/');
+    return idx < 0 ? '' : encodedPath.slice(0, idx);
+  }
+
+  // 隐藏项判定 (Q3): 名称以 '.' 开头. 编码路径接受原样 '.' (unreserved) 与
+  // '%2E'/'%2e' 编码形态; 字面 '%' 在 transport 编码为 %25, 不会误判.
+  function isHiddenName(name) {
+    return typeof name === 'string' && name[0] === '.';
+  }
+  function isHiddenEncodedPath(encodedPath) {
+    if (typeof encodedPath !== 'string' || encodedPath === '') return false;
+    const idx = encodedPath.lastIndexOf('/');
+    const last = idx < 0 ? encodedPath : encodedPath.slice(idx + 1);
+    return last[0] === '.' || /^%2e/i.test(last);
+  }
+
+  // 最近可见条目索引 (Q17 隐藏焦点回退, DOM 无关 seam): 从 fromIndex 起优先
+  // 向后找最近可见项, 其后向前找; 全部不可见返回 -1 (空列表落到容器).
+  function nearestVisibleIndex(visible, fromIndex) {
+    if (!Array.isArray(visible) || visible.length === 0) return -1;
+    const start = Math.max(0, Math.min(Math.round(fromIndex), visible.length - 1));
+    for (let i = start; i < visible.length; i++) {
+      if (visible[i]) return i;
+    }
+    for (let i = start - 1; i >= 0; i--) {
+      if (visible[i]) return i;
+    }
+    return -1;
+  }
+
+  // 树分支加载提交决策 (DOM 无关 seam):
+  // - 'drop': 旧壳响应 — 不写缓存、不落 DOM、不报错;
+  // - 'stale': 旧显示规则版本的响应/错误 — 全部丢弃 (与缓存一并失效);
+  // - 'cache': 当前版本但导航所有权已陈旧 — 只共享缓存结果, 不提交 DOM/展开;
+  // - 'install': 提交缓存并安装 DOM.
+  function treeLoadDecision(shellCurrent, versionCurrent, navRequired, navCurrent) {
+    if (!shellCurrent) return 'drop';
+    if (!versionCurrent) return 'stale';
+    if (navRequired && !navCurrent) return 'cache';
+    return 'install';
+  }
+
+  /* ---------- managed 历史快照 (纯 seam) ---------- */
+
+  const SNAPSHOT_VERSION = 1;
+  const SNAPSHOT_SURFACES = ['directory', 'search', 'reading'];
+  const SNAPSHOT_VIEWS = ['tree', 'list', 'grid'];
+
+  // 快照结构校验 (DOM 无关 seam): 表面/视图/路径/查询/hash/规则/打开与选中
+  // identity; 绝不含 token 或正文. 独立阅读无浏览视图 (view === null), 但树壳
+  // 可以覆盖在阅读目标上 (view === 'tree').
+  function isValidSnapshot(value) {
+    if (!value || typeof value !== 'object') return false;
+    if (value.v !== SNAPSHOT_VERSION) return false;
+    if (SNAPSHOT_SURFACES.indexOf(value.surface) < 0) return false;
+    if (value.view !== null && SNAPSHOT_VIEWS.indexOf(value.view) < 0) return false;
+    if (!isValidSort(value.sort)) return false;
+    if (!isValidHidden(String(value.hidden))) return false;
+    if (typeof value.hash !== 'string') return false;
+    if (value.opened !== null && !isValidEncodedPath(value.opened)) return false;
+    if (value.openedKind !== null && value.openedKind !== 'reading' && value.openedKind !== 'directory') return false;
+    if ((value.opened === null) !== (value.openedKind === null)) return false;
+    if (value.selected !== null && !isValidEncodedPath(value.selected)) return false;
+    if (value.surface === 'search') {
+      if (typeof value.q !== 'string') return false;
+      if (value.path !== '') return false;
+      if (value.view === null) return false;
+      return true;
+    }
+    if (value.q !== null && value.q !== undefined) return false;
+    if (!isValidEncodedPath(value.path)) return false;
+    if (value.surface === 'reading') {
+      // 阅读目标的路径必须非空; 只允许无视图或树壳.
+      if (value.path === '') return false;
+      return value.view === null || value.view === 'tree';
+    }
+    // directory 表面始终有活跃浏览视图.
+    return value.view !== null;
+  }
+
+  /* ---------- DOM 小工具 ---------- */
 
   function $(sel, root) {
     return (root || document).querySelector(sel);
@@ -209,59 +311,429 @@
     return Array.from((root || document).querySelectorAll(sel));
   }
 
-  function searchInput() {
-    return $('#cb-search-q');
-  }
+  // 能力仅来自合法完整页; 进入树壳清除, 不进入快照或浏览器存储.
+  let nativeToken = null;
 
-  function viewList() {
-    return $('#cb-view-list');
-  }
+  /* ---------- 偏好读写与一次性迁移 ---------- */
 
-  function viewGrid() {
-    return $('#cb-view-grid');
-  }
+  const PREF_VIEW = 'cb-browse-view'; // 'tree' | 'list' | 'grid'
+  const PREF_SORT = 'cb-sort'; // 'Column:Order'
+  const PREF_HIDDEN = 'cb-hidden'; // '1' | '0'
+  const LEGACY_MODE_KEY = 'cb-mode'; // 旧二级模式偏好: 'tree'
+  const LEGACY_VIEW_KEY = 'cb-view'; // 旧列表/网格偏好: 'list' | 'grid'
 
-  function panel() {
-    return $(PANEL_SELECTOR);
-  }
-
-  function panelContent() {
-    return $('#cb-preview-content');
-  }
-
-  function panelTitle() {
-    return $('#cb-preview-title');
-  }
-
-  function currentView() {
-    return view;
-  }
-
-  // 视图切换: 列表/网格渲染同一批 entries (同序), selectedIndex 语义不变;
-  // 切换后必须把 cb-selected 重新应用到新视图的对应条目, 否则键盘状态
-  // 与可见选中行分叉.
-  function applyView() {
-    const grid = view === 'grid';
-    if (viewList()) viewList().hidden = grid;
-    if (viewGrid()) viewGrid().hidden = !grid;
-    $$('[data-cb-view]').forEach(function (btn) {
-      btn.setAttribute(
-        'aria-pressed',
-        btn.getAttribute('data-cb-view') === view ? 'true' : 'false'
-      );
-    });
-    $$(ENTRY_SELECTOR).forEach(function (el) {
-      el.classList.remove('cb-selected');
-    });
-    const entries = visibleEntries();
-    if (selectedIndex >= 0 && selectedIndex < entries.length) {
-      entries[selectedIndex].classList.add('cb-selected');
-    }
+  function readPref(key) {
     try {
-      localStorage.setItem(VIEW_KEY, view);
+      return localStorage.getItem(key);
     } catch (err) {
-      /* 隐私模式等场景忽略持久化失败 */
+      return null; // 隐私模式/存储禁用: 仅内存态可用
     }
+  }
+
+  function writePref(key, value) {
+    try {
+      localStorage.setItem(key, value);
+    } catch (err) {
+      /* 持久化失败忽略 */
+    }
+  }
+
+  function removePref(key) {
+    try {
+      localStorage.removeItem(key);
+    } catch (err) {
+      /* 持久化失败忽略 */
+    }
+  }
+
+  // 一次性迁移旧 cb-mode / cb-view 到三态 cb-browse-view: 旧 tree 优先, 否则
+  // 保留 grid/list; 写入新键后删除旧键, 不保留长期兼容别名.
+  function loadViewPref() {
+    const stored = readPref(PREF_VIEW);
+    if (stored === 'tree' || stored === 'list' || stored === 'grid') return stored;
+    const legacyMode = readPref(LEGACY_MODE_KEY);
+    const legacyView = readPref(LEGACY_VIEW_KEY);
+    let migrated = DEFAULT_VIEW;
+    if (legacyMode === 'tree') {
+      migrated = 'tree';
+    } else if (legacyView === 'grid') {
+      migrated = 'grid';
+    }
+    if (legacyMode !== null || legacyView !== null) {
+      writePref(PREF_VIEW, migrated);
+      removePref(LEGACY_MODE_KEY);
+      removePref(LEGACY_VIEW_KEY);
+    }
+    return migrated;
+  }
+
+  function loadSortPref() {
+    const value = readPref(PREF_SORT);
+    return isValidSort(value) ? value : DEFAULT_SORT;
+  }
+
+  function loadHiddenPref() {
+    const value = readPref(PREF_HIDDEN);
+    return isValidHidden(value) ? value === '1' : DEFAULT_HIDDEN;
+  }
+
+  function persistView(view) {
+    writePref(PREF_VIEW, view);
+  }
+  function persistSort(sort) {
+    writePref(PREF_SORT, sort);
+  }
+  function persistHidden(hidden) {
+    writePref(PREF_HIDDEN, hidden ? '1' : '0');
+  }
+
+  /* ---------- 浏览状态 ---------- */
+
+  // kind: 内容区语义 (directory|search|reading); view: 活跃浏览视图或 null;
+  // path: 内容区目标的编码 identity ('' 为服务根; search 恒为 '');
+  // q: 搜索查询 (仅 search); opened/openedKind: 预览区打开条目; selected: 选中条目.
+  const state = {
+    kind: 'directory',
+    view: null,
+    path: '',
+    q: null,
+    rules: { sort: DEFAULT_SORT, hidden: DEFAULT_HIDDEN },
+    opened: null,
+    openedKind: null,
+    selected: null,
+  };
+
+  // 显示规则版本: 每次规则变化递增; 树缓存/空分支状态/在途结果都按版本提交.
+  let optionsVersion = 0;
+  let initialized = false;
+  // 本次文档加载是否消费了有效 managed 快照 (冷访问才回落共享偏好).
+  let bootSnapshot = false;
+
+  function isBrowseView() {
+    return state.view === 'tree' || state.view === 'list' || state.view === 'grid';
+  }
+
+  // 服务器页面语义 (body data-cb-surface); 缺失时不激活浏览增强 (fail-closed).
+  function bodySurface() {
+    const body = document.body;
+    const explicit = body && body.dataset ? body.dataset.cbSurface : null;
+    if (explicit === 'directory' || explicit === 'search' || explicit === 'reading') {
+      return explicit;
+    }
+    return null;
+  }
+
+  // 当前 URL 的路径 identity (canonical 编码, 无前导斜杠; 非法 → null).
+  function locationEncodedPath() {
+    const pathname = location.pathname;
+    if (pathname === '/' || pathname === '') return '';
+    const rel = pathname.slice(1).replace(/\/+$/, '');
+    return isValidEncodedPath(rel) ? rel : null;
+  }
+
+  function locationPathname() {
+    const pathname = location.pathname.replace(/\/+$/, '');
+    return pathname === '' ? '/' : pathname;
+  }
+
+  function isSearchLocation() {
+    return locationPathname() === '/__/search';
+  }
+
+  function urlParams() {
+    return new URL(location.href).searchParams;
+  }
+
+  // 显式 URL 规则: 缺失/非法返回 null (非法值服务端已 404, 不会到达这里).
+  function explicitUrlRules() {
+    const params = urlParams();
+    const sort = params.get('sort');
+    const hidden = params.get('hidden');
+    return {
+      sort: isValidSort(sort) ? sort : null,
+      hidden: isValidHidden(hidden) ? hidden === '1' : null,
+    };
+  }
+
+  // 浏览上下文 URL: 只带 q (search) 与 sort/hidden, 绝不携带 layout/fragment/
+  // download/view 等传输模式; hash 由调用方决定 (同文档延续, 新文档丢弃).
+  // sort/hidden 手工拼装: 保持服务端 `Column:Order` 字面冒号形式 (URLSearchParams
+  // 会把 ':' 编码为 %3A); q 经 form 语义编码 (与搜索表单提交一致).
+  function contextUrl(kind, encodedPath, query, hash) {
+    const base = kind === 'search' ? '/__/search' : '/' + encodedPath;
+    const parts = [];
+    if (kind === 'search') {
+      const qParams = new URLSearchParams();
+      qParams.set('q', query || '');
+      parts.push(qParams.toString());
+    }
+    parts.push('sort=' + state.rules.sort);
+    parts.push('hidden=' + (state.rules.hidden ? '1' : '0'));
+    return new URL(base + '?' + parts.join('&') + (hash || ''), location.origin);
+  }
+
+  // UI 导航沿用有效条目规则; transport identity 始终由纯 actionUrl 构造.
+  function browseActionUrl(encodedPath, mode) {
+    const url = actionUrl(encodedPath, mode);
+    if (url && mode !== 'download') {
+      url.search += (url.search ? '&' : '') +
+        'sort=' + state.rules.sort + '&hidden=' + (state.rules.hidden ? '1' : '0');
+    }
+    return url;
+  }
+
+  // 当前 URL 就地更新为有效规则 (保留其他参数与 hash); 用于同位置控件变化.
+  function currentEntryUrlWithRules() {
+    const url = new URL(location.href);
+    const rest = url.search
+      ? url.search
+          .slice(1)
+          .split('&')
+          .filter(function (pair) {
+            const key = pair.split('=')[0];
+            return key !== 'sort' && key !== 'hidden' && key !== 'q';
+          })
+      : [];
+    if (state.kind === 'search') {
+      const qParams = new URLSearchParams();
+      qParams.set('q', state.q || '');
+      rest.unshift(qParams.toString());
+    }
+    rest.push('sort=' + state.rules.sort);
+    rest.push('hidden=' + (state.rules.hidden ? '1' : '0'));
+    url.search = rest.join('&'); // search setter 不编码 ':'/'+' (保留字面形式)
+    return url;
+  }
+
+  function snapshotNow() {
+    return {
+      v: SNAPSHOT_VERSION,
+      surface: state.kind,
+      view: state.view,
+      path: state.path,
+      q: state.kind === 'search' ? state.q : null,
+      hash: location.hash,
+      sort: state.rules.sort,
+      hidden: state.rules.hidden ? 1 : 0,
+      opened: state.opened,
+      openedKind: state.openedKind,
+      selected: state.selected,
+    };
+  }
+
+  // 同位置控件变化: 只更新当前历史项 (URL 与快照), 不新增历史, 不写偏好.
+  function replaceCurrentEntry(url) {
+    history.replaceState({ cb: snapshotNow() }, '', url ? url.href : location.href);
+  }
+
+  // 真实路径/搜索导航: 新增一个携带快照的目标项.
+  function pushEntry(url) {
+    history.pushState({ cb: snapshotNow() }, '', url.href);
+  }
+
+  function readSnapshot() {
+    const raw = history.state;
+    const value = raw && typeof raw === 'object' ? raw.cb : null;
+    return isValidSnapshot(value) ? value : null;
+  }
+
+  // 快照只有在与当前 URL 上下文一致时才可消费 (reload/popstate/BFCache).
+  function snapshotMatchesLocation(snapshot) {
+    if (snapshot.surface === 'search') {
+      if (!isSearchLocation()) return false;
+      return (urlParams().get('q') || '') === (snapshot.q || '');
+    }
+    const urlPath = locationEncodedPath();
+    if (urlPath === null) return false;
+    const a = canonicalTransportKey(snapshot.path);
+    const b = canonicalTransportKey(urlPath);
+    return a !== null && a === b;
+  }
+
+  function applySnapshot(snapshot) {
+    state.kind = snapshot.surface;
+    state.view = snapshot.view;
+    state.path = snapshot.path;
+    state.q = snapshot.surface === 'search' ? snapshot.q : null;
+    state.rules = { sort: snapshot.sort, hidden: snapshot.hidden === 1 };
+    state.opened = snapshot.opened;
+    state.openedKind = snapshot.openedKind;
+    state.selected = snapshot.selected;
+  }
+
+  // 完整页交接 (补能力 / 视图切换): 目标路径与当前位置相同 → replace 当前项;
+  // 不同 → 只新增一个携带快照的目标项; 随后整页加载恢复能力.
+  function handoff(target, view) {
+    state.view = view;
+    state.kind = target.kind;
+    state.path = target.path;
+    state.q = target.kind === 'search' ? state.q : null;
+    state.opened = target.opened;
+    state.openedKind = target.openedKind || null;
+    state.selected = target.locate;
+    const sameLocation = target.sameLocation === true;
+    const url = contextUrl(
+      target.kind,
+      target.path,
+      target.kind === 'search' ? state.q : null,
+      sameLocation ? location.hash : ''
+    );
+    if (sameLocation) {
+      history.replaceState({ cb: snapshotNow() }, '', url.href);
+    } else {
+      history.pushState({ cb: snapshotNow() }, '', url.href);
+    }
+    location.reload();
+  }
+
+  /* ---------- 工具区控件 (视图 / 隐藏 / 排序) ---------- */
+
+  function viewButtons() {
+    return $$('[data-cb-view]');
+  }
+
+  function hiddenToggle() {
+    return $('[data-cb-hidden-toggle]');
+  }
+
+  function sortControl() {
+    return $('.cb-sort');
+  }
+
+  // 排序入口 = 顶部 12 个菜单链接 + 表头快捷入口: 只认可交互 anchor (body 与
+  // fragment wrapper 用同名 data-cb-sort 携带元数据, 绝不能被当成控件).
+  function sortLinks() {
+    return $$('a[data-cb-sort]');
+  }
+
+  function searchForm() {
+    return $('header.cb-topbar form.cb-search') || $('form.cb-search');
+  }
+
+  // 控件可用性: 只有活跃浏览视图下 hidden/sort 才生效 (独立阅读页禁用, 由
+  // aria-disabled 表达; 客户端启用 = 清除 aria-disabled 并补 href/click).
+  function syncControlState() {
+    const browse = isBrowseView();
+    viewButtons().forEach(function (btn) {
+      btn.removeAttribute('aria-disabled');
+      btn.setAttribute('data-cb-tip', btn.getAttribute('aria-label'));
+      const active = btn.getAttribute('data-cb-view') === state.view;
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+      // 视图入口的渐进增强 href (列表 anchor) 延续有效显示规则.
+      if (btn.tagName === 'A') {
+        btn.setAttribute(
+          'href',
+          hrefWithRules(btn.getAttribute('href') || location.href, {
+            sort: state.rules.sort,
+            hidden: state.rules.hidden,
+          })
+        );
+      }
+    });
+    const toggle = hiddenToggle();
+    if (toggle) {
+      toggle.setAttribute('aria-pressed', state.rules.hidden ? 'true' : 'false');
+      toggle.setAttribute('aria-disabled', browse ? 'false' : 'true');
+      toggle.setAttribute('data-cb-tip', browse
+        ? (state.rules.hidden ? '不显示隐藏项' : '显示隐藏项')
+        : '阅读模式不适用：请先在目录或搜索中使用');
+      if (toggle.tagName === 'A') {
+        toggle.setAttribute(
+          'href',
+          hrefWithRules(toggle.getAttribute('href') || location.href, {
+            sort: state.rules.sort,
+            hidden: !state.rules.hidden,
+          })
+        );
+      }
+    }
+    const control = sortControl();
+    if (control) {
+      control.setAttribute('aria-disabled', browse ? 'false' : 'true');
+      const summary = control.querySelector('summary');
+      if (summary) summary.setAttribute('data-cb-tip', browse
+        ? '排序' : '阅读模式不适用：请先在目录或搜索中使用');
+    }
+    let currentLabel = null;
+    sortLinks().forEach(function (link) {
+      link.setAttribute('aria-disabled', browse ? 'false' : 'true');
+      const value = link.getAttribute('data-cb-sort');
+      // 表头链接表示下一次排序动作; 当前摘要只能取工具区内的选项标签.
+      const current = !!control && control.contains(link) && value === state.rules.sort;
+      if (current) {
+        link.setAttribute('aria-current', 'true');
+        currentLabel = link.textContent ? link.textContent.trim() : null;
+      } else {
+        link.removeAttribute('aria-current');
+      }
+      // 独立阅读页 (服务器不输出 href) 只有在浏览视图活跃时才补回可用链接.
+      if (browse || link.hasAttribute('href')) {
+        link.setAttribute(
+          'href',
+          hrefWithRules(link.getAttribute('href') || location.href, {
+            sort: value,
+            hidden: state.rules.hidden,
+          })
+        );
+      }
+    });
+    const sortState = $('[data-cb-sort-state]');
+    if (sortState && currentLabel) sortState.textContent = currentLabel;
+    const form = searchForm();
+    if (form) {
+      const sortField = form.querySelector('input[name="sort"]');
+      const hiddenField = form.querySelector('input[name="hidden"]');
+      if (sortField) sortField.value = state.rules.sort;
+      if (hiddenField) hiddenField.value = state.rules.hidden ? '1' : '0';
+    }
+  }
+
+  // 在既有 href 上就地替换 sort/hidden (保留 q 与其他必要字段; 非法 href 原样).
+  // 手工拼装保持服务端 `Column:Order` 字面形式, 不重新编码其余参数.
+  function hrefWithRules(href, rules) {
+    if (typeof href !== 'string' || href === '') return href;
+    let url;
+    try {
+      url = new URL(href, location.href);
+    } catch (err) {
+      return href;
+    }
+    if (url.origin !== location.origin) return href;
+    const pairs = url.search
+      ? url.search
+          .slice(1)
+          .split('&')
+          .filter(function (pair) {
+            const key = pair.split('=')[0];
+            return key !== 'sort' && key !== 'hidden';
+          })
+      : [];
+    if (rules.sort !== undefined && rules.sort !== null) {
+      pairs.push('sort=' + rules.sort);
+    }
+    if (rules.hidden !== undefined && rules.hidden !== null) {
+      pairs.push('hidden=' + (rules.hidden ? '1' : '0'));
+    }
+    return url.pathname + (pairs.length ? '?' + pairs.join('&') : '') + url.hash;
+  }
+
+  /* ---------- 列表/网格条目与选中 ---------- */
+
+  const ENTRY_SELECTOR = '[data-browser-entry]';
+  const ACTION_SELECTOR = '[data-cb-action]';
+  const PANEL_SELECTOR = '#cb-preview';
+  // 需要 panel target 才能启用的工具栏按钮 (close 永远可用)
+  const TARGET_ACTIONS = { full: true, new: true, download: true, native: true };
+
+  let selectedIndex = -1; // 内存光标: 当前视图内选中行下标 (identity 镜像进 state)
+
+  function entryHost() {
+    return state.view === 'grid' ? $('#cb-view-grid') : $('#cb-view-list');
+  }
+
+  function visibleEntries() {
+    const host = entryHost();
+    return host ? $$(ENTRY_SELECTOR, host) : [];
   }
 
   // 行/面板唯一 action target: 属性缺失或非法 → null (禁用全部 action)。
@@ -272,36 +744,89 @@
     return value;
   }
 
-  function visibleEntries() {
-    const host = view === 'grid' ? viewGrid() : viewList();
-    return host ? $$(ENTRY_SELECTOR, host) : [];
+  function entryKindOf(el) {
+    return el && el.dataset ? el.dataset.kind || null : null;
   }
 
-  function selectIndex(index) {
+  function findEntryByIdentity(identity) {
+    if (identity === null) return null;
+    const found = visibleEntries().find(function (el) {
+      return encodedPathOf(el) === identity;
+    });
+    return found || null;
+  }
+
+  function removeEntrySelection() {
+    visibleEntries().forEach(function (el) {
+      el.classList.remove('cb-selected');
+    });
+  }
+
+  // 该行在新 hidden 规则下是否仍可见: 无 identity 的显示行不可判定 → 视为可见
+  // (非 UTF-8 display-only 行由服务端过滤规则决定).
+  function entryHiddenByRules(el) {
+    const identity = encodedPathOf(el);
+    if (identity === null || identity === '') return false;
+    return isHiddenEncodedPath(identity);
+  }
+
+  // Q17 隐藏焦点回退候选: 从当前光标起最近可见条目 (优先向后); 无选中 → null.
+  function fallbackSelectionForHide() {
+    if (selectedIndex < 0) return null;
+    const entries = visibleEntries();
+    const visible = entries.map(function (el) {
+      return !entryHiddenByRules(el);
+    });
+    const idx = nearestVisibleIndex(visible, selectedIndex);
+    return idx < 0 ? null : encodedPathOf(entries[idx]);
+  }
+
+  function clearEntrySelection(opts) {
+    removeEntrySelection();
+    selectedIndex = -1;
+    state.selected = null;
+    if (!(opts && opts.silent)) replaceCurrentEntry();
+  }
+
+  function selectIndex(index, opts) {
     const entries = visibleEntries();
     if (entries.length === 0) {
-      selectedIndex = -1;
+      clearEntrySelection(opts);
       return;
     }
     const clamped = Math.max(0, Math.min(index, entries.length - 1));
-    if (selectedIndex >= 0 && selectedIndex < entries.length) {
-      entries[selectedIndex].classList.remove('cb-selected');
-    }
+    removeEntrySelection();
     selectedIndex = clamped;
-    entries[selectedIndex].classList.add('cb-selected');
-    entries[selectedIndex].scrollIntoView({ block: 'nearest' });
-    // P2#4: 选中非 actionable 行立即清空旧 panel target 并禁用 actions,
-    // 绝不复用 stale target。
-    panelTarget = panelTargetForSelection(
-      encodedPathOf(entries[selectedIndex]),
-      panelTarget
-    );
+    const entry = entries[clamped];
+    entry.classList.add('cb-selected');
+    entry.scrollIntoView({ block: 'nearest' });
+    state.selected = encodedPathOf(entry);
+    // 选中非 actionable 行立即清空 panel target (绝不复用 stale target);
+    // 打开条目的 identity 不受选中影响.
+    panelTarget = panelTargetForSelection(state.selected, panelTarget);
     if (panelTarget === null) setActionsEnabled(false);
+    if (!(opts && opts.silent)) replaceCurrentEntry();
   }
 
   function selectEntry(entry) {
     const idx = visibleEntries().indexOf(entry);
     if (idx >= 0) selectIndex(idx);
+  }
+
+  // 按编码 identity 恢复选中 (视图切换/内容重取后; 不猜 index).
+  function selectByIdentity(identity, opts) {
+    if (identity === null || identity === undefined) {
+      clearEntrySelection(opts);
+      return;
+    }
+    const idx = visibleEntries().findIndex(function (el) {
+      return encodedPathOf(el) === identity;
+    });
+    if (idx >= 0) {
+      selectIndex(idx, opts);
+    } else {
+      clearEntrySelection(opts);
+    }
   }
 
   // 有界移动: 到边界停, 不循环。
@@ -318,7 +843,315 @@
     return encodedPathOf(entries[selectedIndex]);
   }
 
-  // fail-closed: 清空面板 target 并禁用依赖 target 的工具栏按钮。
+  // 选中条目的 data-kind (dir|file): PDF 判定需要 kind + 后缀双条件 —
+  // 目录名 `folder.pdf` 必须按目录处理.
+  function selectedEntryKind() {
+    const entries = visibleEntries();
+    if (selectedIndex < 0 || selectedIndex >= entries.length) return null;
+    return entryKindOf(entries[selectedIndex]);
+  }
+
+  // 视图 DOM: list/grid 容器互斥显示 (阅读页无容器); 树壳由外壳逻辑独占.
+  function applyViewContainers() {
+    const list = $('#cb-view-list');
+    const grid = $('#cb-view-grid');
+    if (state.view === 'list') {
+      if (list) list.hidden = false;
+      if (grid) grid.hidden = true;
+    } else if (state.view === 'grid') {
+      if (list) list.hidden = true;
+      if (grid) grid.hidden = false;
+    }
+  }
+
+  // 重取/视图切换后重标选中行 (identity 驱动, 不用 selectedIndex 反推).
+  function applyEntrySelection(opts) {
+    if (state.selected === null) {
+      clearEntrySelection(opts);
+      return;
+    }
+    selectByIdentity(state.selected, opts);
+  }
+
+  /* ---------- 视图/规则状态转移 ---------- */
+
+  // 进入 tree 时的内容区目标: list/grid 的已打开条目优先, 否则当前上下文.
+  // opened 的语义 kind 优先取内存值, 缺失时从列表行 data-kind 推导 (没有竞态).
+  function treeEntryTarget() {
+    // 搜索切换只改变布局, 已打开预览不能把查询变成文件导航.
+    if (state.kind === 'search') return { kind: 'search', path: '' };
+    if (state.view === 'list' || state.view === 'grid') {
+      const opened = state.opened;
+      if (opened !== null && opened !== '' && isValidEncodedPath(opened)) {
+        const entry = findEntryByIdentity(opened);
+        const kind =
+          state.openedKind ||
+          (entry ? (entryKindOf(entry) === 'dir' ? 'directory' : 'reading') : null);
+        if (kind) return { kind: kind, path: opened };
+      }
+    }
+    return { kind: state.kind, path: state.path };
+  }
+
+  // tree → list/grid: 阅读目标进父目录并定位 (实际导航, 新增一个目标项);
+  // 目录/搜索保持位置 (同位置 replace 后整页重取, 恢复本机打开能力).
+  function listGridTargetFromTree() {
+    if (state.kind === 'reading') {
+      const parent = parentEncodedPath(state.path);
+      const dir = parent === null ? '' : parent;
+      return {
+        kind: 'directory',
+        path: dir,
+        locate: state.path,
+        opened: state.path,
+        openedKind: 'reading',
+        sameLocation: false,
+      };
+    }
+    if (state.kind === 'search') {
+      return {
+        kind: 'search',
+        path: '',
+        locate: state.selected,
+        opened: null,
+        openedKind: null,
+        sameLocation: isSearchLocation(),
+      };
+    }
+    return {
+      kind: 'directory',
+      path: state.path,
+      locate: null,
+      opened: null,
+      openedKind: null,
+      sameLocation: locationEncodedPath() === state.path,
+    };
+  }
+
+  // 独立阅读页 → list/grid: 父目录并定位当前文档.
+  function readingListGridTarget() {
+    const parent = parentEncodedPath(state.path);
+    return {
+      kind: 'directory',
+      path: parent === null ? '' : parent,
+      locate: state.path,
+      opened: state.path,
+      openedKind: 'reading',
+      sameLocation: false,
+    };
+  }
+
+  // 用户视图切换 (控件或 v 键): 同位置变化 replace 当前项; 需要完整页能力时
+  // 交接 (同路径 replace+reload, 跨路径只新增一个目标项+reload).
+  function switchToView(next, opts) {
+    if (next !== 'tree' && next !== 'list' && next !== 'grid') return;
+    if (next === state.view) return;
+    const user = !!(opts && opts.user);
+    if (next === 'tree') {
+      cancelListingRefresh();
+      const target = treeEntryTarget();
+      state.view = 'tree';
+      state.kind = target.kind;
+      state.path = target.path;
+      state.q = target.kind === 'search' ? state.q : null;
+      state.opened = null;
+      state.openedKind = null;
+      closePanel(); // 树壳没有预览面板: 关闭并作废在途预览
+      if (user) persistView('tree');
+      syncControlState();
+      replaceCurrentEntry(
+        isSearchLocation()
+          ? currentEntryUrlWithRules()
+          : contextUrl(state.kind, state.path, state.q, location.hash)
+      );
+      ensureTreeShell(true);
+      return;
+    }
+    if (user) persistView(next);
+    if (state.view === 'tree') {
+      handoff(listGridTargetFromTree(), next);
+      return;
+    }
+    if (state.view === null) {
+      handoff(readingListGridTarget(), next);
+      return;
+    }
+    state.view = next;
+    syncControlState();
+    applyViewContainers();
+    applyEntrySelection();
+    replaceCurrentEntry();
+  }
+
+  // 隐藏/排序控件变化: 立即提交新规则、当前历史项与用户改动的偏好字段.
+  function applyRulesChange(next) {
+    const change = {};
+    if (next.sort !== undefined && next.sort !== null && next.sort !== state.rules.sort) {
+      change.sort = next.sort;
+    }
+    if (next.hidden !== undefined && next.hidden !== null && next.hidden !== state.rules.hidden) {
+      change.hidden = next.hidden;
+    }
+    if (change.sort === undefined && change.hidden === undefined) return;
+    if (change.hidden === false) {
+      // Q17 焦点回退: 只重标选中/焦点, 不打开回退项, 不改变 pathname/q/hash.
+      state.selected =
+        state.view === 'tree'
+          ? treeHiddenFallback()
+          : selectedIndex < 0
+            ? null
+            : fallbackSelectionForHide();
+    }
+    if (change.sort !== undefined) {
+      state.rules.sort = change.sort;
+      persistSort(change.sort);
+    }
+    if (change.hidden !== undefined) {
+      state.rules.hidden = change.hidden;
+      persistHidden(change.hidden);
+    }
+    optionsVersion += 1;
+    syncControlState();
+    replaceCurrentEntry(currentEntryUrlWithRules());
+    if (state.view === 'tree') {
+      // 树/内容区客户端重取: 已展开分支与目录预览进入新版本加载状态; 打开内容
+      // 保留 (文档正文不因规则变化重转换), 重排不收起、不回根目录.
+      refreshTreeForRules();
+      refreshPaneForRules();
+      return;
+    }
+    // 只安装服务器生成的条目区, 保留已打开文档的 live DOM 与本机打开能力.
+    refreshListingForRules();
+    if (state.opened !== null && state.openedKind === 'directory') {
+      openPreview(state.opened, 'dir', { silent: true });
+    }
+  }
+
+  let listingAbort = null;
+
+  function cancelListingRefresh() {
+    if (listingAbort) listingAbort.abort();
+    listingAbort = null;
+    const status = $('[data-cb-listing-status]');
+    if (status) status.remove();
+    const main = $('main.cb-main');
+    if (main) {
+      main.hidden = false;
+      main.removeAttribute('aria-busy');
+    }
+  }
+
+  // 完整可信页只取 main/面包屑, 不安装 head、token、工具区或预览面板.
+  // 显示规则变化不重建文档正文; 新旧版本的成功/失败采用同一提交守卫.
+  function refreshListingForRules() {
+    cancelListingRefresh();
+    const main = $('main.cb-main');
+    if (!main) return;
+    const version = optionsVersion;
+    const kind = state.kind;
+    const path = state.path;
+    const query = state.q;
+    const sort = state.rules.sort;
+    const hidden = state.rules.hidden ? '1' : '0';
+    const focusInMain = main.contains(document.activeElement);
+    const current = function () {
+      return (
+        version === optionsVersion &&
+        (state.view === 'list' || state.view === 'grid') &&
+        kind === state.kind && path === state.path && query === state.q
+      );
+    };
+    const status = document.createElement('p');
+    status.setAttribute('data-cb-listing-status', '');
+    status.setAttribute('role', 'status');
+    status.textContent = '正在更新条目…';
+    main.before(status);
+    main.hidden = true;
+    main.setAttribute('aria-busy', 'true');
+    const ac = new AbortController();
+    listingAbort = ac;
+    fetch(contextUrl(kind, path, query, location.hash), {
+      headers: { Accept: 'text/html' },
+      signal: ac.signal,
+    })
+      .then(function (res) {
+        if (!current()) return null;
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        if (
+          !(res.headers.get('Content-Type') || '').toLowerCase().startsWith('text/html') ||
+          res.headers.get('X-Frame-Options') !== 'DENY'
+        ) throw new Error('无效的条目响应');
+        return res.text();
+      })
+      .then(function (html) {
+        if (html === null || !current()) return;
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const data = doc.body.dataset;
+        const nextMain = doc.querySelector('main.cb-main');
+        if (
+          !nextMain || data.cbSurface !== kind || data.nativePathEncoded !== path ||
+          data.cbSort !== sort || data.cbHidden !== hidden ||
+          (kind === 'search' && data.cbQuery !== query)
+        ) throw new Error('条目响应与当前上下文不一致');
+        main.replaceWith(nextMain);
+        const breadcrumb = $('.cb-breadcrumb');
+        const nextBreadcrumb = doc.querySelector('.cb-breadcrumb');
+        if (breadcrumb && nextBreadcrumb) breadcrumb.replaceWith(nextBreadcrumb);
+        document.body.dataset.cbSort = sort;
+        document.body.dataset.cbHidden = hidden;
+        status.remove();
+        listingAbort = null;
+        applyViewContainers();
+        applyEntrySelection({ silent: true });
+        if (focusInMain) {
+          const selected = findEntryByIdentity(state.selected);
+          nextMain.tabIndex = -1;
+          (selected || nextMain).focus();
+        }
+        replaceCurrentEntry();
+      })
+      .catch(function (err) {
+        if (!current() || (err && err.name === 'AbortError')) return;
+        const error = document.createElement('p');
+        error.setAttribute('role', 'alert');
+        error.textContent = '无法更新条目：' + (err && err.message ? err.message : String(err));
+        main.replaceChildren(error);
+        main.hidden = false;
+        main.removeAttribute('aria-busy');
+        status.remove();
+        listingAbort = null;
+      });
+  }
+
+  /* ---------- 预览面板 (list/grid) ---------- */
+
+  let panelTarget = null; // 合法 encodedPath 或 null (fail-closed)
+  let panelCommittedKey = null; // 最近成功安装的内容键 (含上下文与规则)
+  const previewGuard = createGenerationGuard();
+
+  function panel() {
+    return $(PANEL_SELECTOR);
+  }
+
+  function panelContent() {
+    return $('#cb-preview-content');
+  }
+
+  function panelTitle() {
+    return $('#cb-preview-title');
+  }
+
+  // 内容键: 目录/搜索内容依赖上下文、查询与显示规则; 文档正文与规则无关
+  // (绝不因排序/隐藏重转换已打开文档).
+  function contentKey(kind, encodedPath, query) {
+    const parts = [kind, encodedPath, query || ''];
+    if (kind === 'directory' || kind === 'search') {
+      parts.push(state.rules.sort);
+      parts.push(state.rules.hidden ? '1' : '0');
+    }
+    return parts.join('|');
+  }
+
   function setActionsEnabled(enabled) {
     $$(PANEL_SELECTOR + ' ' + ACTION_SELECTOR).forEach(function (btn) {
       if (TARGET_ACTIONS[btn.getAttribute('data-cb-action')]) {
@@ -326,6 +1159,7 @@
       }
     });
   }
+
   // 下载按钮单独禁用: 目录 target 的 download 被服务端忽略 (返回目录页),
   // 其余 target 相关 action (full/new/native) 对目录仍有效.
   function setDownloadEnabled(enabled) {
@@ -333,20 +1167,20 @@
     if (btn) btn.disabled = !enabled;
   }
 
-
   function clearPanelTarget() {
     panelTarget = null;
     setActionsEnabled(false);
   }
 
   function installPanelTarget(encodedPath) {
-    if (!isValidEncodedPath(encodedPath)) {
+    if (!isValidEncodedPath(encodedPath) || encodedPath === '') {
       clearPanelTarget();
       return;
     }
     panelTarget = encodedPath;
     setActionsEnabled(true);
   }
+
   // 预览标题纯文本 (错误/清空): textContent, 绝不注入 HTML.
   function setPanelTitleText(text) {
     const el = panelTitle();
@@ -370,7 +1204,6 @@
     }
   }
 
-
   function openPanel() {
     const el = panel();
     if (!el) return;
@@ -384,13 +1217,35 @@
     if (el) el.hidden = true;
     document.body.classList.remove('cb-panel-open');
     clearPanelTarget();
+    panelCommittedKey = null;
     setPanelTitleText('');
-    if (panelContent()) panelContent().textContent = '';
+    const host = panelContent();
+    if (host) {
+      host.textContent = '';
+      host.removeAttribute('data-cb-content-state');
+    }
+    if (state.opened !== null || state.openedKind !== null) {
+      state.opened = null;
+      state.openedKind = null;
+      replaceCurrentEntry();
+    }
   }
 
   function showPanelError(message) {
-    setPanelTitleText(message);
-    if (panelContent()) panelContent().textContent = '';
+    const host = panelContent();
+    if (!host) return;
+    const priorError = host.querySelector('[data-cb-preview-error]');
+    if (priorError) priorError.remove();
+    const error = document.createElement('p');
+    error.setAttribute('data-cb-preview-error', '');
+    error.setAttribute('role', 'alert');
+    error.textContent = message;
+    host.append(error);
+    // 导航失败不破坏先前安装的正文与 identity; 没有旧目标时仍禁用 actions.
+    if (state.opened !== null && isValidEncodedPath(state.opened)) {
+      installPanelTarget(state.opened);
+      setDownloadEnabled(state.openedKind !== 'directory');
+    }
   }
 
   function flashNativeFeedback(text) {
@@ -403,56 +1258,117 @@
     }, 1600);
   }
 
-  // fragment wrapper 恒为响应的根元素; 面板 identity 只从根 wrapper 自身的
-  // data 读取, 绝不从后代元素 (迷你列表条目等) 反推.
+  // fragment wrapper 恒为响应的根元素; 面板/内容区 identity 只从根 wrapper 自身
+  // 的 data 读取, 绝不从后代元素 (迷你列表条目等) 反推.
   function findFragmentWrapper(host) {
     return host.firstElementChild;
   }
 
+  function wrapperSurface(wrapper) {
+    const value = wrapper && wrapper.dataset ? wrapper.dataset.cbSurface : null;
+    if (value === 'directory' || value === 'search' || value === 'reading') return value;
+    return null;
+  }
+
+  // 非成功内容 (占位/忙/错误 body) 绝不是可跳过重取的成功安装: 标记可能落在
+  // wrapper 自身 (fragment 错误根) 或 wrapper 内的 no_preview 根 (文件包装).
+  function wrapperIsPlaceholder(wrapper) {
+    if (!wrapper || !wrapper.matches) return false;
+    return (
+      wrapper.matches('[data-cb-content-state="placeholder"]') ||
+      wrapper.querySelector('[data-cb-content-state="placeholder"]') !== null
+    );
+  }
+
+  // 安装 side metadata: 内容状态镜像到宿主 (成功内容移除 placeholder 标记).
+  function mirrorContentState(host, wrapper) {
+    if (!host) return;
+    if (wrapperIsPlaceholder(wrapper)) {
+      host.setAttribute('data-cb-content-state', 'placeholder');
+    } else {
+      host.removeAttribute('data-cb-content-state');
+    }
+  }
+
   // 预览: 先清空旧 target/actions 再 fetch; 要求 ok + text/html 才 innerHTML,
   // 错误用 textContent; target 只从返回 wrapper 的合法 encoded data 安装。
-  // P2#5: generation 守卫 — 新请求/面板关闭使在途请求过期, 旧响应/错误
-  // 不得 overwrite/install 任何状态。
-  function openPreview(encodedPath, kind) {
-    if (!isValidEncodedPath(encodedPath)) return; // fail-closed
-    // PDF: 面板承载不了原生查看器 — 新 tab 打开并返回, 不打开面板/不 fetch
+  // generation 守卫: 新请求/面板关闭使在途请求过期, 旧响应/错误不得安装状态。
+  function openPreview(encodedPath, kind, opts) {
+    if (!isValidEncodedPath(encodedPath) || encodedPath === '') return; // fail-closed
+    const silent = !!(opts && opts.silent);
+    // PDF: 面板承载不了原生查看器 — 用户操作时新 tab 打开并返回; 恢复不触发.
     if (isPdfFile(encodedPath, kind)) {
-      window.open(actionUrl(encodedPath, 'full').href, '_blank', 'noopener');
+      if (!silent) {
+        window.open(browseActionUrl(encodedPath, 'full').href, '_blank', 'noopener');
+      }
       return;
     }
+    // 预览内容键: 目录预览随显示规则失效, 文档正文与规则无关 (绝不重转换).
+    const requestedKind = kind === 'file' ? 'reading' : 'directory';
+    const key = contentKey(requestedKind, encodedPath, null);
+    const sort = state.rules.sort;
+    const hidden = state.rules.hidden ? '1' : '0';
     const gen = previewGuard.begin(); // 新请求作废所有在途请求
     clearPanelTarget();
     openPanel();
-    const url = actionUrl(encodedPath, 'fragment');
+    const priorError = panelContent() && panelContent().querySelector('[data-cb-preview-error]');
+    if (priorError) priorError.remove();
+    if (panelCommittedKey === key && !(opts && opts.force)) {
+      // 内容未变 (同 identity 同规则): 不重取, 仅恢复 target/打开条目.
+      installPanelTarget(encodedPath);
+      state.opened = encodedPath;
+      replaceCurrentEntry();
+      return;
+    }
+    const url = browseActionUrl(encodedPath, 'fragment');
     fetch(url, { headers: { Accept: 'text/html' } })
       .then(function (res) {
-        if (!previewGuard.isCurrent(gen)) return; // 过期响应: 丢弃
+        if (!previewGuard.isCurrent(gen)) return null; // 过期响应: 丢弃
         return readFragmentResponse(res);
       })
       .then(function (html) {
-        if (!previewGuard.isCurrent(gen)) return; // 过期响应: 丢弃
+        if (html === null || !previewGuard.isCurrent(gen)) return; // 过期响应: 丢弃
         const host = panelContent();
-        host.textContent = '';
-        host.innerHTML = html;
-        const wrapper = findFragmentWrapper(host);
-        if (!wrapper) {
-          clearPanelTarget();
-          setPanelTitleText('');
-          return;
-        }
-        installPanelTarget(wrapper.dataset.nativePathEncoded);
-        // 目录 fragment: 下载对目录无意义 (服务端忽略目录 download 模式),
-        // 单独禁用; 其余 target 相关 action 保持可用.
+        if (!host) return;
+        const parsed = document.createElement('div');
+        parsed.innerHTML = html;
+        const wrapper = findFragmentWrapper(parsed);
+        if (!wrapper) throw new Error('无效的预览响应');
+        const identity =
+          typeof wrapper.dataset.nativePathEncoded === 'string' &&
+          isValidEncodedPath(wrapper.dataset.nativePathEncoded) &&
+          wrapper.dataset.nativePathEncoded !== ''
+            ? wrapper.dataset.nativePathEncoded
+            : null;
+        const surface = wrapperSurface(wrapper);
+        if (
+          identity !== encodedPath || surface !== requestedKind ||
+          (surface === 'directory' &&
+            (wrapper.dataset.cbSort !== sort || wrapper.dataset.cbHidden !== hidden))
+        ) throw new Error('预览响应与请求上下文不一致');
+        host.replaceChildren(wrapper);
+        installPanelTarget(identity);
+        mirrorContentState(host, wrapper);
+        // 打开条目 identity: 只接受与服务端 wrapper 一致的合法目标.
+        state.opened = identity;
+        state.openedKind = surface === 'directory' ? 'directory' : surface === 'reading' ? 'reading' : null;
+        replaceCurrentEntry();
         if (panelTarget !== null) {
-          setDownloadEnabled(!wrapper.classList.contains('cb-dir-fragment'));
+          setDownloadEnabled(surface !== 'directory');
         }
         installPanelTitleMarkup(wrapper.querySelector('.cb-frag-title'));
         renderMermaidIn(host); // 预览面板 fragment 内的 mermaid 容器
+        // 只有一致且非占位内容才记为可跳过重取的成功安装.
+        if (!wrapperIsPlaceholder(wrapper)) {
+          panelCommittedKey = key;
+        } else {
+          panelCommittedKey = null;
+        }
       })
       .catch(function (err) {
         if (!previewGuard.isCurrent(gen)) return; // 过期错误: 丢弃
         clearPanelTarget();
-        showPanelError('无法预览：' + err.message);
+        showPanelError('无法预览：' + (err && err.message ? err.message : String(err)));
       });
   }
 
@@ -482,11 +1398,10 @@
       });
   }
 
-
   function handleAction(event, btn) {
     const action = btn.getAttribute('data-cb-action');
-    // 树模式无 native-open (Q17): native action 一律 no-op
-    if (action === 'native' && treeMode) return;
+    // 树视图无 native-open (Q17 能力边界): native action 一律 no-op
+    if (action === 'native' && state.view === 'tree') return;
     if (action === 'close') {
       event.preventDefault();
       closePanel();
@@ -501,105 +1416,16 @@
     if (target === null) return; // 非 actionable: no-op
     event.preventDefault();
     if (action === 'preview') {
-      openPreview(target, entry ? entry.dataset.kind : null);
+      openPreview(target, entry ? entryKindOf(entry) : null);
     } else if (action === 'full') {
-      location.href = actionUrl(target, 'full').href;
+      location.href = browseActionUrl(target, 'full').href;
     } else if (action === 'new') {
-      window.open(actionUrl(target, 'full').href, '_blank', 'noopener');
+      window.open(browseActionUrl(target, 'full').href, '_blank', 'noopener');
     } else if (action === 'download') {
-      location.href = actionUrl(target, 'download').href;
+      location.href = browseActionUrl(target, 'download').href;
     } else if (action === 'native') {
       openNative(target);
     }
-  }
-
-  function onDocumentClick(event) {
-    const actionBtn = event.target.closest(ACTION_SELECTOR);
-    if (actionBtn) {
-      handleAction(event, actionBtn);
-      return;
-    }
-    // 树节点: 单击打开 — 目录展开/收起, 文件 SPA 导航; 双击连击 (detail > 1)
-    // 不产生第二次动作 (第二次 click 直接返回; dblclick 分支同样阻断)
-    const treeRow = event.target.closest('.cb-tree-row');
-    if (treeRow) {
-      if (event.detail > 1) return; // 双击连击: 单击已处理, 不产生第二次动作
-      const li = treeRow.closest('li.cb-tree-node');
-      if (!li) return;
-      focusTreeRootUl(); // 先落焦点: active-descendant 公告 + 键盘可立即接管
-      selectTreeNode(li);
-      if (isDirNode(li)) toggleTreeNode(li); else navigateTreeNode(li);
-      closeTreeDrawer(); return; // 窄屏抽屉: 选择条目后收起 (宽屏 no-op)
-    }
-    // 面板/内容区内目录迷你列表: 拦截可操作 anchor — 树模式 SPA 下钻,
-    // 目录模式保持面板内下钻
-    const miniLink = event.target.closest(
-      '.cb-dir-mini a[data-native-path-encoded]'
-    );
-    if (miniLink) {
-      event.preventDefault();
-      const target = encodedPathOf(miniLink);
-      const li = miniLink.closest('li');
-      const kind = li ? li.dataset.kind : null;
-      // PDF 文件: 新 tab 原生查看器 — 目录模式与树模式一致, 不 SPA / 不面板
-      if (isPdfFile(target, kind)) {
-        window.open(actionUrl(target, 'full').href, '_blank', 'noopener');
-        return;
-      }
-      if (treeMode) {
-        if (target !== null) paneNavigate(target);
-      } else {
-        openPreview(target, kind);
-      }
-      return;
-    }
-    // 非链接点击: 选中行 (文件名 anchor 保持原生行为)
-    const entry = event.target.closest(ENTRY_SELECTOR);
-    if (entry && !event.target.closest('a')) {
-      selectEntry(entry);
-    }
-  }
-
-  function onDocumentDblclick(event) {
-    // P2#3: 双击落在任何 action/button/control/link 上绝不触发行 Full 导航
-    // (链接/按钮/表单控件走各自原生行为; action 按钮双击仍只触发两次单击动作)。
-    if (
-      event.target.closest(
-        'a, button, input, select, textarea, [data-cb-action]'
-      )
-    ) {
-      return;
-    }
-    // 树节点双击: 单击已打开 (目录展开/文件导航), 双击必须无第二次动作 —
-    // 阻断默认并返回, 不再整页/SPA 导航
-    if (event.target.closest('.cb-tree-row')) {
-      event.preventDefault();
-      return;
-    }
-    const entry = event.target.closest(ENTRY_SELECTOR);
-    if (entry) {
-      const target = encodedPathOf(entry);
-      if (target !== null) location.href = actionUrl(target, 'full').href;
-    }
-  }
-
-  function isEditableTarget(el) {
-    if (!el) return false;
-    const tag = el.tagName;
-    return (
-      tag === 'INPUT' ||
-      tag === 'TEXTAREA' ||
-      tag === 'SELECT' ||
-      el.isContentEditable
-    );
-  }
-
-  // 选中条目的 data-kind (dir|file): PDF 判定需要 kind + 后缀双条件 —
-  // 目录名 `folder.pdf` 必须按目录处理.
-  function selectedEntryKind() {
-    const entries = visibleEntries();
-    if (selectedIndex < 0 || selectedIndex >= entries.length) return null;
-    return entries[selectedIndex].dataset.kind || null;
   }
 
   function togglePreview() {
@@ -613,164 +1439,49 @@
     openPreview(target, selectedEntryKind());
   }
 
-  function onKeydown(event) {
-    if (event.ctrlKey || event.metaKey || event.altKey) return;
-    if (treeMode) {
-      onTreeKeydown(event);
-      return;
-    }
-    // 面板打开时关闭; handled 时在返回前恰好一次 preventDefault, 未处理不取消;
-    // 其余快捷键在可编辑元素内仍被忽略。
-    if (event.key === 'Escape') {
-      const input = searchInput();
-      const action = escapeAction(
-        document.activeElement === input,
-        panel() ? !panel().hidden : false
-      );
-      if (action === null) return; // 未处理: 不取消默认行为
-      event.preventDefault(); // handled: 恰好一次, 先于任何动作
-      if (action === 'blur-search') {
-        input.blur();
-      } else if (action === 'close-panel') {
-        closePanel();
-      }
-      return;
-    }
-    if (isEditableTarget(event.target)) return;
-    // Enter 在聚焦的链接/按钮上必须走原生激活 (文件名 anchor、工具栏按钮的
-    // 键盘可达性契约), 全局 Enter 只服务于无交互焦点时的选中行打开.
-    if (event.key === 'Enter' && event.target.closest('a, button')) return;
-    const key = event.key;
-    switch (key) {
-      case 'j':
-      case 'ArrowDown':
-        moveSelection(1);
-        event.preventDefault();
-        break;
-      case 'k':
-      case 'ArrowUp':
-        moveSelection(-1);
-        event.preventDefault();
-        break;
-      case 'Enter': {
-        const target = selectedTarget();
-        if (target !== null) location.href = actionUrl(target, 'full').href;
-        event.preventDefault();
-        break;
-      }
-      case 'o': {
-        const target = selectedTarget();
-        if (target !== null) {
-          window.open(actionUrl(target, 'full').href, '_blank', 'noopener');
-        }
-        event.preventDefault();
-        break;
-      }
-      case 'p':
-        togglePreview();
-        event.preventDefault();
-        break;
-      case 'v':
-        view = view === 'grid' ? 'list' : 'grid';
-        applyView();
-        event.preventDefault();
-        break;
-      case 'Backspace': {
-        const parent = $('[data-cb-parent]');
-        if (parent) location.href = parent.getAttribute('href');
-        event.preventDefault();
-        break;
-      }
-      case '/': {
-        const input = searchInput();
-        if (input) input.focus();
-        event.preventDefault();
-        break;
-      }
-      default:
-        break;
-    }
-  }
+  /* ---------- 树壳 (tree 视图; 懒加载 + 显示规则版本化) ---------- */
 
-  /* ---------- 树模式 (编辑器式浏览外壳) ---------- */
-
-  // 模式/树状态持久化键. 默认目录模式 (无键即目录模式).
-  const MODE_KEY = 'cb-mode';
   const TREE_EXPANDED_KEY = 'cb-tree-expanded';
   const TREE_SELECTED_KEY = 'cb-tree-selected';
   const TREE_WIDTH_KEY = 'cb-tree-width'; // 树宽持久化键 (px)
+  const TREE_COLLAPSED_KEY = 'cb-tree-collapsed';
   const TREE_DEFAULT_WIDTH = 238;
   const TREE_MIN_WIDTH = 160;
   const TREE_MAX_WIDTH = 480;
   const TREE_DRAWER_MQL = '(width < 64rem)'; // 窄屏抽屉断点 (与 CSS 媒体查询同源)
 
-  let treeMode = false;
-  let treeNav = null; // nav.cb-tree 外壳
+  let treeShell = null; // nav.cb-tree 外壳
   let treeRootUl = null; // 根 <ul>
-  // 已加载子项缓存: encoded dir path (无前导斜杠) -> 子节点 <li> 数组
-  const treeCache = new Map();
-  // 在途目录加载去重: path -> 在途 Promise. 同一目录只允许一个在途请求
-  // (重复激活返回同一 Promise, 绝不二次 fetch); 条目只由 owner Promise 的
-  // finally 清理, 退出树模式整体清空.
-  const treePendingLoads = new Map();
-  // 目录展开意图: path -> { expanded, version, explicit } 记录. 按发布时序
-  // (全局单调 treeExpansionIntentVersion) 版本化 — 最新记录即终态权威: 更新
-  // 的导航 (explicit=false) 覆盖更早的显式折叠, 更晚的显式点击覆盖导航.
-  // 安装方 (installTreeChildren) 在落地终态后按记录身份消费; 失败响应 (无
-  // 缓存) 兜底只删本请求适用记录; 叶子化/退出壳整体清除.
-  const treeExpansionIntents = new Map();
-  // 全局单调版本: 每次发布意图递增 — 跨路径共享时序; 记录比较只用身份/版本
-  // (跨壳不清零: 记录已随壳清空, 身份比较天然隔离).
-  let treeExpansionIntentVersion = 0;
-  let treeSelectedEl = null;
-  // 稳定节点 id 计数器: 仅保证当前壳内唯一/稳定 (ARIA 活动后代公告锚点);
-  // 每次建壳复位 (退出树模式后旧节点随壳销毁, id 可安全复用).
-  let treeItemSeq = 0;
-  // 树壳生命周期 generation: 退出树模式递增使全部在途响应失效 (镜像 previewGuard)
-  let treeGen = 0;
-  // 本壳树请求 (root/子项) 的 AbortController: 进入时创建 (先于 root/子项
-  // 请求), 退出时 abort 并置空 — 在途请求以 AbortError 收尾, 失败处理器静默
-  // 吞掉 (无可见陈旧 alert、无未处理拒绝).
-  let treeAbort = null;
-  // 窄屏抽屉 (<64rem, off-canvas transform + 遮罩): 随树壳创建/销毁.
-  // 开合态挂 body.cb-drawer-open (宽屏无对应 CSS, 恒 no-op).
+  let treeResizer = null; // 列 2 调整器元素 (随树壳创建)
+  let treeCollapseBtn = null; // 折叠按钮 (树壳顶栏子控件)
   let treeScrim = null; // 遮罩: 点击收起抽屉
   let treeOpenBtn = null; // 唤起按钮 (仅窄屏可见)
-  let drawerMql = null; // 窄屏 media query (跨回宽屏时清理打开态)
+  let treeRestoreBtn = null; // 左缘恢复按钮 (仅折叠生效时可见)
+  let treeAbortControllers = new Set(); // 本壳全部在途树请求 (退出/版本变化时中止)
+  let treeGen = 0; // 树壳生命周期 generation: 退出/重建递增使全部在途响应失效
+  let treeSelectedEl = null;
+  let treeItemSeq = 0; // 稳定节点 id 计数器 (壳内唯一; 每次建壳复位)
+  let drawerMql = null;
   let drawerMqlHandler = null;
-  // 宽屏视口 resize 重钳制: 视口收窄 (仍 ≥64rem) 时 50vw 上限下降, 生效宽
-  // 需跟随重钳制; 命名处理器便于 enter/exit 对称安装卸载 (绝不写 localStorage).
   let treeViewportResizeHandler = null;
-  // 树宽 (宽屏列 1): resizer 常驻调整; 窄屏抽屉内 resizer 隐藏, 宽度值不生效.
-  // treePreferredWidth 是持久化偏好: 仅硬边界 [160,480] 截断, 绝不被窄屏 50vw
-  // 上限改写; treeWidth 是当前生效宽 (宽屏 = 偏好按视口约束, 窄屏抽屉忽略).
-  let treePreferredWidth = TREE_DEFAULT_WIDTH;
-  let treeWidth = TREE_DEFAULT_WIDTH;
-  let treeResizer = null; // 列 2 调整器元素 (随树壳创建/销毁)
-  // 在途拖拽手势的 pointerId (单 owner): 无手势时为 null. move/end/收尾只认
-  // 该 id; 捕获失败或退出树模式时干净复位.
-  let treeResizePointerId = null;
-  // 手动折叠 (宽屏左树收起): 偏好与生效态分离. treeCollapsePreferred 是持久化
-  // 偏好 (仅 '1' 折叠); treeCollapsed 是当前生效态 — 窄屏抽屉恒展开, 宽屏 =
-  // 偏好 (跨断点由 mql handler 重放). 折叠期间树/调整器隐藏, 左缘恢复按钮
-  // (treeRestoreBtn) 悬浮常驻.
-  const TREE_COLLAPSED_KEY = 'cb-tree-collapsed';
+  let treeCollapseMql = null;
+  let treeCollapseMqlHandler = null;
+  let treeFocusKind = null; // 跨断点焦点追踪 (见 applyTreeCollapsed)
+  let treePreferredWidth = TREE_DEFAULT_WIDTH; // 持久化偏好: 仅硬边界截断
+  let treeWidth = TREE_DEFAULT_WIDTH; // 当前生效宽
+  let treeResizePointerId = null; // 在途拖拽手势 pointerId (单 owner)
   let treeCollapsePreferred = false;
   let treeCollapsed = false;
-  let treeRestoreBtn = null; // 左缘恢复按钮 (仅折叠生效时可见)
-  let treeCollapseMql = null; // 断点感知: 窄屏强制展开, 宽屏重放偏好
-  let treeCollapseMqlHandler = null;
-  let treeCollapseBtn = null; // 折叠按钮 (树壳顶栏子控件; 展开态焦点落点, 随壳创建/销毁)
-  // 目录模式左缘工具栏行与模式切换按钮: 跨模式复用 (按钮在树顶栏与目录工具
-  // 栏行之间移动, 随目录工具栏行创建/销毁; 树模式隐藏该行, 退出恢复).
-  let modeToolbar = null;
-  let modeToggleBtn = null;
-  // 树壳焦点追踪: 跨断点时浏览器在 mql 处理器运行前就按新视口 CSS 把目标
-  // 控件 display:none 并静默丢弃焦点 (无 focusout 事件), 处理器启动时
-  // activeElement 已回落 body. focusin 捕获阶段记录最近一次落在树壳控件上的
-  // 焦点种类, 落到非树壳控件 (键盘移出/指针点击内容区) 即清空; applyTreeCollapsed
-  // 仅在 activeElement 已丢失焦点时用它补判跨断点落点, 不会因过期记录抢焦点.
-  let treeFocusKind = null;
+
+  // 显示规则版本化的分支缓存/意图: 只有当前版本的结果可安装; 版本变化整体失效.
+  const treeBranchCache = new Map(); // path -> { version, entries }
+  const treeExpandIntent = new Map(); // path -> boolean (最新显式展开意图, 安装时消费)
+  const treePending = new Map(); // path -> { version, promise, controller }
+  // 树内容链 (展开/恢复) 代次: 新的导航或规则变化使旧链只共享缓存, 不提交 DOM.
+  const treeContentGuard = createGenerationGuard();
+
+  let treeExpandedPaths = loadJsonArray(TREE_EXPANDED_KEY, []);
+
   function loadJsonArray(key, fallback) {
     try {
       const value = JSON.parse(localStorage.getItem(key) || 'null');
@@ -788,19 +1499,27 @@
     }
   }
 
-  let treeExpandedPaths = loadJsonArray(TREE_EXPANDED_KEY, []);
-
-  // 搜索页 (page_shell 带 data-cb-parent) 不挂树壳、无切换按钮.
-  function isSearchPage() {
-    return !!document.querySelector('main[data-cb-parent]');
+  function treeUrl(path) {
+    const base = path === '' ? '/__/tree' : '/__/tree/' + path;
+    return (
+      base + '?sort=' + state.rules.sort + '&hidden=' + (state.rules.hidden ? '1' : '0')
+    );
   }
 
-  // 可挂树壳的完整页: 目录页 (.cb-browser-page 且非搜索页) 与文档/代码/Office 页.
-  function isTreeCapablePage() {
-    return (
-      !!document.querySelector('.cb-doc-page') ||
-      (!!document.querySelector('.cb-browser-page') && !isSearchPage())
-    );
+  // 拉取目录子项 JSON: path 为空串时命中显式根路由 /__/tree (绝不拼尾斜杠);
+  // 请求带有效显示规则 (树不再忽略 sort/hidden).
+  function fetchTreeEntries(path, signal) {
+    return fetch(treeUrl(path), {
+      headers: { Accept: 'application/json' },
+      signal: signal,
+    })
+      .then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function (data) {
+        return data && Array.isArray(data.entries) ? data.entries : [];
+      });
   }
 
   function treePathFromHref(href) {
@@ -810,31 +1529,6 @@
     return isValidEncodedPath(rel) ? rel : null;
   }
 
-  function currentPathFromLocation() {
-    const pathname = location.pathname;
-    if (pathname === '/') return '';
-    // 目录深链可能带尾斜杠 (/subdir/): 剥掉后校验 (canonical 形式无尾斜杠)
-    const rel = pathname.slice(1).replace(/\/+$/, '');
-    return isValidEncodedPath(rel) ? rel : null;
-  }
-
-  function treeSearchForm(inputId) {
-    const form = document.createElement('form');
-    form.className = 'cb-tree-search';
-    form.action = '/__/search';
-    form.method = 'get';
-    form.setAttribute('role', 'search');
-    const input = document.createElement('input');
-    input.type = 'search';
-    input.name = 'q';
-    input.id = inputId || 'cb-tree-search-q';
-    input.placeholder = '搜索文件';
-    input.setAttribute('aria-label', '搜索文件');
-    input.autocomplete = 'off';
-    form.append(input);
-    return form;
-  }
-
   // JSON -> DOM 节点: 文件名只经 createElement + textContent (外层 bdi),
   // 绝不插值进 innerHTML/HTML 模板. href 过合法 encodedPath 校验后进 dataset.
   function buildTreeNode(entry) {
@@ -842,7 +1536,7 @@
     li.className = 'cb-tree-node';
     const name = typeof entry.name === 'string' ? entry.name : '';
     const isDir = entry.dir === true;
-    li.id = 'cb-tree-item-' + (++treeItemSeq); // 稳定 id: ARIA 活动后代公告锚点
+    li.id = 'cb-tree-item-' + ++treeItemSeq; // 稳定 id: ARIA 活动后代公告锚点
     li.setAttribute('role', 'treeitem');
     li.setAttribute('aria-selected', 'false');
     const href = typeof entry.href === 'string' ? entry.href : null;
@@ -912,7 +1606,7 @@
 
   function nodeHref(li) {
     const path = encodedPathOf(li);
-    return path === null ? null : actionUrl(path, 'full');
+    return path === null || path === '' ? null : browseActionUrl(path, 'full');
   }
 
   function setTwist(li, expanded) {
@@ -920,347 +1614,352 @@
     if (twist) twist.textContent = expanded ? '▾' : '▸';
   }
 
-  function setTreeNodeExpanded(li, expanded) {
+  // 分支状态标记 (loading/error/empty; 缺席 = 已加载).
+  function setBranchState(li, status) {
+    if (status === null || status === undefined) {
+      li.removeAttribute('data-cb-branch-state');
+      li.removeAttribute('aria-busy');
+      return;
+    }
+    li.setAttribute('data-cb-branch-state', status);
+    if (status === 'loading') li.setAttribute('aria-busy', 'true');
+    else li.removeAttribute('aria-busy');
+  }
+
+  function isBranchInstalled(li) {
+    const branchState = li.getAttribute('data-cb-branch-state');
+    if (branchState === 'empty' || branchState === 'error') return true;
+    if (branchState === 'loading') return false;
+    const ul = li.querySelector(':scope > ul.cb-tree-children');
+    return !!(ul && ul.childElementCount > 0);
+  }
+
+  // 展开/收起 (persist: 只在用户动作与导航默认展开时写偏好; 版本重取不写).
+  function setTreeNodeExpanded(li, expanded, persist) {
     const ul = li.querySelector(':scope > ul.cb-tree-children');
     if (ul) ul.hidden = !expanded;
-    if (isExpandableDir(li)) setTwist(li, expanded);
-    if (isExpandableDir(li)) li.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    if (isExpandableDir(li)) {
+      setTwist(li, expanded);
+      li.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    }
     const path = encodedPathOf(li);
-    if (path === null) return;
+    if (path === null || path === '') return;
     const idx = treeExpandedPaths.indexOf(path);
     if (expanded && idx < 0) {
       treeExpandedPaths.push(path);
     } else if (!expanded && idx >= 0) {
       treeExpandedPaths.splice(idx, 1);
-    }
-    saveJsonArray(TREE_EXPANDED_KEY, treeExpandedPaths);
-  }
-
-  // 拉取目录子项 JSON: path 为空串时命中显式根路由 /__/tree (绝不拼尾斜杠).
-  // signal: 本壳 AbortController 的取消信号 — 壳退出即中止在途树请求.
-  function fetchTreeEntries(path, signal) {
-    const url = path === '' ? '/__/tree' : '/__/tree/' + path;
-    const opts = { headers: { Accept: 'application/json' } };
-    if (signal) opts.signal = signal;
-    return fetch(url, opts)
-      .then(function (res) {
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        return res.json();
-      })
-      .then(function (data) {
-        return data && Array.isArray(data.entries) ? data.entries : [];
-      });
-  }
-
-  // 展开意图纯函数 (DOM 无关 seam): 显式用户激活的下一条意图. prior 为最新
-  // 已发布记录或 null. 最新记录为显式用户意图 (explicit=true) 时翻转其
-  // expanded (第二次激活表达收起); 其余 (无记录 / nav 默认 explicit=false)
-  // 按可见 DOM 推导 (!expanded — 首击可见折叠目录即表达展开, nav 的隐藏意图
-  // 绝不参与). 返回 { expanded, explicit: true } — 调用方经
-  // publishTreeExpansionIntent 发布 (版本化: 更晚的显式动作自然覆盖更早导航).
-  function treeNextExplicitIntent(prior, expanded) {
-    if (prior && prior.explicit) return { expanded: !prior.expanded, explicit: true };
-    return { expanded: expanded ? false : true, explicit: true };
-  }
-
-  // 发布展开意图 (唯一写入点): 递增全局单调版本并存储记录, 返回记录. 导航/
-  // 默认发布 (explicit=false) 与显式用户发布 (explicit=true) 共用 — 时序即
-  // 优先级: 更新的记录永远覆盖更旧的 (latest wins).
-  function publishTreeExpansionIntent(path, expanded, explicit) {
-    const record = {
-      expanded: expanded,
-      version: ++treeExpansionIntentVersion,
-      explicit: explicit,
-    };
-    treeExpansionIntents.set(path, record);
-    return record;
-  }
-
-  // 树加载提交决策纯函数 (DOM 无关 seam): 提交 DOM/展开/持久化前必须通过 —
-  // 壳当前 (shellCurrent) 恒必需; 带导航所有权 (navRequired, reveal/sync 链)
-  // 时还须导航当前 (navCurrent); 显式用户调用 (无导航所有权) 只要求壳当前.
-  // 缓存结果共享不受此约束 (陈旧导航可复用结果, 但不得提交 DOM).
-  function treeLoadMayCommit(shellCurrent, navRequired, navCurrent) {
-    if (!shellCurrent) return false;
-    return !navRequired || navCurrent;
-  }
-
-  // 空目录响应: li 转为终端叶子 — 无子项无展开语义, 未来 click/ArrowRight 经
-  // isExpandableDir 直接短路, 不再发起请求/翻转意图. 移除 group/展开属性与
-  // 持久化展开, 意图随叶子删除 (空目录不保留展开状态).
-  function convertTreeLeaf(li, path) {
-    const ul = li.querySelector(':scope > ul.cb-tree-children');
-    // 叶子化移除的子树内若含选中节点: 先清选中与 aria-activedescendant
-    if (ul && treeSelectedEl && ul.contains(treeSelectedEl)) {
-      clearTreeSelection();
-    }
-    li.dataset.treeExpandable = '0';
-    li.removeAttribute('aria-expanded');
-    const twist = li.querySelector(':scope > .cb-tree-row .cb-tree-twist');
-    if (twist) twist.textContent = '';
-    if (ul) ul.remove(); // 子 role=group 一并移除: 叶子不得携带 group 语义
-    const before = treeExpandedPaths.length;
-    treeExpandedPaths = treeExpandedPaths.filter(function (p) {
-      return p !== path;
-    });
-    if (treeExpandedPaths.length !== before) {
-      saveJsonArray(TREE_EXPANDED_KEY, treeExpandedPaths);
-    }
-    treeExpansionIntents.delete(path); // 叶子无展开语义: 意图记录一并清除
-  }
-
-  // 唯一子项替换点: 把缓存子项安装进 li (缓存命中与异步响应共用). 空缓存 →
-  // 叶子化; 替换前先清除被替换子树内的选中 (aria-activedescendant 同步移除);
-  // 终态跟随最新意图记录 (在途期间可翻转表达收起), 无记录默认展开, 绝不盲目
-  // 折叠; 落地终态后按记录身份消费 (DOM 即权威) — 续接方晚于 owner finally
-  // 注册, 意图必须由安装方清理, 否则 finally 抢先清除会让续接方读到已清除的
-  // 意图; 身份比对绝不误删更新导航/显式点击发布的更新记录.
-  function installTreeChildren(li, path) {
-    const cached = treeCache.get(path);
-    if (!cached) return;
-    if (cached.length === 0) {
-      convertTreeLeaf(li, path);
+    } else if (!persist) {
       return;
     }
-    const ul = childrenUlFor(li);
-    if (treeSelectedEl && ul.contains(treeSelectedEl)) {
+    if (persist) saveJsonArray(TREE_EXPANDED_KEY, treeExpandedPaths);
+  }
+
+  // 只在被替换的子树内清除选中 (节点自身不因安装其子项而失去选中/identity).
+  function clearSelectionWithin(li) {
+    if (treeSelectedEl && treeSelectedEl !== li && li.contains(treeSelectedEl)) {
       clearTreeSelection();
     }
-    ul.replaceChildren(...cached);
-    const record = treeExpansionIntents.get(path);
-    setTreeNodeExpanded(li, record ? record.expanded : true);
-    if (treeExpansionIntents.get(path) === record) {
-      treeExpansionIntents.delete(path); // 意图已消费: DOM 即权威, 不留残留
+  }
+
+  // 分支成功内容安装 (唯一 replaceChildren 点): 空结果只表示当前显示规则版本
+  // 没有可见孩子 — 不叶子化、不删除展开意图; 服务器明确不可展开的目录保持.
+  function installTreeBranch(li, path, entries, version, ownership) {
+    const decision = treeLoadDecision(
+      true,
+      version === optionsVersion,
+      !!(ownership && ownership.required),
+      !ownership || !ownership.required ? false : ownership.current()
+    );
+    if (decision !== 'install') return false;
+    clearSelectionWithin(li);
+    if (entries.length === 0) {
+      childrenUlFor(li).replaceChildren();
+      setBranchState(li, 'empty');
+    } else {
+      const ul = childrenUlFor(li);
+      ul.replaceChildren(...entries.map(buildTreeNode));
+      setBranchState(li, null);
     }
+    applyTreeBranchIntent(li, path);
+    return true;
   }
 
-  // 共享在途结果的续接方提交: 响应可能因发起方所有权陈旧只写缓存未动 DOM —
-  // 续接方所有权当前时补齐安装; 已安装 (子项非空) 则跳过, 保证同一 DOM/壳内
-  // 只有一个调用方执行 replaceChildren.
-  function ensureTreeChildrenInstalled(li, path) {
-    if (!treeCache.has(path)) return;
-    const ul = li.querySelector(':scope > ul.cb-tree-children');
-    if (ul && ul.childElementCount > 0) return;
-    installTreeChildren(li, path);
+  // 终态跟随最新显式展开意图 (在途期间用户可再次激活表达收起); 记录被消费后
+  // 删除, DOM 即权威.
+  function applyTreeBranchIntent(li, path) {
+    const desired = treeExpandIntent.get(path);
+    treeExpandIntent.delete(path);
+    setTreeNodeExpanded(li, desired === undefined ? true : desired, false);
   }
 
-  // 懒加载目录子项; 失败静默 (网络/服务端错误不留半展开态). 同一目录路径只
-  // 允许一个在途请求: 重复激活复用同一 Promise, 绝不二次 fetch; 每个调用方
-  // 都在共享 Promise 上挂自己的续接 — 发起方所有权陈旧时 (如陈旧导航) 响应
-  // 只写缓存不落 DOM, 本调用方所有权当前则补齐安装, 终态跟随最新意图记录
-  // (treeExpansionIntents, 无记录默认展开), 绝不盲目折叠; 响应落地后安装方
-  // (installTreeChildren) 在落地终态后按记录身份消费意图 (DOM 即权威), finally
-  // 在 owner 块内清除在途条目, 失败响应 (无缓存) 才由 finally 兜底删除本请求
-  // 适用记录 (旧壳 finally 不得删新壳条目; 续接方晚于 finally 注册, 意图不得
-  // 被 finally 抢先清除; 更新记录绝不被删除).
-  // owner 传调用方所有权: { navGen } (reveal/sync 导航链) 或 { enterGen }
-  // (进入链持久化展开) — 响应落地时导航/进入链已过期则只共享缓存结果, 不
-  // 提交 DOM/展开/持久化; owner 存在时每次调用都发布 nav/默认意图
-  // (expanded=true, explicit=false) — 更新的导航覆盖更早的显式折叠; 无 owner
-  // (显式用户调用) 可采纳共享在途结果, 意图已由调用方发布.
-  function loadTreeChildren(li, path, owner) {
-    const gen = treeGen;
-    const navGen = owner && typeof owner.navGen === 'number' ? owner.navGen : undefined;
-    const enterGen = owner && typeof owner.enterGen === 'number' ? owner.enterGen : undefined;
-    const navRequired = navGen !== undefined;
-    const navCurrent = navRequired && paneNavGuard.isCurrent(navGen);
-    // nav/进入链 (owner 存在) 每次请求/复用祖先展开都发布 nav/默认意图 — 时序
-    // 即优先级: 更新的导航 (explicit=false) 覆盖更早的显式折叠; 显式用户调用
-    // (无 owner) 已由 toggleTreeNode/ArrowRight 发布显式意图, 此处绝不覆盖.
-    if (owner) publishTreeExpansionIntent(path, true, false);
-    if (treeCache.has(path)) {
-      // 缓存结果可共享: 陈旧导航/进入链只取结果, 不提交 DOM/展开/持久化
-      if (!treeLoadMayCommit(enterGen === undefined || enterGen === treeGen, navRequired, navCurrent)) {
-        return Promise.resolve();
+  // 当前版本分支失败: 安全错误状态 — 不留旧集合、不视为空目录、不删展开意图.
+  function installTreeBranchError(li, path, version) {
+    if (version !== optionsVersion || !li.isConnected) return false;
+    clearSelectionWithin(li);
+    const ul = childrenUlFor(li);
+    ul.replaceChildren();
+    const item = document.createElement('li');
+    item.className = 'cb-tree-branch-state';
+    item.setAttribute('role', 'none');
+    const row = document.createElement('div');
+    row.className = 'cb-tree-branch-error';
+    row.setAttribute('role', 'alert');
+    row.textContent = '无法加载目录分支';
+    item.append(row);
+    ul.append(item);
+    setBranchState(li, 'error');
+    applyTreeBranchIntent(li, path);
+    return true;
+  }
+
+  function installTreeBranchLoading(li) {
+    clearSelectionWithin(li);
+    const ul = childrenUlFor(li);
+    ul.replaceChildren();
+    const item = document.createElement('li');
+    item.className = 'cb-tree-branch-state';
+    item.setAttribute('role', 'none');
+    const row = document.createElement('span');
+    row.className = 'cb-tree-branch-loading';
+    row.setAttribute('aria-hidden', 'true');
+    row.textContent = '加载中…';
+    item.append(row);
+    ul.append(item);
+    setBranchState(li, 'loading');
+    // 加载中即展开态 (可见加载行与 aria-expanded 一致); 终态由安装方按最新
+    // 意图落地.
+    setTreeNodeExpanded(li, true, false);
+  }
+
+
+  // 懒加载目录子项 (显示规则版本化):
+  // - 同版本在途请求复用同一 Promise (绝不二次 fetch); 旧版本在途一律丢弃且
+  //   在版本变化时整体中止;
+  // - 成功: 当前版本写入缓存并按所有权安装 (陈旧导航只共享缓存, 不提交 DOM);
+  // - 失败: 仅当前版本显示安全错误; 旧版本错误丢弃; 不加自动重试.
+  function loadTreeBranch(li, path, ownership) {
+    const shellGen = treeGen;
+    const version = optionsVersion;
+    const required = !!(ownership && ownership.required);
+    const currentFn = required ? ownership.current : null;
+    if (required && !currentFn()) return Promise.resolve(false);
+    // 当前导航先发布默认展开意图; 之后的显式点击仍可覆盖它.
+    if (required) treeExpandIntent.set(path, true);
+    const cached = treeBranchCache.get(path);
+    if (cached && cached.version === version) {
+      if (!isBranchInstalled(li)) {
+        return Promise.resolve(installTreeBranch(li, path, cached.entries, version, ownership));
       }
-      installTreeChildren(li, path);
-      return Promise.resolve();
+      applyTreeBranchIntent(li, path);
+      return Promise.resolve(true);
     }
-    const inFlight = treePendingLoads.get(path);
-    if (inFlight) {
-      // 每个调用方都挂自己的续接: 发起方所有权陈旧时 (如陈旧导航) 响应只写缓存
-      // 不落 DOM — 本调用方所有权当前则补齐安装, 终态跟随最新意图记录 (缓存
-      // 结果共享); 绝不 bare-return 发起方的 Promise. 所有权在响应落地时重查:
-      // 调用时的快照 (navCurrent/壳代) 会过期 — 跨导航/跨壳后不得提交.
-      return inFlight.then(function (entries) {
-        if (!treeLoadMayCommit(gen === treeGen, navRequired, paneNavGuard.isCurrent(navGen))) {
+    if (cached) treeBranchCache.delete(path);
+    let pending = treePending.get(path);
+    if (pending && pending.version !== version) {
+      treePending.delete(path);
+      try {
+        pending.controller.abort();
+      } catch (err) {
+        /* 已结束: 忽略 */
+      }
+      pending = null;
+    }
+    if (!pending) {
+      const controller = new AbortController();
+      treeAbortControllers.add(controller);
+      // 共享传输只缓存结果, 不持有发起导航的 DOM 提交权.
+      const request = { version: version, controller: controller, promise: null };
+      request.promise = fetchTreeEntries(path, controller.signal)
+        .then(function (entries) {
+          if (shellGen === treeGen && version === optionsVersion) {
+            treeBranchCache.set(path, { version: version, entries: entries });
+          }
           return entries;
-        }
-        ensureTreeChildrenInstalled(li, path); // 空缓存 → 叶子化; 已安装 → 跳过
-        return entries;
-      });
+        })
+        .finally(function () {
+          treeAbortControllers.delete(controller);
+          // 旧版本结束不得删除同路径的新请求身份.
+          if (treePending.get(path) === request) treePending.delete(path);
+        });
+      treePending.set(path, request);
+      pending = request;
+      if (li.isConnected) installTreeBranchLoading(li);
     }
-    // 请求起始记录 (版本 token): 失败兜底只删本请求适用记录, 绝不删除更新
-    // 导航/显式点击发布的更新记录.
-    const intentRecord = treeExpansionIntents.get(path);
-    const pending = fetchTreeEntries(path, treeAbort ? treeAbort.signal : undefined).then(
+    // 每个续接方独立检查所有权: 陈旧导航不能阻止最新点击消费同一结果/错误.
+    return pending.promise.then(
       function (entries) {
-        // 旧壳/旧进入链在途响应: 不得写缓存、不得触碰新壳 DOM
-        if (gen !== treeGen || (enterGen !== undefined && enterGen !== treeGen)) return;
-        const nodes = entries.map(buildTreeNode);
-        treeCache.set(path, nodes); // 结果可共享: 缓存先于所有权提交
-        // 导航所有权: 陈旧导航只共享缓存结果, 不提交 DOM/展开/持久化
-        if (navRequired && !paneNavGuard.isCurrent(navGen)) return;
-        installTreeChildren(li, path);
+        const decision = treeLoadDecision(
+          shellGen === treeGen,
+          version === optionsVersion,
+          required,
+          required ? currentFn() : false
+        );
+        if (decision !== 'install' || !li.isConnected) return false;
+        if (isBranchInstalled(li)) return true;
+        return installTreeBranch(li, path, entries, version, ownership);
       },
       function (err) {
-        /* 加载失败: 不标记展开, 下次点击重试; 壳退出中止 (AbortError) 静默 */
-        if (err && err.name === 'AbortError') return;
+        if (err && err.name === 'AbortError') return false;
+        const decision = treeLoadDecision(
+          shellGen === treeGen,
+          version === optionsVersion,
+          required,
+          required ? currentFn() : false
+        );
+        if (decision !== 'install' || !li.isConnected) return false;
+        if (!isBranchInstalled(li)) installTreeBranchError(li, path, version);
+        return false;
       }
     );
-    treePendingLoads.set(path, pending);
-    pending.finally(function () {
-      // 清理只由 owner Promise 执行: 先比对在途条目身份 (恒为本 Promise) —
-      // 旧壳/旧链的 finally 不得删除新壳注册的条目与意图. 成功响应已由安装方
-      // (installTreeChildren) 在落地终态后按记录身份消费; 此处兜底只清无消费
-      // 方的意图: 失败响应 (无缓存) 且当前记录仍是本请求起始记录 (身份相同)
-      // 才删除 — 绝不删除更新导航/显式点击发布的更新记录 (latest wins); 成功
-      // 落地但无安装方 (陈旧导航只写缓存, 有缓存) 不删 — 后续发布恒新版本,
-      // 陈旧 nav 记录不影响任何决策.
-      if (treePendingLoads.get(path) === pending) {
-        treePendingLoads.delete(path);
-        if (!treeCache.has(path) && treeExpansionIntents.get(path) === intentRecord) {
-          treeExpansionIntents.delete(path);
-        }
+  }
+
+  function abortTreeRequests() {
+    treeAbortControllers.forEach(function (controller) {
+      try {
+        controller.abort();
+      } catch (err) {
+        /* 已结束: 忽略 */
       }
     });
-    return pending;
+    treeAbortControllers = new Set();
+    treePending.clear();
+    treeExpandIntent.clear();
   }
 
-  function toggleTreeNode(li) {
-    if (!isExpandableDir(li)) return;
-    const ul = li.querySelector(':scope > ul.cb-tree-children');
-    const path = encodedPathOf(li);
-    if (path === null) return;
-    const expanded = !!ul && !ul.hidden;
-    const pending = treePendingLoads.has(path);
-    if (pending) {
-      // 在途: 经意图纯函数按最新记录推导 — prior 显式则翻转 (第二次激活表达
-      // 收起), prior 无/nav 默认按可见 DOM 推导 (!expanded, nav 的隐藏意图
-      // 绝不参与 — 首击可见折叠目录即表达展开); 发布显式意图 (版本化) 后恒经
-      // loadTreeChildren 挂 ownerless 续接 (在途去重: 绝不发起第二个请求) —
-      // 响应落地时由续接方安装, 终态跟随最新记录, 安装方消费意图后 DOM 成为
-      // 权威. 绝不裸 return: 无续接时陈旧 nav owner 的响应不会安装, 用户点击
-      // 将落空 (需要第三次点击).
-      const next = treeNextExplicitIntent(treeExpansionIntents.get(path), expanded);
-      publishTreeExpansionIntent(path, next.expanded, true);
-      return loadTreeChildren(li, path);
-    }
-    // 无在途: 意图无消费方 — 收起直接改 DOM (绝不写入残留, 陈旧意图会挡住
-    // 后续 reveal 的缓存命中展开); 展开经纯函数 + 发布显式意图后加载.
-    if (expanded) {
-      setTreeNodeExpanded(li, false);
-    } else {
-      // 用户激活即显式意图 (nav/reveal 默认不算): 经最新记录推导并发布 —
-      // 在途期间的后续激活按显式记录翻转 (第二次激活表达收起), 而不是把首击
-      // 当 nav 默认意图翻转.
-      const next = treeNextExplicitIntent(treeExpansionIntents.get(path), expanded);
-      publishTreeExpansionIntent(path, next.expanded, true);
-      loadTreeChildren(li, path);
-    }
+  // 显示规则变化: 版本递增后所有旧缓存/旧在途/旧错误一律失效, 重新取根并恢复
+  // 展开与选中 (不收起、不回根目录、不抢焦点); 内容区目录/搜索预览同步重取.
+  function refreshTreeForRules() {
+    if (!treeShell || !treeRootUl) return;
+    const expanded = expandedTreePaths(); // 版本变化前已展开的分支: 重排不收起
+    treeBranchCache.clear();
+    treeContentGuard.invalidate();
+    abortTreeRequests();
+    loadTreeRoot({ focusInTree: treeHasFocus(), expandedPaths: expanded });
   }
 
-  function selectTreeNode(li) {
-    if (treeSelectedEl) {
-      treeSelectedEl.classList.remove('cb-selected');
-      treeSelectedEl.setAttribute('aria-selected', 'false');
-    }
-    treeSelectedEl = li;
-    li.classList.add('cb-selected');
-    li.setAttribute('aria-selected', 'true');
-    if (treeRootUl) treeRootUl.setAttribute('aria-activedescendant', li.id);
-    const path = encodedPathOf(li);
-    try {
-      if (path === null) {
-        localStorage.removeItem(TREE_SELECTED_KEY);
-      } else {
-        localStorage.setItem(TREE_SELECTED_KEY, path);
-      }
-    } catch (err) {
-      /* 持久化失败忽略 */
-    }
+  function treeHasFocus() {
+    return !!(treeShell && document.activeElement && treeShell.contains(document.activeElement));
   }
 
-  function clearTreeSelection() {
-    if (treeSelectedEl) {
-      treeSelectedEl.classList.remove('cb-selected');
-      treeSelectedEl.setAttribute('aria-selected', 'false');
-    }
-    treeSelectedEl = null;
-    if (treeRootUl) treeRootUl.removeAttribute('aria-activedescendant');
+  function removeTreeError() {
+    if (!treeShell) return;
+    const prev = treeShell.querySelector('.cb-tree-error');
+    if (prev) prev.remove();
   }
 
-  // 树根聚焦 (preventScroll): 指针选中树行后焦点落树根 — active-descendant 由根
-  // 公告, 键盘导航立即接管; 老环境不支持 focus options 时退化为普通 focus.
-  function focusTreeRootUl() {
+  function showTreeError(message) {
+    if (!treeShell || !treeRootUl) return;
+    treeRootUl.replaceChildren();
+    treeRootUl.removeAttribute('aria-busy');
+    removeTreeError();
+    const errEl = document.createElement('div');
+    errEl.className = 'cb-tree-error';
+    errEl.setAttribute('role', 'alert');
+    errEl.textContent = message;
+    treeShell.append(errEl);
+  }
+
+  // 根加载: 旧集合立即让位 (新规则下不可操作), 成功安装后恢复展开/选中.
+  function loadTreeRoot(opts) {
     if (!treeRootUl) return;
-    try {
-      treeRootUl.focus({ preventScroll: true });
-    } catch (err) {
-      treeRootUl.focus();
-    }
+    const shellGen = treeGen;
+    const version = optionsVersion;
+    const focusInTree = !!(opts && opts.focusInTree);
+    removeTreeError();
+    treeRootUl.replaceChildren();
+    treeRootUl.setAttribute('aria-busy', 'true');
+    const controller = new AbortController();
+    treeAbortControllers.add(controller);
+    const settle = function () {
+      treeAbortControllers.delete(controller);
+      if (shellGen === treeGen && version === optionsVersion && treeRootUl) {
+        treeRootUl.removeAttribute('aria-busy');
+      }
+    };
+    fetchTreeEntries('', controller.signal).then(
+      function (entries) {
+        settle();
+        const decision = treeLoadDecision(shellGen === treeGen, version === optionsVersion, false, false);
+        if (decision !== 'install') return;
+        treeRootUl.replaceChildren(...entries.map(buildTreeNode));
+        restoreTreeContent({
+          focusInTree: focusInTree,
+          expandedPaths: opts && Array.isArray(opts.expandedPaths) ? opts.expandedPaths : [],
+          revealCurrent: !!(opts && opts.revealCurrent),
+        });
+      },
+      function (err) {
+        settle();
+        if (err && err.name === 'AbortError') return;
+        const decision = treeLoadDecision(shellGen === treeGen, version === optionsVersion, false, false);
+        if (decision !== 'install') return;
+        showTreeError('无法加载目录树');
+      }
+    );
   }
 
-  function visibleTreeNodes() {
-    const result = [];
-    function walk(ul) {
-      $$(':scope > li', ul).forEach(function (li) {
-        result.push(li);
-        const children = li.querySelector(':scope > ul.cb-tree-children');
-        if (children && !children.hidden) walk(children);
-      });
-    }
-    if (treeRootUl) walk(treeRootUl);
-    return result;
-  }
-
-  // 恢复持久化选中路径 (visible 节点内查找; 深层未展开则不可见, 跳过).
-  function restoreTreeSelection() {
-    let saved = null;
-    try {
-      saved = localStorage.getItem(TREE_SELECTED_KEY);
-    } catch (err) {
-      return;
-    }
-    if (saved === null || !isValidEncodedPath(saved)) return;
-    const node = visibleTreeNodes().find(function (li) {
-      return encodedPathOf(li) === saved;
-    });
-    if (node) selectTreeNode(node);
-  }
-
-  function moveTreeSelection(delta) {
-    const nodes = visibleTreeNodes();
-    if (nodes.length === 0) return;
-    const idx = nodes.indexOf(treeSelectedEl);
-    const base = idx < 0 ? (delta > 0 ? -1 : 0) : idx;
-    const next = Math.max(0, Math.min(base + delta, nodes.length - 1));
-    selectTreeNode(nodes[next]);
-    nodes[next].scrollIntoView({ block: 'nearest' });
-  }
-
-  function navigateTreeNode(li) {
-    const url = nodeHref(li);
-    if (url === null) return;
-    const path = encodedPathOf(li);
-    // PDF 文件: 不 SPA fetch / 不 history / 不换 pane — 新 tab 原生查看器
-    // (Chromium 内置查看器拒绝 document-sandbox 响应; 面板承载不了原生 viewer)
-    if (!isDirNode(li) && isPdfFile(path, 'file')) {
-      window.open(actionUrl(path, 'full').href, '_blank', 'noopener');
-      return;
-    }
-    // 树内导航: SPA (fragment 注入 + pushState); 无 pane (异常) 时兜底整页导航.
-    if (pane && path !== null) {
-      paneNavigate(path);
-      return;
-    }
-    location.href = url.href;
+  // 当前内容区路径 (search 无文件系统路径 → null).
+  function currentPathFromState() {
+    if (state.kind === 'search') return null;
+    return state.path;
   }
 
   // 在当前层查找 href 匹配的树节点 (pathname 比较, 不 decode).
   function findTreeNode(parentUl, href) {
     return $$(':scope > li', parentUl).find(function (li) {
-      return nodeHref(li) !== null && nodeHref(li).pathname === href;
+      const url = nodeHref(li);
+      return url !== null && url.pathname === href;
+    });
+  }
+
+  // 导航展开 encoded 前缀链; 恢复记录时只沿仍展开的祖先下钻, 不打开已折叠父项.
+  // 返回最深节点. 链上所有分支加载都携带同一所有权 — 陈旧链只共享缓存.
+  function walkTreePath(encodedPath, ownership, preserveCollapse) {
+    const segments = encodedPath === '' ? [] : encodedPath.split('/');
+    let parentUl = treeRootUl;
+    let lastNode = null;
+    let chain = Promise.resolve();
+    segments.forEach(function (seg, i) {
+      const href = '/' + segments.slice(0, i + 1).join('/');
+      chain = chain.then(function () {
+        if (!parentUl) return;
+        if (ownership.required && !ownership.current()) {
+          parentUl = null; // 陈旧链: 立即终止, 不再下钻
+          return;
+        }
+        const node = findTreeNode(parentUl, href);
+        if (!node) {
+          parentUl = null;
+          return;
+        }
+        lastNode = node;
+        if (isExpandableDir(node)) {
+          const path = encodedPathOf(node);
+          if (path === null || (preserveCollapse && !treeExpandedPaths.includes(path))) {
+            parentUl = null;
+            return;
+          }
+          return loadTreeBranch(node, path, ownership).then(function () {
+            if (ownership.required && !ownership.current()) {
+              parentUl = null;
+              return;
+            }
+            parentUl = node.querySelector(':scope > ul.cb-tree-children');
+          });
+        }
+        parentUl = null;
+      });
+    });
+    return chain.then(function () {
+      return lastNode;
+    });
+  }
+
+  function clearTreeCurrent() {
+    if (!treeRootUl) return;
+    $$('.cb-current', treeRootUl).forEach(function (el) {
+      el.classList.remove('cb-current');
     });
   }
 
@@ -1276,82 +1975,269 @@
         return;
       }
       lastNode = node;
+      node.classList.add('cb-current');
       const children = node.querySelector(':scope > ul.cb-tree-children');
       parentUl = isDirNode(node) && children && !children.hidden ? children : null;
     });
-    // 只有最深匹配节点标 current (祖先只展开, 不高亮)
-    if (lastNode) lastNode.classList.add('cb-current');
     return lastNode;
   }
 
-  // 展开并定位当前 URL 路径: 逐段匹配节点 (按 href, 不分目录/文件), 匹配即标
-  // current; 可展开目录继续下钻, 环/非 UTF-8 目录或文件处终止. 解析为最深节点.
-  function revealPath(segments, gen) {
-    const shellGen = treeGen; // 链级壳守卫: 退出/重进后旧链路立即终止
-    let parentUl = treeRootUl;
-    let lastNode = null;
-    let promise = Promise.resolve();
-    segments.forEach(function (seg, i) {
-      const href = '/' + segments.slice(0, i + 1).join('/');
-      promise = promise.then(function () {
-        // 旧壳链路: 立即终止 (退出/重进后不得触碰新壳 DOM)
-        if (shellGen !== treeGen) {
-          parentUl = null;
-          return;
-        }
-        // 陈旧导航的链路不得继续标记 (single-active-navigation)
-        if (gen !== undefined && !paneNavGuard.isCurrent(gen)) return;
-        if (!parentUl) return;
-        const node = findTreeNode(parentUl, href);
-        if (!node) {
-          parentUl = null;
-          return;
-        }
-        lastNode = node;
-        if (isExpandableDir(node)) {
-          const path = encodedPathOf(node);
-          if (path === null) {
-            parentUl = null;
-            return;
-          }
-          // 导航所有权随加载传递: 陈旧导航响应只共享缓存结果
-          return loadTreeChildren(node, path, { navGen: gen }).then(function () {
-            if (shellGen !== treeGen) {
-              parentUl = null;
-              return;
-            }
-            // 续接方所有权当前才补齐安装 (发起方陈旧时响应只写缓存)
-            if (gen !== undefined && !paneNavGuard.isCurrent(gen)) return;
-            ensureTreeChildrenInstalled(node, path);
-            parentUl = node.querySelector(':scope > ul.cb-tree-children');
-          });
-        }
-        parentUl = null;
+  function visibleTreeNodes() {
+    const result = [];
+    function walk(ul) {
+      $$(':scope > li', ul).forEach(function (li) {
+        result.push(li);
+        const children = li.querySelector(':scope > ul.cb-tree-children');
+        if (children && !children.hidden) walk(children);
       });
+    }
+    if (treeRootUl) walk(treeRootUl);
+    return result;
+  }
+
+  function selectTreeNode(li, opts) {
+    if (treeSelectedEl) {
+      treeSelectedEl.classList.remove('cb-selected');
+      treeSelectedEl.setAttribute('aria-selected', 'false');
+    }
+    treeSelectedEl = li;
+    li.classList.add('cb-selected');
+    li.setAttribute('aria-selected', 'true');
+    if (treeRootUl) treeRootUl.setAttribute('aria-activedescendant', li.id);
+    const path = encodedPathOf(li);
+    state.selected = path;
+    if (!(opts && opts.silent)) {
+      try {
+        if (path === null) {
+          localStorage.removeItem(TREE_SELECTED_KEY);
+        } else {
+          localStorage.setItem(TREE_SELECTED_KEY, path);
+        }
+      } catch (err) {
+        /* 持久化失败忽略 */
+      }
+      replaceCurrentEntry();
+    }
+  }
+
+  function clearTreeSelection(opts) {
+    if (treeSelectedEl) {
+      treeSelectedEl.classList.remove('cb-selected');
+      treeSelectedEl.setAttribute('aria-selected', 'false');
+    }
+    treeSelectedEl = null;
+    state.selected = null;
+    if (treeRootUl) treeRootUl.removeAttribute('aria-activedescendant');
+    if (!(opts && opts.silent)) replaceCurrentEntry();
+  }
+
+  // 恢复选中 identity: 快照/状态优先; 只有没有有效恢复快照的冷访问才回落到
+  // 持久化 cb-tree-selected (不从共享选中偏好猜恢复对象); 不猜 index.
+  function restoreTreeSelection(opts) {
+    const snapshotTarget = state.selected;
+    const node = snapshotTarget === null ? null : findVisibleTreeNode(snapshotTarget);
+    if (node) {
+      selectTreeNode(node, { silent: true });
+      return;
+    }
+    if (snapshotTarget !== null || bootSnapshot) {
+      clearTreeSelection({ silent: true });
+      return;
+    }
+    let saved = null;
+    try {
+      saved = localStorage.getItem(TREE_SELECTED_KEY);
+    } catch (err) {
+      return;
+    }
+    if (saved === null || !isValidEncodedPath(saved)) return;
+    const persisted = findVisibleTreeNode(saved);
+    if (persisted) selectTreeNode(persisted, { silent: true });
+  }
+
+  function findVisibleTreeNode(identity) {
+    return (
+      visibleTreeNodes().find(function (li) {
+        return encodedPathOf(li) === identity;
+      }) || null
+    );
+  }
+
+  // Q17 树焦点回退候选: 最近可见祖先 (自身仍可见则不变), 否则首个可见节点.
+  function treeHiddenFallback() {
+    if (!treeSelectedEl) return null;
+    let node = treeSelectedEl;
+    while (node) {
+      const path = encodedPathOf(node);
+      if (!(path !== null && path !== '' && isHiddenEncodedPath(path))) {
+        return path;
+      }
+      const parentUl = node.parentElement;
+      node = parentUl ? parentUl.closest('li.cb-tree-node') : null;
+    }
+    const first = visibleTreeNodes()[0];
+    return first ? encodedPathOf(first) : null;
+  }
+
+  function moveTreeSelection(delta) {
+    const nodes = visibleTreeNodes();
+    if (nodes.length === 0) return;
+    const idx = nodes.indexOf(treeSelectedEl);
+    const base = idx < 0 ? (delta > 0 ? -1 : 0) : idx;
+    const next = Math.max(0, Math.min(base + delta, nodes.length - 1));
+    selectTreeNode(nodes[next]);
+    nodes[next].scrollIntoView({ block: 'nearest' });
+  }
+
+  // 树根聚焦 (preventScroll): 指针选中树行后焦点落树根 — active-descendant 由根
+  // 公告, 键盘导航立即接管; 老环境不支持 focus options 时退化为普通 focus.
+  function focusTreeRootUl() {
+    if (!treeRootUl) return;
+    try {
+      treeRootUl.focus({ preventScroll: true });
+    } catch (err) {
+      treeRootUl.focus();
+    }
+  }
+
+  // 当前 DOM 中已展开的分支路径 (用于版本变化后的展开状态保持: 重排不收起).
+  function expandedTreePaths() {
+    const paths = [];
+    if (!treeRootUl) return paths;
+    $$('li.cb-tree-node', treeRootUl).forEach(function (li) {
+      const ul = li.querySelector(':scope > ul.cb-tree-children');
+      if (!ul || ul.hidden) return;
+      const path = encodedPathOf(li);
+      if (path !== null && path !== '') paths.push(path);
     });
-    return promise.then(function () {
-      // 旧壳链路: 显式陈旧哨兵 (调用方不得按成功处理)
-      if (shellGen !== treeGen) return null;
-      // 只有最深匹配节点标 current (祖先只展开, 不高亮)
-      if (gen !== undefined && !paneNavGuard.isCurrent(gen)) return lastNode;
-      if (lastNode) lastNode.classList.add('cb-current');
-      return lastNode;
+    return paths;
+  }
+
+  // 恢复壳/刷新规则只恢复既有展开; 新导航入口才定位展开当前内容路径.
+  // 标记 current 与恢复选中; 只有焦点原本位于树内时才回到树根 (绝不抢焦点).
+  function restoreTreeContent(opts) {
+    const shellGen = treeGen;
+    const version = optionsVersion;
+    const gen = treeContentGuard.begin();
+    const ownership = {
+      required: true,
+      current: function () {
+        return shellGen === treeGen && version === optionsVersion && treeContentGuard.isCurrent(gen);
+      },
+    };
+    const focusInTree = !!(opts && opts.focusInTree);
+    const current = currentPathFromState();
+    const revealCurrent = !!(opts && opts.revealCurrent);
+    const extra = opts && Array.isArray(opts.expandedPaths) ? opts.expandedPaths : [];
+    // 各路径内部依次补祖先, 独立分支并发恢复; 一个慢/失败分支不阻塞其他分支.
+    const targets = new Set();
+    if (revealCurrent && current !== null && current !== '') targets.add(current);
+    extra.concat(treeExpandedPaths).forEach(function (path) {
+      if (typeof path !== 'string' || !isValidEncodedPath(path) || path === '') return;
+      targets.add(path);
+    });
+    return Promise.all(
+      Array.from(targets, function (path) {
+        return walkTreePath(path, ownership, !revealCurrent || path !== current);
+      })
+    )
+      .then(function () {
+        if (!ownership.current()) return;
+        clearTreeCurrent();
+        const target = currentPathFromState();
+        if (target !== null) {
+          markTreePath(target === '' ? [] : target.split('/'));
+        }
+        restoreTreeSelection();
+        if (focusInTree && treeRootUl && !treeRootUl.contains(document.activeElement)) {
+          focusTreeRootUl();
+          if (treeSelectedEl && treeRootUl) {
+            treeRootUl.setAttribute('aria-activedescendant', treeSelectedEl.id);
+          }
+        }
+      });
+  }
+
+  // 手动重新展开时恢复已记住的子树; 不开启内容导航代次, 不重选或改变打开内容.
+  function restoreTreeChildExpansions(li) {
+    if (!li.isConnected || li.closest('.cb-tree-node[aria-expanded="false"]')) return;
+    const ul = li.querySelector(':scope > ul.cb-tree-children');
+    if (!ul) return;
+    $$(':scope > li', ul).forEach(function (child) {
+      const path = encodedPathOf(child);
+      if (!isExpandableDir(child) || path === null || !treeExpandedPaths.includes(path)) return;
+      // 恢复展开不自动重试错误分支; 错误保留给用户显式激活.
+      if (child.getAttribute('data-cb-branch-state') === 'error') return;
+      loadTreeBranch(child, path, null).then(function (installed) {
+        if (installed) restoreTreeChildExpansions(child);
+      });
     });
   }
 
-  // 树宽上限: 视口一半封顶 (极窄视口下两栏仍各得其所), 且不超 480px.
+  function toggleTreeNode(li) {
+    if (!isExpandableDir(li)) return;
+    const path = encodedPathOf(li);
+    if (path === null) return;
+    const ul = li.querySelector(':scope > ul.cb-tree-children');
+    const expanded = !!ul && !ul.hidden;
+    if (treePending.has(path)) {
+      // 在途: 按最新显式意图翻转 (第二次激活表达与上一次相反的终态); 安装方
+      // 消费记录决定落地终态, 点击绝不落空也不产生第二个请求.
+      const prior = treeExpandIntent.get(path);
+      const next = prior === undefined ? !expanded : !prior;
+      treeExpandIntent.set(path, next);
+      setTreeNodeExpanded(li, next, true);
+      loadTreeBranch(li, path, null).then(function (installed) {
+        if (installed) restoreTreeChildExpansions(li);
+      });
+      return;
+    }
+    if (expanded) {
+      treeExpandIntent.delete(path); // 无在途: 意图无消费方, 不留残留
+      setTreeNodeExpanded(li, false, true);
+      return;
+    }
+    // 展开: 失败状态允许用户手动重试 (非自动重试); 其余走当前版本缓存/在途.
+    if (li.getAttribute('data-cb-branch-state') === 'error') {
+      treeBranchCache.delete(path);
+    }
+    treeExpandIntent.set(path, true);
+    setTreeNodeExpanded(li, true, true);
+    loadTreeBranch(li, path, null).then(function (installed) {
+      if (installed) restoreTreeChildExpansions(li);
+    });
+  }
+
+  function navigateTreeNode(li) {
+    const url = nodeHref(li);
+    if (url === null) return;
+    const path = encodedPathOf(li);
+    // PDF 文件: 不 SPA fetch / 不 history / 不换 pane — 新 tab 原生查看器
+    // (Chromium 内置查看器拒绝 document-sandbox 响应; 面板承载不了原生 viewer)
+    if (!isDirNode(li) && isPdfFile(path, 'file')) {
+      window.open(browseActionUrl(path, 'full').href, '_blank', 'noopener');
+      return;
+    }
+    // 树内导航: SPA (fragment 注入 + pushState); 无 pane (异常) 时兜底整页导航.
+    if (pane && path !== null && path !== '') {
+      paneNavigate({
+        kind: isDirNode(li) ? 'directory' : 'reading',
+        path: path,
+        history: 'push',
+      });
+      return;
+    }
+    location.href = url.href;
+  }
   function treeWidthMax() {
     return Math.min(TREE_MAX_WIDTH, Math.floor(window.innerWidth * 0.5));
   }
-  // 持久化偏好只受硬边界约束 [160,480], 绝不受窄屏 50vw 上限影响.
   function clampTreePreferred(width) {
     return Math.max(TREE_MIN_WIDTH, Math.min(TREE_MAX_WIDTH, Math.round(width)));
   }
-  // 生效宽: 偏好再按当前视口约束 (宽屏恒等于偏好; 窄屏抽屉忽略该值).
   function clampTreeWidth(width) {
     return Math.max(TREE_MIN_WIDTH, Math.min(treeWidthMax(), Math.round(width)));
   }
-  // 恢复持久化偏好: 仅有限正数合法 (0/NaN/Infinity/负数 → 默认 238), 再按硬边界截断.
   function loadTreePreferredWidth() {
     let saved = 0;
     try {
@@ -1361,8 +2247,6 @@
     }
     return Number.isFinite(saved) && saved > 0 ? clampTreePreferred(saved) : TREE_DEFAULT_WIDTH;
   }
-  // 应用树宽到 CSS 变量 (body.cb-tree-mode 列 1) 并同步 resizer ARIA;
-  // persist 时按硬边界截断更新持久化偏好 (存储异常忽略, 宽度仍生效).
   function setTreeWidth(width, persist) {
     treeWidth = clampTreeWidth(width);
     document.body.style.setProperty('--cb-tree-width', treeWidth + 'px');
@@ -1379,18 +2263,53 @@
       }
     }
   }
-  function buildTreeShell() {
-    const gen = treeGen;
-    treeNav = document.createElement('nav');
-    treeNav.className = 'cb-tree';
-    treeNav.id = 'cb-tree-nav'; // 稳定 id: 抽屉唤起按钮 aria-controls 锚点
-    treeNav.setAttribute('aria-label', '目录树');
-    // 顶栏: 搜索表单 + 折叠按钮, 作为树壳第一个子节点 (先于根列表). 折叠按钮
-    // 随树壳 inert/hidden/抽屉生命周期一起走, 不再是调整器子控件; 调整器上的
-    // pointerdown/keydown 守卫 (closest('.cb-tree-collapse')) 保留为防御纵深.
-    const treeToolbar = document.createElement('div');
-    treeToolbar.className = 'cb-tree-toolbar';
-    treeToolbar.append(treeSearchForm());
+
+  /* ---------- 树壳构建 + 窄屏抽屉/折叠/宽度 ---------- */
+
+  // 进入树壳: 清除内存 token 与全部 native 控制 (树无本机打开能力; 退出补能力
+  // 只能整页重载重新取得). token 绝不进入 fragment/快照/持久存储.
+  function clearNativeCapability() {
+    nativeToken = null;
+    const tokenMeta = document.querySelector('meta[name="cb-native-open-token"]');
+    if (tokenMeta) tokenMeta.remove();
+    $$('[data-cb-action="native"]').forEach(function (el) {
+      el.remove();
+    });
+  }
+
+  function buildTreeShell(revealCurrent) {
+    if (treeShell) return;
+    treeGen += 1; // 新壳: 旧壳在途响应全部失效
+    clearNativeCapability();
+    // 完整页 spy 观察原正文: 内容区 fragment 替换后目标脱离 DOM — 先断开.
+    if (fullPageSpyDisposer) {
+      fullPageSpyDisposer();
+      fullPageSpyDisposer = null;
+    }
+    closeTreeDrawer();
+    document.body.classList.add('cb-tree-mode');
+    treePreferredWidth = loadTreePreferredWidth();
+    if (!window.matchMedia(TREE_DRAWER_MQL).matches) {
+      setTreeWidth(treePreferredWidth, false);
+    }
+    treeCollapsePreferred = false;
+    try {
+      treeCollapsePreferred = localStorage.getItem(TREE_COLLAPSED_KEY) === '1';
+    } catch (err) {
+      /* 持久化读取失败: 默认展开 */
+    }
+    installTreeCollapseMql();
+    document.addEventListener('focusin', onTreeFocusIn, true);
+    document.addEventListener('pointerdown', onTreePointerDown, true);
+    installTreeViewportResizeHandler();
+
+    treeShell = document.createElement('nav');
+    treeShell.className = 'cb-tree';
+    treeShell.id = 'cb-tree-nav'; // 稳定 id: 抽屉唤起按钮 aria-controls 锚点
+    treeShell.setAttribute('aria-label', '目录树');
+    // 顶栏只承载折叠控制: 搜索与显示规则控件统一在页面顶部工具区.
+    const toolbar = document.createElement('div');
+    toolbar.className = 'cb-tree-toolbar';
     treeCollapseBtn = document.createElement('button');
     treeCollapseBtn.type = 'button';
     treeCollapseBtn.className = 'cb-tree-collapse';
@@ -1398,110 +2317,22 @@
     treeCollapseBtn.title = '收起目录树';
     treeCollapseBtn.textContent = '‹';
     treeCollapseBtn.addEventListener('click', function (event) {
-      event.stopPropagation(); // 不落入 document 全局 click (native action 等)
+      event.stopPropagation(); // 不落入 document 全局 click
       setTreeCollapsePreference(true, true);
     });
-    treeToolbar.append(treeCollapseBtn);
-    // 模式切换按钮: 顶栏末位 (append 移动节点, 自目录工具栏行迁入; 随树壳
-    // inert/hidden/抽屉生命周期一起走). 退出树模式时迁回目录工具栏行.
-    treeToolbar.append(modeToggleBtn);
-    treeNav.append(treeToolbar);
-    treeItemSeq = 0; // 新壳: id 计数器复位 (id 仅需壳内稳定唯一, 见声明)
+    toolbar.append(treeCollapseBtn);
+    treeShell.append(toolbar);
+    treeItemSeq = 0; // 新壳: id 计数器复位 (id 仅需壳内稳定唯一)
     treeRootUl = document.createElement('ul');
     treeRootUl.className = 'cb-tree-root';
     treeRootUl.id = 'cb-tree-root'; // 稳定 id: 树根 (单 tab 停靠点) 身份锚点
     treeRootUl.setAttribute('role', 'tree');
     treeRootUl.setAttribute('aria-label', '目录树');
     treeRootUl.tabIndex = 0; // 单 tab 停靠点; 活动后代经 aria-activedescendant 公告
-    treeNav.append(treeRootUl);
-    document.body.prepend(treeNav);
-    // 列 2 树宽调整器 (宽屏常驻; 窄屏抽屉内 display:none, 无行为): ARIA
-    // separator + 指针拖拽 (捕获) + 键盘 ±16/Home/End 步进. 属性值随
-    // treeWidth 同步 (setTreeWidth 已先于外壳就位执行/或在外壳内保持).
-    treeResizer = document.createElement('div');
-    treeResizer.className = 'cb-tree-resizer';
-    treeResizer.tabIndex = 0;
-    treeResizer.setAttribute('role', 'separator');
-    treeResizer.setAttribute('aria-orientation', 'vertical');
-    treeResizer.setAttribute('aria-label', '调整目录树宽度');
-    treeResizer.setAttribute('aria-valuemin', String(TREE_MIN_WIDTH));
-    treeResizer.setAttribute('aria-valuemax', String(treeWidthMax()));
-    treeResizer.setAttribute('aria-valuenow', String(treeWidth));
-    treeResizer.addEventListener('pointerdown', function (event) {
-      // 折叠按钮守卫 (防御纵深, 按钮已移入树壳顶栏): 子控件不触发拖拽, 先于一切返回.
-      if (event.target.closest('.cb-tree-collapse')) return;
-      // 仅主指针左键可开始; 已有在途手势时拒绝 (副键/多指不抢手势).
-      if (!canStartTreeResize(event, treeResizePointerId)) return;
-      // 先捕获后启动: 捕获失败 (异常/禁用) 干净返回, 不留 class/监听/持久化.
-      try {
-        treeResizer.setPointerCapture(event.pointerId);
-      } catch (err) {
-        return;
-      }
-      const pointerId = event.pointerId;
-      const startX = event.clientX;
-      const startWidth = treeWidth;
-      let dragWidth = startWidth; // 未截断的目标宽: 结束时按硬边界持久化
-      treeResizePointerId = pointerId;
-      document.body.classList.add('cb-tree-resizing');
-      if (event.cancelable) event.preventDefault();
-      const onMove = function (moveEvent) {
-        if (!ownsTreeResize(moveEvent, treeResizePointerId)) return;
-        dragWidth = startWidth + moveEvent.clientX - startX;
-        setTreeWidth(dragWidth, false);
-        if (moveEvent.cancelable) moveEvent.preventDefault();
-      };
-      // 幂等收尾: 任意结束信号 (up/cancel/lostpointercapture) 只清理一次.
-      // 先复位 owner 再释放捕获 — releasePointerCapture 触发的
-      // lostpointercapture 重入此刻已无 owner, 直接返回, 不重复清理/持久化.
-      const onEnd = function (endEvent) {
-        if (!ownsTreeResize(endEvent, treeResizePointerId)) return;
-        treeResizePointerId = null;
-        treeResizer.removeEventListener('pointermove', onMove);
-        treeResizer.removeEventListener('pointerup', onEnd);
-        treeResizer.removeEventListener('pointercancel', onEnd);
-        treeResizer.removeEventListener('lostpointercapture', onEnd);
-        document.body.classList.remove('cb-tree-resizing');
-        try {
-          treeResizer.releasePointerCapture(pointerId);
-        } catch (err) {
-          /* 指针捕获已隐式释放: 忽略 */
-        }
-        // finish (up/cancel): 持久化偏好按硬边界截断, 绝不写入 50vw 截断值
-        setTreeWidth(dragWidth, true);
-      };
-      treeResizer.addEventListener('pointermove', onMove);
-      treeResizer.addEventListener('pointerup', onEnd);
-      treeResizer.addEventListener('pointercancel', onEnd);
-      treeResizer.addEventListener('lostpointercapture', onEnd);
-    });
-    treeResizer.addEventListener('keydown', function (event) {
-      // 折叠按钮守卫 (防御纵深) 的按键 (Enter/Space 触发 click) 不得被当成宽度步进.
-      if (event.target.closest('.cb-tree-collapse')) return;
-      let next = null;
-      switch (event.key) {
-        case 'ArrowLeft':
-          next = treeWidth - 16;
-          break;
-        case 'ArrowRight':
-          next = treeWidth + 16;
-          break;
-        case 'Home':
-          next = TREE_MIN_WIDTH;
-          break;
-        case 'End':
-          next = treeWidthMax();
-          break;
-        default:
-          return;
-      }
-      event.preventDefault();
-      event.stopPropagation(); // 阻断冒泡: 分隔器按键不得落入全局树键
-      setTreeWidth(next, true);
-    });
-    document.body.append(treeResizer);
+    treeShell.append(treeRootUl);
+    document.body.prepend(treeShell);
+    buildTreeResizer();
     // 窄屏抽屉配套: 遮罩 + 唤起按钮 (宽屏 display:none, 无行为).
-    // 遮罩点击收起; 按钮点击唤起 — 都走独立监听, 不干扰目录模式全局 handler.
     treeScrim = document.createElement('div');
     treeScrim.className = 'cb-tree-scrim';
     treeScrim.setAttribute('aria-hidden', 'true');
@@ -1532,32 +2363,104 @@
     document.body.append(treeRestoreBtn);
     installDrawerMql();
     applyTreeCollapsed(); // 壳就位: 同步生效态到新元素 (inert/hidden/类)
-    return fetchTreeEntries('', treeAbort ? treeAbort.signal : undefined).then(
-      function (entries) {
-        if (gen !== treeGen) return;
-        // 重试/成功即清理: 既有错误元素 (同壳重取/迟到清理) 一律移除
-        const prevErr = treeNav.querySelector('.cb-tree-error');
-        if (prevErr) prevErr.remove();
-        const nodes = entries.map(buildTreeNode);
-        treeCache.set('', nodes);
-        treeRootUl.replaceChildren(...nodes);
-      },
-      function (err) {
-        // 根加载失败: 壳退出中止 (AbortError) 与旧壳一律静默 — 无可见陈旧
-        // alert、无未处理拒绝; 当前壳清空根并把纯文本错误 (role=alert) 挂为
-        // nav 内 treeRootUl 的兄弟 (绝不直接挂进 role=tree 的 ul), 链路
-        // resolve; 重进/重试由新壳全新请求.
-        if (err && err.name === 'AbortError') return;
-        if (gen !== treeGen) return;
-        treeCache.delete('');
-        treeRootUl.replaceChildren();
-        const errEl = document.createElement('div');
-        errEl.className = 'cb-tree-error';
-        errEl.setAttribute('role', 'alert');
-        errEl.textContent = '无法加载目录树';
-        treeNav.append(errEl);
+    // 内容区: 包装当前完整页内容进 .cb-pane, 再取当前内容区目标的 fragment
+    // (目录/搜索/文档), 替换为统一 fragment 视图 (与根加载并行).
+    createPane();
+    clearTreeCurrent();
+    refreshPaneForState({ history: 'none' });
+    loadTreeRoot({ revealCurrent: revealCurrent });
+  }
+
+  // 进入/恢复 tree 视图 (唯一入口; 幂等): 新壳构建; 已有壳只重同步 - 内容区按
+  // 快照目标重取 (已成功安装同一目标则不重取), 树标记 current 并恢复选中 identity.
+  function ensureTreeShell(revealCurrent) {
+    syncControlState();
+    if (!treeShell) {
+      buildTreeShell(revealCurrent);
+      return;
+    }
+    clearTreeCurrent();
+    syncTreeToState(true);
+    restoreTreeSelection();
+    refreshPaneForState({ history: 'none' });
+  }
+
+  function buildTreeResizer() {
+    treeResizer = document.createElement('div');
+    treeResizer.className = 'cb-tree-resizer';
+    treeResizer.tabIndex = 0;
+    treeResizer.setAttribute('role', 'separator');
+    treeResizer.setAttribute('aria-orientation', 'vertical');
+    treeResizer.setAttribute('aria-label', '调整目录树宽度');
+    treeResizer.setAttribute('aria-valuemin', String(TREE_MIN_WIDTH));
+    treeResizer.setAttribute('aria-valuemax', String(treeWidthMax()));
+    treeResizer.setAttribute('aria-valuenow', String(treeWidth));
+    treeResizer.addEventListener('pointerdown', function (event) {
+      if (event.target.closest('.cb-tree-collapse')) return;
+      if (!canStartTreeResize(event, treeResizePointerId)) return;
+      try {
+        treeResizer.setPointerCapture(event.pointerId);
+      } catch (err) {
+        return; // 捕获失败 (异常/禁用) 干净返回, 不留 class/监听/持久化
       }
-    );
+      const pointerId = event.pointerId;
+      const startX = event.clientX;
+      const startWidth = treeWidth;
+      let dragWidth = startWidth; // 未截断的目标宽: 结束时按硬边界持久化
+      treeResizePointerId = pointerId;
+      document.body.classList.add('cb-tree-resizing');
+      if (event.cancelable) event.preventDefault();
+      const onMove = function (moveEvent) {
+        if (!ownsTreeResize(moveEvent, treeResizePointerId)) return;
+        dragWidth = startWidth + moveEvent.clientX - startX;
+        setTreeWidth(dragWidth, false);
+        if (moveEvent.cancelable) moveEvent.preventDefault();
+      };
+      // 幂等收尾: 任意结束信号 (up/cancel/lostpointercapture) 只清理一次.
+      const onEnd = function (endEvent) {
+        if (!ownsTreeResize(endEvent, treeResizePointerId)) return;
+        treeResizePointerId = null;
+        treeResizer.removeEventListener('pointermove', onMove);
+        treeResizer.removeEventListener('pointerup', onEnd);
+        treeResizer.removeEventListener('pointercancel', onEnd);
+        treeResizer.removeEventListener('lostpointercapture', onEnd);
+        document.body.classList.remove('cb-tree-resizing');
+        try {
+          treeResizer.releasePointerCapture(pointerId);
+        } catch (err) {
+          /* 指针捕获已隐式释放: 忽略 */
+        }
+        setTreeWidth(dragWidth, true); // 持久化按硬边界截断, 不写 50vw 截断值
+      };
+      treeResizer.addEventListener('pointermove', onMove);
+      treeResizer.addEventListener('pointerup', onEnd);
+      treeResizer.addEventListener('pointercancel', onEnd);
+      treeResizer.addEventListener('lostpointercapture', onEnd);
+    });
+    treeResizer.addEventListener('keydown', function (event) {
+      if (event.target.closest('.cb-tree-collapse')) return;
+      let next = null;
+      switch (event.key) {
+        case 'ArrowLeft':
+          next = treeWidth - 16;
+          break;
+        case 'ArrowRight':
+          next = treeWidth + 16;
+          break;
+        case 'Home':
+          next = TREE_MIN_WIDTH;
+          break;
+        case 'End':
+          next = treeWidthMax();
+          break;
+        default:
+          return;
+      }
+      event.preventDefault();
+      event.stopPropagation(); // 阻断冒泡: 分隔器按键不得落入全局树键
+      setTreeWidth(next, true);
+    });
+    document.body.append(treeResizer);
   }
 
   /* ---------- 窄屏抽屉 (<64rem): off-canvas transform + 遮罩; 宽屏恒 no-op ---------- */
@@ -1567,9 +2470,7 @@
     if (treeOpenBtn) {
       treeOpenBtn.setAttribute('aria-expanded', 'true');
     }
-    // 焦点移入抽屉根树 (tabindex=0 单停靠点, aria-activedescendant 在根上
-    // 公告活动后代), 键盘导航立即可用; nav 仅兜底 (根缺失时)
-    const focusTarget = treeRootUl || treeNav;
+    const focusTarget = treeRootUl || treeShell;
     if (focusTarget) {
       try {
         focusTarget.focus({ preventScroll: true });
@@ -1585,8 +2486,7 @@
     if (treeOpenBtn) {
       treeOpenBtn.setAttribute('aria-expanded', 'false');
     }
-    // 只有窄屏抽屉真实打开时才有焦点归还逻辑 (宽屏常驻侧栏不受影响)
-    if (wasOpen && treeNav && treeNav.contains(document.activeElement)) {
+    if (wasOpen && treeShell && treeShell.contains(document.activeElement)) {
       if (treeOpenBtn) {
         treeOpenBtn.focus({ preventScroll: true });
       } else {
@@ -1595,8 +2495,6 @@
     }
   }
 
-  // 窄屏 media query 监听: 跨回宽屏时清理打开态并重放持久化偏好 (窄屏阶段
-  // 从未改写偏好, 恢复 CSS 变量与 ARIA); 收窄本身不得触碰偏好/生效宽.
   function installDrawerMql() {
     drawerMql = window.matchMedia(TREE_DRAWER_MQL);
     drawerMqlHandler = function (e) {
@@ -1612,19 +2510,6 @@
     }
   }
 
-  function uninstallDrawerMql() {
-    if (drawerMql && drawerMqlHandler) {
-      if (drawerMql.removeEventListener) {
-        drawerMql.removeEventListener('change', drawerMqlHandler);
-      } else if (drawerMql.removeListener) {
-        drawerMql.removeListener(drawerMqlHandler);
-      }
-    }
-    drawerMql = null;
-    drawerMqlHandler = null;
-  }
-  // 宽屏 resize 重钳制: 窄屏抽屉直接忽略 (resizer 隐藏, 宽度不生效); 宽屏按
-  // 持久化偏好重钳制生效宽 (persist=false — 不写 localStorage, 偏好原样保留).
   function installTreeViewportResizeHandler() {
     treeViewportResizeHandler = function () {
       if (window.matchMedia(TREE_DRAWER_MQL).matches) return;
@@ -1633,18 +2518,7 @@
     window.addEventListener('resize', treeViewportResizeHandler);
   }
 
-  function uninstallTreeViewportResizeHandler() {
-    if (treeViewportResizeHandler) {
-      window.removeEventListener('resize', treeViewportResizeHandler);
-    }
-    treeViewportResizeHandler = null;
-  }
   // 焦点落点纯函数: 返回 'restore' | 'collapse' | 'drawer' | null.
-  // - 折叠生效 (nextCollapsed): 树/调整器/抽屉唤起按钮内的焦点一律移交恢复
-  //   按钮 (inert/隐藏元素不可聚焦, 必须先移出); 恢复按钮自身保持可见, 无需移交.
-  // - 展开生效: 恢复按钮焦点落回折叠按钮 (宽屏 — 树列重新可见) 或抽屉唤起
-  //   按钮 (窄屏 — 恢复按钮即将隐藏); 宽屏下抽屉唤起按钮焦点落回折叠按钮.
-  // - 其余 (焦点在保持可见/可聚焦的元素, 或不在受影响控件内): null 不移交.
   function collapseFocusTarget(nextCollapsed, narrow, activeKind) {
     if (
       nextCollapsed &&
@@ -1661,20 +2535,16 @@
     return null;
   }
 
-  // 树壳焦点分类: 树内 → 'tree' (折叠按钮已在树壳顶栏内, 归 'tree'), 调整器内
-  // → 'resizer', 恢复按钮自身 → 'restore', 抽屉唤起按钮自身 → 'drawer', 其余
-  // → null. 供 applyTreeCollapsed 与焦点追踪共用, 判定顺序先包含后 identity.
+  // 树壳焦点分类: 树内 → 'tree', 调整器内 → 'resizer', 恢复按钮自身 → 'restore',
+  // 抽屉唤起按钮自身 → 'drawer', 其余 → null.
   function classifyTreeFocusTarget(target) {
-    if (treeNav && treeNav.contains(target)) return 'tree';
+    if (treeShell && treeShell.contains(target)) return 'tree';
     if (treeResizer && treeResizer.contains(target)) return 'resizer';
     if (treeRestoreBtn && target === treeRestoreBtn) return 'restore';
     if (treeOpenBtn && target === treeOpenBtn) return 'drawer';
     return null;
   }
 
-  // 焦点追踪 (见 treeFocusKind 注释): focusin 捕获阶段记录/清空; 指针按下
-  // 非树壳控件 (内容区等, 不可聚焦元素不触发 focusin) 时清空, 防止过期记录
-  // 在后续断点过渡中误判.
   function onTreeFocusIn(event) {
     treeFocusKind = classifyTreeFocusTarget(event.target);
   }
@@ -1685,11 +2555,8 @@
     }
   }
 
-  // 焦点必须在任何 class/inert/hidden 变更之前捕获并分类: inert/隐藏元素
-  // 不可聚焦, 一旦失能焦点即丢且无法再移交. 跨断点时焦点可能已被新视口 CSS
-  // 静默丢弃 (见 treeFocusKind), 用追踪记录补判; 落点由纯函数计算, 与最终
-  // 生效态互不纠缠.
   function applyTreeCollapsed() {
+    if (!treeShell) return;
     const narrow = treeCollapseMql
       ? treeCollapseMql.matches
       : window.matchMedia(TREE_DRAWER_MQL).matches;
@@ -1700,37 +2567,28 @@
       activeKind = treeFocusKind;
     }
     const focusTarget = collapseFocusTarget(nextCollapsed, narrow, activeKind);
-
     treeCollapsed = nextCollapsed;
     if (treeCollapsed) {
-      // 折叠路径: 恢复按钮先解除 hidden → 折叠类 → 移交焦点 → 树/调整器
-      // inert/hidden (display:none 不可聚焦, 恢复按钮必须先可见才能聚焦).
       if (treeRestoreBtn) treeRestoreBtn.hidden = false;
       document.body.classList.add('cb-tree-collapsed');
       if (focusTarget === 'restore' && treeRestoreBtn) {
         treeRestoreBtn.focus({ preventScroll: true });
-        treeFocusKind = 'restore'; // 程序化移交不触发 focusin 的环境下直接记录
+        treeFocusKind = 'restore';
       }
-      if (treeNav) {
-        treeNav.inert = true;
-        treeNav.setAttribute('aria-hidden', 'true');
+      if (treeShell) {
+        treeShell.inert = true;
+        treeShell.setAttribute('aria-hidden', 'true');
       }
       if (treeResizer) treeResizer.hidden = true;
       return;
     }
-    // 展开路径: 折叠类移除 → 树/调整器解除 inert/hidden → 落点聚焦 → 恢复
-    // 按钮隐藏 (任何已绘制帧都不暴露恢复控件). 落点: 窄屏抽屉唤起按钮 (宽
-    // →窄过渡, 恢复按钮即将隐藏); 宽屏折叠按钮 (树顶栏子控件, 已解除隐藏),
-    // 折叠按钮缺失时回退调整器/树根 (nav 仅最后兜底) — 焦点绝不停留在隐藏/inert 元素.
     document.body.classList.remove('cb-tree-collapsed');
-    if (treeNav) {
-      treeNav.inert = false;
-      treeNav.setAttribute('aria-hidden', 'false');
+    if (treeShell) {
+      treeShell.inert = false;
+      treeShell.setAttribute('aria-hidden', 'false');
     }
     if (treeResizer) treeResizer.hidden = false;
     if (focusTarget === 'drawer') {
-      // 收窄到抽屉且焦点在恢复按钮 (跨断点补判): 恢复按钮即将隐藏, 焦点移交
-      // 可见的抽屉唤起按钮.
       if (treeOpenBtn) {
         treeOpenBtn.focus({ preventScroll: true });
         treeFocusKind = 'drawer';
@@ -1738,23 +2596,22 @@
     } else if (focusTarget === 'restore' || focusTarget === 'collapse') {
       if (treeCollapseBtn) {
         treeCollapseBtn.focus({ preventScroll: true });
-        treeFocusKind = 'tree'; // 折叠按钮在树顶栏内, 归 'tree' (与 classify 一致)
+        treeFocusKind = 'tree';
       } else if (treeResizer) {
         treeResizer.focus({ preventScroll: true });
         treeFocusKind = 'resizer';
       } else if (treeRootUl) {
         treeRootUl.focus({ preventScroll: true });
         treeFocusKind = 'tree';
-      } else if (treeNav) {
-        treeNav.focus({ preventScroll: true });
+      } else if (treeShell) {
+        treeShell.focus({ preventScroll: true });
         treeFocusKind = 'tree';
       }
     }
     if (treeRestoreBtn) treeRestoreBtn.hidden = true;
   }
 
-  // 折叠偏好: persist 只写两态 '1'/'0' (仅按钮交互写入; 窄屏抽屉交互不触碰
-  // 该键), 随后立即重算生效态.
+  // 折叠偏好: persist 只写两态 '1'/'0' (仅按钮交互写入).
   function setTreeCollapsePreference(preferred, persist) {
     treeCollapsePreferred = preferred;
     if (persist) {
@@ -1767,8 +2624,6 @@
     applyTreeCollapsed();
   }
 
-  // 断点感知: 收窄到抽屉时强制展开生效态 (偏好保留), 跨回宽屏时重放偏好.
-  // 与 drawer mql 同断点同源; add/remove 走同一 handler 引用.
   function installTreeCollapseMql() {
     treeCollapseMql = window.matchMedia(TREE_DRAWER_MQL);
     treeCollapseMqlHandler = applyTreeCollapsed;
@@ -1779,33 +2634,18 @@
     }
   }
 
-  function uninstallTreeCollapseMql() {
-    if (treeCollapseMql && treeCollapseMqlHandler) {
-      if (treeCollapseMql.removeEventListener) {
-        treeCollapseMql.removeEventListener('change', treeCollapseMqlHandler);
-      } else if (treeCollapseMql.removeListener) {
-        treeCollapseMql.removeListener(treeCollapseMqlHandler);
-      }
-    }
-    treeCollapseMql = null;
-    treeCollapseMqlHandler = null;
-  }
+  /* ---------- 内容区 (tree 视图的 SPA 内容面板) ---------- */
 
-  /* ---------- SPA 内容区导航 (树模式) ---------- */
-
-  // 内容区: 树模式右侧滚动容器. 进入树模式时把当前完整页内容 (目录页 main.cb-main
-  // / 文档页 .cb-doc) 包装进 .cb-pane, 再 fetch 当前 URL 的 fragment 替换为统一
-  // fragment 视图 (深链目录页显示迷你列表). 树内导航全部 SPA: fragment 注入 +
-  // history.pushState/popstate, 无整页刷新; URL 恒为 actionUrl(path, 'full').
+  // 内容区: tree 视图右侧滚动容器. 进入树壳时把当前完整页内容 (目录页
+  // main.cb-main / 文档页 .cb-doc) 包装进 .cb-pane, 再 fetch 当前内容区目标的
+  // fragment 替换为统一 fragment 视图 (目录/搜索/文档). 树内导航全部 SPA:
+  // fragment 注入 + history 快照; URL 恒为含有效规则的浏览上下文 URL.
   let pane = null;
   let paneAbort = null; // 在途 fragment fetch 的 AbortController
-  let paneCommittedPath = null; // 最近一次提交的 canonical encoded path (hash 导航防重取)
-  let paneCommittedGen = null; // 最近一次提交的导航 generation (启动重同步用)
-  let paneInitialGen = null; // 初始加载导航的 generation (启动链守卫用)
-  // 单一活跃导航不变量: 单调 nav id (generation 守卫) — 仅当 id 最新且
+  let paneCommittedKey = null; // 最近一致且成功安装的内容键 (占位/失败不记)
+  let paneCommittedTarget = null; // 最近提交的目标 {kind,path,query}
   const paneNavGuard = createGenerationGuard();
-  // pane 生命周期 registry: SPA 替换/退出树模式时统一拆除. ticket 08 的 TOC
-  // observer 经 registerPaneDisposable 注册, 替换时自动 disconnect, 高亮不串台.
+  // pane 生命周期 registry: 内容区 fragment 替换时统一拆除.
   const paneDisposables = [];
 
   function registerPaneDisposable(fn) {
@@ -1825,7 +2665,6 @@
     });
   }
 
-  // 统一 teardown: 先断开注册的 observer/媒体, 供替换与退出复用.
   function teardownPane() {
     paneDisposables.splice(0).forEach(function (fn) {
       try {
@@ -1839,23 +2678,27 @@
 
   // 被包装的完整页内容宿主: 目录页 main.cb-main, 文档页 .cb-doc.
   function paneHostForPage() {
-    return (
-      document.querySelector('main.cb-main') ||
-      document.querySelector('.cb-doc')
-    );
+    return document.querySelector('main.cb-main') || document.querySelector('.cb-doc');
   }
 
   function createPane() {
+    if (pane) return pane;
     const host = paneHostForPage();
-    if (!host || pane) return null;
+    if (!host) return null;
     const wrap = document.createElement('div');
     wrap.className = 'cb-pane';
     wrap.setAttribute('role', 'region');
     wrap.setAttribute('aria-label', '内容区');
+    wrap.setAttribute('data-cb-pane-state', 'loading');
     host.before(wrap);
     wrap.append(host);
     pane = wrap;
     return wrap;
+  }
+
+  function paneSetState(status) {
+    if (!pane) return;
+    pane.setAttribute('data-cb-pane-state', status);
   }
 
   function paneClearError() {
@@ -1864,7 +2707,7 @@
     if (errEl) errEl.remove();
   }
 
-  // 错误只经 textContent (绝不 innerHTML): 保留现有 pane 内容, URL 不变.
+  // 错误只经 textContent (绝不 innerHTML): 保留先前打开内容, URL 不变.
   function paneShowError(message) {
     if (!pane) return;
     let errEl = pane.querySelector(':scope > .cb-pane-error');
@@ -1877,20 +2720,87 @@
     errEl.textContent = message;
   }
 
-  // 树内 SPA 导航: fetch fragment -> 校验 (ok + text/html + wrapper identity)
-  // -> 提交 (teardown 旧 pane 状态, 安装新内容, pushState, 树状态同步).
-  // 失败 fail-closed: 保留 pane 内容, 不 pushState (URL 不变), 文本错误.
-  function paneNavigate(encodedPath, opts) {
-    if (!isValidEncodedPath(encodedPath) || !pane) return null;
-    const url = actionUrl(encodedPath, 'full');
-    if (url === null) return null;
-    const selectTree = !opts || opts.select !== false;
+  // 当前版本的目标键 (目录/搜索含显示规则; 文档正文不含).
+  function paneTargetKey(target) {
+    return contentKey(target.kind, target.kind === 'search' ? '' : target.path, target.query);
+  }
+
+  function paneFragmentUrl(kind, target) {
+    if (kind === 'search') {
+      const qParams = new URLSearchParams();
+      qParams.set('q', target.query || '');
+      return new URL(
+        '/__/search?' +
+          qParams.toString() +
+          '&fragment=1&sort=' +
+          state.rules.sort +
+          '&hidden=' +
+          (state.rules.hidden ? '1' : '0'),
+        location.origin
+      );
+    }
+    if (kind === 'directory') {
+      const base = target.path === '' ? '/' : '/' + target.path;
+      return new URL(
+        base +
+          '?fragment=1&sort=' +
+          state.rules.sort +
+          '&hidden=' +
+          (state.rules.hidden ? '1' : '0'),
+        location.origin
+      );
+    }
+    return browseActionUrl(target.path, 'fragment');
+  }
+
+  function paneTargetPathname() {
+    return state.kind === 'search' ? '/__/search' : '/' + state.path;
+  }
+
+  // 真实导航: 新增一个携带当前快照的目标项 (hash 只在同文档延续).
+  function pushPaneUrl() {
+    const samePath = locationPathname() === paneTargetPathname();
+    const url = contextUrl(state.kind, state.path, state.q, samePath ? location.hash : '');
+    if (location.href !== url.href) pushEntry(url);
+  }
+
+  function paneFail(message) {
+    paneCommittedKey = null; // 失败使成功标记失效
+    paneCommittedTarget = null;
+    paneSetState('error');
+    paneShowError(message);
+  }
+
+  // 内容区导航: fetch fragment -> 校验 (ok + text/html + wrapper 语义/identity)
+  // -> 提交 (teardown 旧 pane 状态, 安装新内容, 按需写历史/快照, 树状态同步).
+  // 失败 fail-closed: 保留 pane 内容, 不提交目标历史/上下文, 文本错误.
+  function paneNavigate(target) {
+    if (!pane || !target) return null;
+    const kind =
+      target.kind === 'search' ? 'search' : target.kind === 'reading' ? 'reading' : 'directory';
+    // 目录/搜索: 合法 encoded path ('' = 服务根, 是合法浏览目标); 文档: 必须非空.
+    if (!isValidEncodedPath(target.path)) return null;
+    if (kind === 'reading' && target.path === '') return null;
+    const key = paneTargetKey({ kind: kind, path: target.path, query: target.query });
     const gen = paneNavGuard.begin(); // 新导航作废所有在途导航
     if (paneAbort) paneAbort.abort();
     const ac = new AbortController();
     paneAbort = ac;
+    const sameCommitted =
+      paneCommittedKey === key &&
+      paneCommittedTarget !== null &&
+      paneCommittedTarget.kind === kind &&
+      paneCommittedTarget.path === target.path;
+    if (sameCommitted) {
+      // 一致且成功安装: 不重取; 真实导航只补写 URL/快照 (hash 导航等).
+      paneClearError();
+      paneSetState('ready');
+      if (target.history === 'push') pushPaneUrl();
+      return gen;
+    }
     paneClearError();
-    fetch(actionUrl(encodedPath, 'fragment'), {
+    paneSetState('loading');
+    fetch(paneFragmentUrl(kind, target), {
       headers: { Accept: 'text/html' },
       signal: ac.signal,
     })
@@ -1900,68 +2810,61 @@
       })
       .then(function (html) {
         if (html === null || !paneNavGuard.isCurrent(gen)) return;
-        commitPane(html, url, encodedPath, gen, selectTree, !!(opts && opts.pop));
+        commitPane(html, target, kind, gen);
       })
       .catch(function (err) {
         if (!paneNavGuard.isCurrent(gen)) return; // 过期错误: 丢弃
         if (err && err.name === 'AbortError') return; // 被新导航中止: 不报错
-        if (opts && opts.pop) {
-          // popstate: URL 已被浏览器改走, 旧内容与新 URL 不一致 — 统一 teardown
-          // 后清空 pane (observer 断开 + 媒体暂停移除), 不绕过生命周期.
-          teardownPane();
-          pane.replaceChildren();
-        }
-        paneShowError(
+        paneFail(
           '无法加载：' + (err && err.message ? err.message : String(err))
         );
       });
     return gen;
   }
 
-  // 提交守卫: id 最新 && wrapper identity 匹配 (fail-closed) && pushState 后
-  // location.pathname 等于导航 canonical URL — 三者满足才动 DOM/history/树.
-  function commitPane(html, url, encodedPath, gen, selectTree, isPop) {
-    if (!paneNavGuard.isCurrent(gen)) return;
+  // 提交守卫: generation 最新 + wrapper 语义/identity 与请求目标一致 (fail-closed)
+  // -> 才动 DOM/状态/历史. wrapper 回显的有效规则也必须与请求规则一致.
+  function commitPane(html, target, kind, gen) {
+    if (!paneNavGuard.isCurrent(gen) || !pane) return;
     const host = document.createElement('div');
     host.innerHTML = html; // 服务端 fragment (与预览面板同一信任契约)
     const wrapper = findFragmentWrapper(host);
-    // 服务端 wrapper identity 是权威 canonical 形态; transport binding 要求
-    // 请求路径与 wrapper 的 canonical key 精确相等 (均非 null), 否则 fail-closed
-    // — 不接受任意合法 wrapper 路径. canonical key 仅用于比较, 绝不构造 action URL.
-    const wrapperPath =
-      wrapper && typeof wrapper.dataset.nativePathEncoded === 'string'
-        ? wrapper.dataset.nativePathEncoded
-        : null;
-    const requestedKey = canonicalTransportKey(encodedPath);
-    const wrapperKey = canonicalTransportKey(wrapperPath);
-    const canonicalUrl =
-      requestedKey !== null &&
-      wrapperKey !== null &&
-      requestedKey === wrapperKey &&
-      isValidEncodedPath(wrapperPath)
-        ? actionUrl(wrapperPath, 'full')
-        : null;
-    if (canonicalUrl === null) {
-      // fail-closed: wrapper 缺失或 identity 非法 — 不推 URL
-      if (isPop) {
-        // popstate: URL 已被浏览器改走 — 统一 teardown 后清空, 内容不残留
-        teardownPane();
-        pane.replaceChildren();
-      }
-      paneShowError('无法加载：响应内容与目标不符');
+    if (!wrapper) {
+      paneFail('无法加载：响应内容为空');
       return;
     }
-    // 初始加载 (gen === paneInitialGen) 恒 replaceState (规范化不新增历史);
-    // 后续导航 pushState. hash 保留规则: 初始加载恒保留 (hash 属于所请求
-    // 文档), 后续导航仅同文档 (同 pathname) 保留.
-    const keepHash = gen === paneInitialGen || location.pathname === canonicalUrl.pathname;
-    const target = canonicalUrl.href + (keepHash ? location.hash : '');
-    if (location.href !== target) {
-      if (gen === paneInitialGen) {
-        history.replaceState(null, '', target);
-      } else {
-        history.pushState(null, '', target);
+    const surface = wrapperSurface(wrapper);
+    const wrapperIdentity =
+      typeof wrapper.dataset.nativePathEncoded === 'string'
+        ? wrapper.dataset.nativePathEncoded
+        : null;
+    let consistent = false;
+    if (kind === 'search') {
+      consistent =
+        surface === 'search' && wrapperIdentity === '' &&
+        wrapper.dataset.cbQuery === (target.query || '');
+    } else {
+      const requestedKey = canonicalTransportKey(target.path);
+      const wrapperKey =
+        wrapperIdentity === null ? null : canonicalTransportKey(wrapperIdentity);
+      consistent =
+        surface === kind &&
+        requestedKey !== null &&
+        wrapperKey !== null &&
+        requestedKey === wrapperKey &&
+        isValidEncodedPath(wrapperIdentity);
+    }
+    if (consistent && kind !== 'reading') {
+      // 旧集合不得冒充新规则结果: wrapper 回显规则不一致视为内容不匹配.
+      const echoSort = wrapper.dataset.cbSort;
+      const echoHidden = wrapper.dataset.cbHidden;
+      if (echoSort !== state.rules.sort || echoHidden !== (state.rules.hidden ? '1' : '0')) {
+        consistent = false;
       }
+    }
+    if (!consistent) {
+      paneFail('无法加载：响应内容与目标不符');
+      return;
     }
     teardownPane(); // 旧 observer 拆除 + 媒体卸载
     paneClearError();
@@ -1971,82 +2874,86 @@
       document.title = titleEl.textContent.trim();
     }
     pane.scrollTop = 0;
-    // 文档布局: wrapper 即 .cb-doc (文档片段) 时直接装; 否则查内层 .cb-doc
-    // (目录/媒体片段无 .cb-doc: installDocLayout(null) no-op, 不建 wrapper)
-    if (wrapper.matches('.cb-doc')) {
-      installDocLayout(wrapper);
-    } else {
-      installDocLayout(wrapper.querySelector('.cb-doc'));
+    mirrorContentState(pane, wrapper);
+    // 文档布局: wrapper 即 .cb-doc (文档片段) 时直接装; 否则查内层 .cb-doc.
+    const docEl = wrapper.matches('.cb-doc') ? wrapper : wrapper.querySelector('.cb-doc');
+    installDocLayout(docEl);
+    if (docEl) installPaneTocSpy(docEl);
+    renderMermaidIn(wrapper); // 内容区 fragment 内的 mermaid 容器
+    // 请求目标与成功安装内容分开记录: 占位/忙内容不记为可跳过重取的成功.
+    const placeholder = wrapperIsPlaceholder(wrapper);
+    paneCommittedTarget = { kind: kind, path: target.path, query: target.query };
+    paneCommittedKey = placeholder ? null : paneTargetKey(paneCommittedTarget);
+    paneSetState('ready');
+    state.kind = kind;
+    state.path = kind === 'search' ? '' : target.path;
+    state.q = kind === 'search' ? target.query || '' : null;
+    // 同上下文刷新由树根恢复展开/选中; 不另开树代次抢走在途分支提交权.
+    if (target.history === 'push') {
+      pushPaneUrl();
+      syncTreeToState(true); // 只有实际导航让选中跟随新的内容路径
     }
-    installPaneTocSpy(wrapper); // 新内容就位后重建 pane TOC spy (无 TOC 则 no-op)
-    renderMermaidIn(wrapper); // 树模式内容区 fragment 内的 mermaid 容器
-    paneCommittedPath = wrapperPath;
-    paneCommittedGen = gen;
-    syncTreeToPath(gen, selectTree);
-    closeTreeDrawer(); // 导航提交成功: 窄屏抽屉收起 (宽屏 no-op)
   }
 
-  function clearTreeCurrent() {
-    if (!treeRootUl) return;
-    $$('.cb-current', treeRootUl).forEach(function (el) {
-      el.classList.remove('cb-current');
-    });
+  // 按当前状态同步内容区 (进入树壳/恢复/规则变化后的重取入口).
+  function refreshPaneForState(opts) {
+    if (!pane) return;
+    const history = opts && opts.history ? opts.history : 'none';
+    if (state.kind === 'search') {
+      paneNavigate({ kind: 'search', path: '', query: state.q, history: history });
+      return;
+    }
+    paneNavigate({ kind: state.kind, path: state.path, history: history });
   }
 
-  // 同步树状态到当前 URL: 清除陈旧 cb-current, revealPath 展开祖先链, 完成后
-  // 以当前链为准重标记; 用户导航 (selectTree) 时选中跟随 URL.
-  function syncTreeToPath(gen, selectTree) {
-    if (!paneNavGuard.isCurrent(gen)) return; // 陈旧导航: 树状态不跟进 (先于任何 mutation)
-    const encoded = currentPathFromLocation();
-    if (encoded === null || !treeRootUl) return;
-    const segments = encoded === '' ? [] : encoded.split('/');
-    clearTreeCurrent();
-    revealPath(segments, gen).then(function () {
-      if (!paneNavGuard.isCurrent(gen)) return; // 过期: 树状态不跟进
-      clearTreeCurrent(); // reveal 期间可能被更早链路标记: 重标记当前链
-      const node = markTreePath(segments);
-      if (selectTree) {
+  // 显示规则变化: 目录/搜索内容依赖规则 → 重取; 文档正文绝不重转换.
+  function refreshPaneForRules() {
+    if (!pane) return;
+    if (state.kind === 'reading') return;
+    refreshPaneForState({ history: 'none' });
+  }
+
+  // 同步树状态到当前内容区目标: 展开路径链, 标记 current, 用户导航时选中跟随.
+  function syncTreeToState(select) {
+    if (!treeRootUl) return Promise.resolve();
+    const shellGen = treeGen;
+    const gen = treeContentGuard.begin();
+    const ownership = {
+      required: true,
+      current: function () {
+        return shellGen === treeGen && treeContentGuard.isCurrent(gen);
+      },
+    };
+    const target = currentPathFromState();
+    const chain = target === null ? Promise.resolve(null) : walkTreePath(target, ownership);
+    return chain.then(function () {
+      if (!ownership.current()) return;
+      clearTreeCurrent();
+      if (target !== null) {
+        markTreePath(target === '' ? [] : target.split('/'));
+      }
+      if (select) {
+        if (target === null) return; // 搜索上下文: 保留当前选中
+        const node = findVisibleTreeNode(state.path);
         if (node) {
-          selectTreeNode(node);
+          selectTreeNode(node, { silent: true });
         } else {
-          clearTreeSelection(); // 选中跟随 URL: 无匹配节点则清空, 不残留旧选中
+          clearTreeSelection({ silent: true });
         }
       }
     });
   }
-  function paneInitialLoad() {
-    const encoded = currentPathFromLocation();
-    if (encoded === null) return; // 非法路径: 保持完整页 (fail-closed)
-    // 规范化由 commitPane 的初始 generation replaceState 完成 (wrapper
-    // identity 为权威 canonical 形态, 含 hash 保留) — 此处不再自行 replaceState.
-    paneInitialGen = paneNavigate(encoded, { select: false });
-  }
-  // back/forward (popstate): URL 已由浏览器同步, 直接按当前 location 导航;
-  // 与最近提交路径相同 (hash 导航等) 不重取.
-  function onPopState() {
-    if (!treeMode || !pane) return;
-    // popstate 一律先作废在途导航 (含 abort): 任何历史回退都取代当前 pending;
-    // 目标已是最近提交内容时只作废不重取, 杜绝迟到 A 借 pushState 反提交.
-    paneNavGuard.invalidate();
-    if (paneAbort) {
-      paneAbort.abort();
-      paneAbort = null;
-    }
-    const encoded = currentPathFromLocation();
-    if (encoded === null || encoded === paneCommittedPath) return;
-    paneNavigate(encoded, { pop: true });
-  }
 
-  /* ---------- TOC scroll-spy (ticket 08) ---------- */
+  /* ---------- TOC scroll-spy ---------- */
 
   // TOC 容器: markdown/org 自渲染为 #TOC; #table-of-contents 为 pandoc 兼容形态.
   function tocNavIn(root) {
     return root.querySelector('#TOC, #table-of-contents');
   }
 
-  // 文档布局 (ticket 02): TOC 与正文是 .cb-doc 下的真实兄弟列. 幂等 — 已装过
-  // 直接返回现有 layout. 原 #TOC / #table-of-contents 节点被移动 (绝不克隆),
-  // 锚点 id / href / slug 契约不变. 无 TOC 文档返回 null, 不建 wrapper.
+  // 文档布局: TOC 与正文是 .cb-doc 下的真实兄弟列. 幂等 — 已装过直接返回现有
+  // layout. 原 #TOC / #table-of-contents 节点被移动 (绝不克隆), 锚点 id / href /
+  // slug 契约不变. 无 TOC 文档返回 null, 不建 wrapper.
   function installDocLayout(docEl) {
     if (!docEl) return null;
     const existing = docEl.querySelector(':scope > .cb-doc-layout');
@@ -2077,7 +2984,6 @@
   // 滚动容器为根 (pane). 返回 disposer (observer disconnect + scroll 监听移除),
   // 调用方决定注册进哪个生命周期; 窄屏 (无 rail) / 无收录标题返回 null.
   function installTocSpy(docEl, tocNav, rootEl) {
-    // 窄屏 (无 rail) 不启动 spy (ticket 08 契约)
     if (!window.matchMedia('(min-width: 75rem)').matches) return null;
     const links = Object.create(null);
     $$('a[href^="#"]', tocNav).forEach(function (a) {
@@ -2121,13 +3027,11 @@
       const line = rootHeight * 0.2;
       const last = targets[targets.length - 1];
       if (!rootScrollable()) {
-        // 短文档一屏放得下: 高亮首个标题 (阅读起点).
-        setCurrent(links[targets[0].id] || null);
+        setCurrent(links[targets[0].id] || null); // 短文档一屏放得下: 高亮首个标题
         return;
       }
       if (rootAtMaxScroll()) {
-        // 滚动到底: 末节即当前节 (末标题无法越过阅读线的底边场景).
-        setCurrent(links[last.id] || null);
+        setCurrent(links[last.id] || null); // 滚动到底: 末节即当前节
         return;
       }
       let best = null; // { anchor, top }
@@ -2141,8 +3045,6 @@
         best === null &&
         last.getBoundingClientRect().bottom - rootTop <= rootHeight
       ) {
-        // 可滚动但未到底, 且全部标题都在可视区内 (标题集中在文档开头):
-        // 高亮首个标题; 长文档未滚动到首个标题则无高亮.
         best = { anchor: targets[0], top: -1 };
       }
       setCurrent(best === null ? null : links[best.anchor.id] || null);
@@ -2155,7 +3057,6 @@
     targets.forEach(function (a) {
       observer.observe(a);
     });
-    // 滚动到底监听: 末标题不越过观察带时 (无 IO 过渡) 也能高亮末节
     const scrollRoot = rootEl || window;
     scrollRoot.addEventListener('scroll', compute, { passive: true });
     compute(); // 初始状态 (深链已滚动/短文档直接出结果)
@@ -2168,16 +3069,15 @@
   }
 
   let paneSpyDisposer = null;
-  // 断点感知 spy 控制器: 跨 75rem 时按当前模式重装正确根的 spy (设计门 P1);
-  // 窄屏恒无 spy (installTocSpy 的 matchMedia 门), 宽屏按模式各装各的.
+  // 断点感知 spy 控制器: 跨 75rem 时按当前模式重装正确根的 spy; 窄屏恒无 spy.
   function reinstallCurrentSpy() {
-    if (treeMode && pane) {
+    if (state.view === 'tree' && pane) {
       if (paneSpyDisposer) {
         paneSpyDisposer();
         paneSpyDisposer = null;
       }
-      const wrapper = pane.querySelector('.cb-doc');
-      if (wrapper) installPaneTocSpy(wrapper);
+      const docEl = pane.querySelector('.cb-doc');
+      if (docEl) installPaneTocSpy(docEl);
     } else if (document.body.classList.contains('cb-doc-page')) {
       if (fullPageSpyDisposer) {
         fullPageSpyDisposer();
@@ -2186,6 +3086,7 @@
       initFullPageTocSpy();
     }
   }
+
   function installTocSpyMql() {
     const mql = window.matchMedia('(min-width: 75rem)');
     const handler = function () {
@@ -2198,8 +3099,7 @@
     }
   }
 
-  // 完整页 spy (目录模式文档页): root = 视口, 页面生命周期. disposer 存入模块
-  // 变量, 进入树模式时断开 (原正文被 pane fragment 替换, 观察目标脱离 DOM).
+  // 完整页 spy (目录模式文档页): root = 视口, 页面生命周期.
   let fullPageSpyDisposer = null;
   function initFullPageTocSpy() {
     if (!document.body.classList.contains('cb-doc-page')) return;
@@ -2210,11 +3110,11 @@
     fullPageSpyDisposer = installTocSpy(docEl, tocNav, null);
   }
 
-  function installPaneTocSpy(wrapper) {
-    if (!pane) return;
-    const tocNav = tocNavIn(wrapper);
+  function installPaneTocSpy(docEl) {
+    if (!pane || !docEl) return;
+    const tocNav = tocNavIn(docEl);
     if (!tocNav) return; // 无 TOC fragment (代码/目录/媒体/占位): 不启用 spy
-    const disposer = installTocSpy(wrapper, tocNav, pane);
+    const disposer = installTocSpy(docEl, tocNav, pane);
     if (disposer) {
       paneSpyDisposer = disposer;
       const registeredDisposer = disposer;
@@ -2227,430 +3127,17 @@
     }
   }
 
-  function enterTreeMode() {
-    // 新壳开始: 递增使旧壳在途响应全部失效 (exit 已递增; 此处确保首入与连续
-    // 进出间的任何在途响应都追不上新壳), 进入链 generation 即此值.
-    treeGen += 1;
-    const enterGen = treeGen;
-    // 本壳树请求 (root/子项) 的取消信号: 先于 buildTreeShell 的根请求与
-    // reveal/persist 子项请求创建; 退出时 abort+置空 (在途以 AbortError 收尾).
-    treeAbort = new AbortController();
-    // 完整页 spy 观察原正文: pane fragment 替换后目标脱离 DOM — 先断开
-    if (fullPageSpyDisposer) {
-      fullPageSpyDisposer();
-      fullPageSpyDisposer = null;
-    }
-    closeTreeDrawer(); // 新壳抽屉默认收起 (宽屏 no-op)
-    document.body.classList.add('cb-tree-mode');
-    // 树宽: 恢复持久化偏好 (仅硬边界 [160,480] 截断, 解析失败/0 → 默认 238).
-    // 宽屏立即按偏好应用 (此时 resizer 未建, setTreeWidth 只写变量 — 建壳时按
-    // treeWidth 初始化 ARIA); 窄屏抽屉忽略宽度, 偏好原样保留, 跨回宽屏时由
-    // drawer media handler 重放.
-    treePreferredWidth = loadTreePreferredWidth();
-    if (!window.matchMedia(TREE_DRAWER_MQL).matches) {
-      setTreeWidth(treePreferredWidth, false);
-    }
-    // 折叠偏好: 仅 '1' 视为折叠 (缺省/损坏 → 展开). 先装 mql 再应用 — apply
-    // 以当前窄屏状态为准 (窄屏恒展开, 偏好保留到跨回宽屏重放).
-    treeCollapsePreferred = false;
-    try {
-      treeCollapsePreferred = localStorage.getItem(TREE_COLLAPSED_KEY) === '1';
-    } catch (err) {
-      /* 持久化读取失败: 默认展开 */
-    }
-    installTreeCollapseMql();
-    applyTreeCollapsed();
-    // 树壳焦点追踪: 跨断点过渡需要最近一次树壳焦点记录 (见 treeFocusKind),
-    // 随壳安装/卸载.
-    document.addEventListener('focusin', onTreeFocusIn, true);
-    document.addEventListener('pointerdown', onTreePointerDown, true);
-    // 宽屏视口 resize 重钳制: 宽度状态就绪后安装一次 (生效宽随 50vw 上限浮动)
-    installTreeViewportResizeHandler();
-    // 目录模式预览面板在树模式不存在: 关闭并作废在途预览 (媒体/迟到响应不得残留)
-    closePanel();
-    // Q17 能力边界: 树模式不仅门禁事件路径, 更清空 JS 内存中的 token 并移除
-    // 全部 native 控制 — 任何遗漏路径都无法再 POST. 退出树模式整页重载后
-    // 重新从服务端读取 token (进程级同一 token, 重载只是重新获得能力);
-    // 树模式的安全边界是清内存 + 删控制 + 事件门禁三重, 而非 token 轮换.
-    nativeToken = null;
-    const tokenMeta = document.querySelector('meta[name="cb-native-open-token"]');
-    if (tokenMeta) tokenMeta.remove();
-    $$('[data-cb-action="native"]').forEach(function (el) {
-      el.remove();
-    });
-    // 内容区: 包装当前完整页内容进 .cb-pane, 再 fetch 当前 URL 的 fragment
-    // 替换为统一 fragment 视图 (深链目录页显示迷你列表; 与外壳构建并行).
-    createPane();
-    paneInitialLoad();
-    buildTreeShell().then(function () {
-      // 旧进入链 (退出/重进后): 新壳已接管, 不得触碰新全局
-      if (enterGen !== treeGen) return;
-      // 启动期根 JSON 延迟时, 用户可能已通过 pane 迷你列表完成导航: 以最新
-      // 已提交导航为准重同步树状态 (启动链的旧 generation 标记/选中不覆盖).
-      if (
-        paneCommittedGen !== null &&
-        paneInitialGen !== null &&
-        paneCommittedGen !== paneInitialGen
-      ) {
-        syncTreeToPath(paneCommittedGen, true);
-        return;
-      }
-      const current = currentPathFromLocation();
-      const reveal = current !== null
-        ? revealPath(
-            current === '' ? [] : current.split('/'),
-            paneInitialGen
-          )
-        : Promise.resolve();
-      return reveal.then(function () {
-        // 先完成当前路径展开与持久化展开 (异步逐级加载), 再恢复选中 — 否则
-        // 深层节点尚不存在, 选中恢复必然落空.
-        if (enterGen !== treeGen) return;
-        const persisted = treeExpandedPaths.filter(isValidEncodedPath);
-        const walks = persisted.map(function (path) {
-          const segments = path.split('/');
-          // 前缀正向遍历: 先在当前层找首个 segment, 展开后携带前缀下钻,
-          // 绝不反向切片 (saved 'a/b' 必须先匹配 /a 再匹配 /a/b).
-          const walk = function (ul, segs, prefix) {
-            if (!ul || segs.length === 0) return Promise.resolve();
-            const stepHref = '/' + prefix.concat([segs[0]]).join('/');
-            const node = $$(':scope > li', ul).find(function (li) {
-              return (
-                isExpandableDir(li) &&
-                nodeHref(li) !== null &&
-                nodeHref(li).pathname === stepHref
-              );
-            });
-            if (!node) return Promise.resolve();
-            const nodePathV = encodedPathOf(node);
-            if (nodePathV === null) return Promise.resolve();
-            // 进入链所有权随加载传递: 退出/重进后旧链响应不得提交
-            return loadTreeChildren(node, nodePathV, { enterGen: enterGen }).then(function () {
-              // 旧进入链续接: 退出/重进后不得继续遍历新壳 DOM
-              if (enterGen !== treeGen) return Promise.resolve();
-              ensureTreeChildrenInstalled(node, nodePathV);
-              return walk(
-                node.querySelector(':scope > ul.cb-tree-children'),
-                segs.slice(1),
-                prefix.concat([segs[0]])
-              );
-            });
-          };
-          return walk(treeRootUl, segments, []);
-        });
-        return Promise.all(walks);
-      });
-    }).then(function () {
-      // 旧进入链 (退出/重进后): 不得恢复选中
-      if (enterGen !== treeGen) return;
-      // 启动链的选中恢复只属于初始导航 generation: 用户已导航走则不覆盖
-      if (paneInitialGen === null || paneNavGuard.isCurrent(paneInitialGen)) {
-        restoreTreeSelection();
-      }
-    });
-  }
-
-  function exitTreeMode() {
-    const hadPane = pane !== null;
-    treeGen += 1; // 使全部在途树响应失效 (旧壳 continuation 不得触碰新壳)
-    if (treeAbort) {
-      treeAbort.abort(); // 中止本壳在途树请求 (root/子项): AbortError 由失败
-      treeAbort = null; // 处理器静默吞掉, 绝不产生可见陈旧 alert/未处理拒绝
-    }
-    document.body.classList.remove('cb-tree-mode');
-    if (hadPane) {
-      paneNavGuard.invalidate(); // 在途 fragment 响应/错误不得安装状态
-      if (paneAbort) paneAbort.abort();
-      teardownPane(); // observer 拆除 + 媒体卸载
-      pane.remove();
-      pane = null;
-      paneCommittedPath = null;
-      paneCommittedGen = null;
-      paneInitialGen = null;
-    }
-    closeTreeDrawer();
-    uninstallDrawerMql();
-    uninstallTreeViewportResizeHandler();
-    uninstallTreeCollapseMql();
-    document.removeEventListener('focusin', onTreeFocusIn, true);
-    document.removeEventListener('pointerdown', onTreePointerDown, true);
-    treeFocusKind = null; // 焦点追踪随壳销毁, 不残留到下一次进入
-    document.body.classList.remove('cb-tree-collapsed');
-    // 在途拖拽手势先安全复位: 移除 resizer 会隐式释放捕获并触发
-    // lostpointercapture — owner 此刻已复位, 幂等收尾重入直接返回, 不重复清理.
-    if (treeResizePointerId !== null) {
-      treeResizePointerId = null;
-      document.body.classList.remove('cb-tree-resizing');
-    }
-    // 树宽调整器与 CSS 变量随壳销毁: 残留变量会污染再进入时的默认列 (变量
-    // 只在树模式被 JS 重新写入, 但避免 dir 宿主残留样式差异).
-    if (treeResizer) {
-      treeResizer.remove();
-      treeResizer = null;
-    }
-    treeCollapseBtn = null; // 折叠按钮在树壳顶栏内, 随壳销毁; 引用必须清空
-    document.body.style.removeProperty('--cb-tree-width');
-    document.body.classList.remove('cb-tree-resizing');
-    if (treeScrim) treeScrim.remove();
-    treeScrim = null;
-    if (treeOpenBtn) treeOpenBtn.remove();
-    treeOpenBtn = null;
-    if (treeRestoreBtn) treeRestoreBtn.remove();
-    treeRestoreBtn = null;
-    // 模式切换按钮跨模式复用: 树壳销毁 (treeNav.remove) 前必须迁回目录工具
-    // 栏行 — append 移动节点, 按钮随树壳销毁即永久丢失.
-    if (modeToggleBtn && modeToolbar) {
-      modeToolbar.append(modeToggleBtn);
-    }
-    if (treeNav) treeNav.remove();
-    treeNav = null;
-    treeRootUl = null;
-    treeCache.clear();
-    treePendingLoads.clear(); // 在途加载与意图随壳销毁 (旧壳响应已由 treeGen 作废)
-    treeExpansionIntents.clear(); // 意图记录随壳销毁 (版本计数保留: 跨壳单调)
-    clearTreeSelection();
-    // SPA 期间 pane 内容已被 fragment 替换: 离开树模式重载当前 URL 恢复完整页.
-    // 仅在真实离开树模式时 (init 时 treeMode 为 false 则 pane 不存在, 不重载).
-    if (hadPane) location.reload();
-  }
-
-  function applyTreeMode() {
-    const btn = $('.cb-mode-toggle');
-    if (btn) {
-      btn.textContent = treeMode ? '目录' : '树';
-      btn.setAttribute('aria-pressed', treeMode ? 'true' : 'false');
-      btn.title = treeMode ? '切换到目录模式' : '切换到树模式';
-    }
-    if (treeMode) {
-      enterTreeMode();
-    } else {
-      exitTreeMode();
-    }
-    // 树模式隐藏目录工具栏行 (搜索随树内搜索让位); 退出恢复 (按钮已迁回).
-    if (modeToolbar) {
-      modeToolbar.hidden = treeMode;
-    }
-  }
-
-  // 目录模式左缘工具栏行: 搜索表单 + 模式切换按钮 (仅树能力页; 搜索页绝不
-  // 创建 — 顶栏搜索表单保持原位). 目录页把顶栏搜索表单移动 (非克隆) 进本行;
-  // 文档页无顶栏表单, 复用树搜索结构 (独立 id, 与树内搜索不撞). 树模式隐藏
-  // 本行, 按钮移入树顶栏; 退出恢复.
-  function buildModeToolbar() {
-    if (!isTreeCapablePage() || $('.cb-mode-toolbar')) return;
-    const toolbar = document.createElement('div');
-    toolbar.className = 'cb-mode-toolbar';
-    const topbarSearch = document.querySelector('header.cb-topbar form.cb-search');
-    if (topbarSearch) {
-      toolbar.append(topbarSearch);
-    } else {
-      toolbar.append(treeSearchForm('cb-mode-search-q'));
-    }
-    modeToggleBtn = document.createElement('button');
-    modeToggleBtn.type = 'button';
-    modeToggleBtn.className = 'cb-mode-toggle';
-    modeToggleBtn.addEventListener('click', function () {
-      treeMode = !treeMode;
-      try {
-        if (treeMode) {
-          localStorage.setItem(MODE_KEY, 'tree');
-        } else {
-          localStorage.removeItem(MODE_KEY);
-        }
-      } catch (err) {
-        /* 持久化失败忽略 */
-      }
-      applyTreeMode();
-    });
-    toolbar.append(modeToggleBtn);
-    modeToolbar = toolbar;
-    document.body.prepend(toolbar);
-  }
-
-  // 树键范围纯函数 (DOM 无关 seam): 返回 'escape-search' | 'focus-search' |
-  // 'tree' | null.
-  // - Escape 只在搜索框聚焦 (blur/收抽屉) 或树根聚焦 (清选中/收抽屉) 时处理,
-  //   其余焦点一律放行原生;
-  // - '/' 是刻意全局快捷: 非可编辑/交互即聚焦树搜索; 搜索框内 (可编辑) 原样
-  //   输入 '/' 字符;
-  // - Arrow/Enter/Backspace/Page 仅树根聚焦时属于树: pane/链接/按钮/切换/
-  //   body 聚焦一律 null — 不阻断原生滚动/激活;
-  // - 可编辑守卫晚于 Escape (搜索框聚焦的 Escape 优先), 早于 '/' 与导航键.
-  function treeKeyScope(key, editable, rootFocused, searchFocused) {
-    if (key === 'Escape') {
-      if (searchFocused) return 'escape-search';
-      if (rootFocused) return 'tree';
-      return null;
-    }
-    if (editable) return null;
-    if (key === '/') return 'focus-search';
-    if (
-      key === 'ArrowUp' ||
-      key === 'ArrowDown' ||
-      key === 'ArrowLeft' ||
-      key === 'ArrowRight' ||
-      key === 'Enter' ||
-      key === 'Backspace' ||
-      key === 'PageUp' ||
-      key === 'PageDown'
-    ) {
-      return rootFocused ? 'tree' : null;
-    }
-    return null;
-  }
-
-  function onTreeKeydown(event) {
-    if (event.ctrlKey || event.metaKey || event.altKey) return;
-    // 分隔器按键由 resizer 自行处理并阻断冒泡; 分隔器子控件的按键同样不得落入
-    // 全局树键 (defaultPrevented 兜底).
-    if (event.defaultPrevented || event.target.closest('.cb-tree-resizer')) return;
-    // 恢复按钮 (body 直系子级, 不在 resizer 内): Enter/Space 只触发恢复, 不得
-    // 落入全局树键; 折叠按钮在树壳顶栏内, 其按键经 treeKeyScope 决策 (焦点不在
-    // 树根/搜索框时返回 null, 原生 click 照常触发折叠).
-    if (event.target.closest('.cb-tree-restore')) return;
-    const searchInput = $('#cb-tree-search-q');
-    const scope = treeKeyScope(
-      event.key,
-      isEditableTarget(event.target),
-      !!treeRootUl && document.activeElement === treeRootUl,
-      document.activeElement === searchInput
-    );
-    if (scope === null) return; // 非树范围按键: 不取消默认, 放行原生行为
-    if (scope === 'escape-search') {
-      // 窄屏抽屉: 先收抽屉 (closeTreeDrawer 把焦点归还唤起按钮), 再失焦 —
-      // 顺序颠倒会让 blur 先把焦点丢给 body, 抽屉关闭后的焦点归还落空;
-      // 宽屏 (抽屉未开) 仅失焦.
-      if (document.body.classList.contains('cb-drawer-open')) {
-        closeTreeDrawer();
-      }
-      if (searchInput && document.activeElement === searchInput) {
-        searchInput.blur();
-      }
-      event.preventDefault();
-      return;
-    }
-    if (scope === 'focus-search') {
-      if (searchInput) searchInput.focus();
-      event.preventDefault();
-      return;
-    }
-    // scope === 'tree': Escape 清选中并收抽屉; 其余为树导航键 (rootFocused
-    // 已由 helper 保证)
-    if (event.key === 'Escape') {
-      clearTreeSelection();
-      closeTreeDrawer();
-      event.preventDefault();
-      return;
-    }
-    switch (event.key) {
-      case 'PageUp':
-        // Page 滚动只响应聚焦的树根: 根 ul 存在且为事件目标或活动元素; 焦点在
-        // pane/链接/切换按钮/body 时放行原生滚动 (不滚动树列、不阻断默认).
-        if (
-          treeRootUl &&
-          (event.target === treeRootUl || document.activeElement === treeRootUl)
-        ) {
-          if (treeNav) {
-            treeNav.scrollBy({ top: -Math.round(treeNav.clientHeight * 0.8) });
-          }
-          event.preventDefault();
-        }
-        break;
-      case 'PageDown':
-        if (
-          treeRootUl &&
-          (event.target === treeRootUl || document.activeElement === treeRootUl)
-        ) {
-          if (treeNav) {
-            treeNav.scrollBy({ top: Math.round(treeNav.clientHeight * 0.8) });
-          }
-          event.preventDefault();
-        }
-        break;
-      case 'ArrowDown':
-        moveTreeSelection(1);
-        event.preventDefault();
-        break;
-      case 'ArrowUp':
-        moveTreeSelection(-1);
-        event.preventDefault();
-        break;
-      case 'ArrowRight':
-        // → 只展开 (契约: → 展开 / ← 收起); 已展开则 no-op. 显式激活发布显式
-        // 展开意图 (覆盖既有收起意图 — 最新用户动作权威, 版本化), 在途响应
-        // 终态跟随最新记录.
-        if (treeSelectedEl && isExpandableDir(treeSelectedEl)) {
-          const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
-          if (!ul || ul.hidden) {
-            const path = encodedPathOf(treeSelectedEl);
-            if (path !== null) {
-              publishTreeExpansionIntent(path, true, true);
-              loadTreeChildren(treeSelectedEl, path);
-            }
-          }
-          event.preventDefault();
-        }
-        break;
-      case 'ArrowLeft': {
-        if (treeSelectedEl) {
-          const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
-          if (isDirNode(treeSelectedEl) && ul && !ul.hidden) {
-            // 可见 ul 即已加载 (无在途): 直接改 DOM, 意图无消费方, 不留残留
-            // (陈旧意图会挡住后续 reveal 的缓存命中展开).
-            setTreeNodeExpanded(treeSelectedEl, false);
-          } else {
-            const row = treeSelectedEl.closest('ul');
-            const parentLi = row ? row.closest('li') : null;
-            if (parentLi) selectTreeNode(parentLi);
-          }
-          event.preventDefault();
-        }
-        break;
-      }
-      case 'Enter':
-        if (treeSelectedEl) {
-          navigateTreeNode(treeSelectedEl);
-          event.preventDefault();
-        }
-        break;
-      case 'Backspace': {
-        const current = currentPathFromLocation();
-        if (current !== null && current !== '') {
-          const segments = current.split('/');
-          const parent = segments.slice(0, -1).join('/');
-          if (pane) {
-            paneNavigate(parent);
-          } else {
-            location.href = '/' + parent;
-          }
-        }
-        event.preventDefault();
-        break;
-      }
-      default:
-        break;
-    }
-  }
-
   /* ---------- Mermaid 图表渲染 (懒加载; 事务式 render; 失败保留源码) ---------- */
 
   // 服务端把 md fence ```mermaid 与 org #+begin_src mermaid 渲染为
   // <pre class="mermaid">转义源码</pre> (textContent 即原始图源码)。
   // 这里发现容器才懒加载 mermaid.min.js (3.5MB, 全站只请求一次), 渲染为 SVG。
   // 降级约定 (与 math.rs 一致): 库加载失败/图语法错误 → 保留原始源码显示。
-
-  // 元素 → 原始图源码. WeakMap: 预览/树导航替换 fragment 后旧节点随 GC 释放.
-  const mermaidSources = new WeakMap();
-  // 元素 → 渲染票号 (单调递增): 主题切换/重复扫描并发时, 只有最新一次
-  // 渲染允许提交, 杜绝迟到的旧主题/旧结果覆盖新结果.
-  const mermaidTickets = new WeakMap();
+  const mermaidSources = new WeakMap(); // 元素 → 原始图源码
+  const mermaidTickets = new WeakMap(); // 元素 → 渲染票号 (单调递增)
   let mermaidLoading = null; // 加载 Promise 缓存; 失败复位以允许下次重试
   let mermaidSeq = 0; // mermaid.render 要求的唯一 id 序列
 
-  // 主题色板真源在 CSS 变量 (chapbook-doc.css :root --cb-*; 目录页另有
-  // chapbook-theme.css 同名同值双份), 亮暗随 prefers-color-scheme 翻转.
-  // 每次渲染/重渲现场读取 computed 值, 杜绝 CSS 与 JS 两份色表漂移;
-  // 变量空值 → 省略该键, 交回 base 预设派生.
   function mermaidConfig(el) {
     const style = window.getComputedStyle(document.documentElement);
     const dark =
@@ -2660,7 +3147,6 @@
       const v = style.getPropertyValue(name).trim();
       return v || undefined;
     }
-    // 字体族: 图所在 .cb-doc (doc.css 的正文栈), 无则任意 .cb-doc, 最后 document.body.
     const host =
       (el && el.closest && el.closest('.cb-doc')) ||
       document.querySelector('.cb-doc') ||
@@ -2668,7 +3154,6 @@
     const fontFamily = window.getComputedStyle(host).fontFamily;
     const themeVariables = {
       // darkMode 必须在 themeVariables 内: theme-base 读 overrides.darkMode
-      // 计算派生色, 顶层 MermaidConfig.darkMode 不传入主题计算 (DesignGate).
       darkMode: !!dark,
       background: cbVar('--cb-bg'),
       primaryColor: cbVar('--cb-soft-bg'),
@@ -2682,7 +3167,7 @@
       startOnLoad: false, // 手动驱动; 库是懒加载的, load 事件早已过去
       securityLevel: 'strict', // 文件可来自局域网分享: 禁 click/HTML label
       suppressErrorRendering: true, // 错误图由 catch 分支的源码回退取代
-      theme: 'base', // 官方自定义打底预设; 站点色板全靠上方 themeVariables (源自 CSS)
+      theme: 'base', // 官方自定义打底预设; 站点色板全靠 themeVariables (源自 CSS)
       themeVariables: themeVariables,
     };
   }
@@ -2771,42 +3256,557 @@
     });
   }
 
-  function init() {
-    const tokenMeta = document.querySelector(
-      'meta[name="cb-native-open-token"]'
+  /* ---------- 键盘 ---------- */
+
+  function isEditableTarget(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    return (
+      tag === 'INPUT' ||
+      tag === 'TEXTAREA' ||
+      tag === 'SELECT' ||
+      el.isContentEditable
     );
-    nativeToken = tokenMeta ? tokenMeta.getAttribute('content') : null;
-    buildModeToolbar();
-    // 完整页 spy 先于 applyTreeMode: 树模式启动时 enterTreeMode 立即断开它
-    // (原正文将被 pane fragment 替换), 避免残留观察已脱离 DOM 的标题.
-    initFullPageTocSpy();
-    installTocSpyMql(); // 断点感知 spy 控制器 (跨 75rem 重装, 页面生命周期)
-    renderMermaidIn(document); // 完整页 (文档/代码页) 首屏 mermaid 扫描
+  }
+
+  function topbarSearchInput() {
+    return $('#cb-search-q');
+  }
+
+  // 树键范围纯函数 (DOM 无关 seam): 返回 'escape-search' | 'focus-search' |
+  // 'tree' | null.
+  function treeKeyScope(key, editable, rootFocused, searchFocused) {
+    if (key === 'Escape') {
+      if (searchFocused) return 'escape-search';
+      if (rootFocused) return 'tree';
+      return null;
+    }
+    if (editable) return null;
+    if (key === '/') return 'focus-search';
+    if (
+      key === 'ArrowUp' ||
+      key === 'ArrowDown' ||
+      key === 'ArrowLeft' ||
+      key === 'ArrowRight' ||
+      key === 'Enter' ||
+      key === 'Backspace' ||
+      key === 'PageUp' ||
+      key === 'PageDown'
+    ) {
+      return rootFocused ? 'tree' : null;
+    }
+    return null;
+  }
+
+  function onTreeKeydown(event) {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    // 分隔器按键由 resizer 自行处理并阻断冒泡; 分隔器子控件的按键同样不得落入
+    // 全局树键 (defaultPrevented 兜底).
+    if (event.defaultPrevented || event.target.closest('.cb-tree-resizer')) return;
+    if (event.target.closest('.cb-tree-restore')) return;
+    const searchInput = topbarSearchInput();
+    const scope = treeKeyScope(
+      event.key,
+      isEditableTarget(event.target),
+      !!treeRootUl && document.activeElement === treeRootUl,
+      !!searchInput && document.activeElement === searchInput
+    );
+    if (scope === null) return; // 非树范围按键: 不取消默认, 放行原生行为
+    if (scope === 'escape-search') {
+      if (document.body.classList.contains('cb-drawer-open')) {
+        closeTreeDrawer();
+      }
+      if (searchInput && document.activeElement === searchInput) {
+        searchInput.blur();
+      }
+      event.preventDefault();
+      return;
+    }
+    if (scope === 'focus-search') {
+      if (searchInput) searchInput.focus();
+      event.preventDefault();
+      return;
+    }
+    if (event.key === 'Escape') {
+      clearTreeSelection();
+      closeTreeDrawer();
+      event.preventDefault();
+      return;
+    }
+    switch (event.key) {
+      case 'PageUp':
+        if (
+          treeRootUl &&
+          (event.target === treeRootUl || document.activeElement === treeRootUl)
+        ) {
+          if (treeShell) {
+            treeShell.scrollBy({ top: -Math.round(treeShell.clientHeight * 0.8) });
+          }
+          event.preventDefault();
+        }
+        break;
+      case 'PageDown':
+        if (
+          treeRootUl &&
+          (event.target === treeRootUl || document.activeElement === treeRootUl)
+        ) {
+          if (treeShell) {
+            treeShell.scrollBy({ top: Math.round(treeShell.clientHeight * 0.8) });
+          }
+          event.preventDefault();
+        }
+        break;
+      case 'ArrowDown':
+        moveTreeSelection(1);
+        event.preventDefault();
+        break;
+      case 'ArrowUp':
+        moveTreeSelection(-1);
+        event.preventDefault();
+        break;
+      case 'ArrowRight':
+        // → 只展开 (契约: → 展开 / ← 收起); 已展开则 no-op.
+        if (treeSelectedEl && isExpandableDir(treeSelectedEl)) {
+          const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
+          if (!ul || ul.hidden) {
+            const path = encodedPathOf(treeSelectedEl);
+            if (path !== null) {
+              if (treeSelectedEl.getAttribute('data-cb-branch-state') === 'error') {
+                treeBranchCache.delete(path);
+              }
+              treeExpandIntent.set(path, true);
+              setTreeNodeExpanded(treeSelectedEl, true, true);
+              loadTreeBranch(treeSelectedEl, path, null);
+            }
+          }
+          event.preventDefault();
+        }
+        break;
+      case 'ArrowLeft': {
+        if (treeSelectedEl) {
+          const ul = treeSelectedEl.querySelector(':scope > ul.cb-tree-children');
+          if (isDirNode(treeSelectedEl) && ul && !ul.hidden) {
+            setTreeNodeExpanded(treeSelectedEl, false, true);
+          } else {
+            const parentUl = treeSelectedEl.parentElement;
+            const parentLi = parentUl ? parentUl.closest('li.cb-tree-node') : null;
+            if (parentLi) selectTreeNode(parentLi);
+          }
+          event.preventDefault();
+        }
+        break;
+      }
+      case 'Enter':
+        if (treeSelectedEl) {
+          navigateTreeNode(treeSelectedEl);
+          event.preventDefault();
+        }
+        break;
+      case 'Backspace': {
+        const current = currentPathFromState();
+        if (current !== null && current !== '') {
+          const parent = parentEncodedPath(current);
+          if (parent !== null) {
+            paneNavigate({ kind: 'directory', path: parent, history: 'push' });
+          }
+        }
+        event.preventDefault();
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  function onKeydown(event) {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    // v 键: 浏览视图内循环 list→grid→tree→list; 输入框/可编辑区/修饰键不触发.
+    if (event.key === 'v' && !isEditableTarget(event.target) && isBrowseView()) {
+      event.preventDefault();
+      switchToView(nextBrowseView(state.view), { user: true });
+      return;
+    }
+    if (state.view === 'tree' && treeShell) {
+      onTreeKeydown(event);
+      return;
+    }
+    // 面板打开时关闭; handled 时在返回前恰好一次 preventDefault, 未处理不取消;
+    // 其余快捷键在可编辑元素内仍被忽略。
+    if (event.key === 'Escape') {
+      const input = topbarSearchInput();
+      const action = escapeAction(
+        document.activeElement === input,
+        panel() ? !panel().hidden : false
+      );
+      if (action === null) return; // 未处理: 不取消默认行为
+      event.preventDefault(); // handled: 恰好一次, 先于任何动作
+      if (action === 'blur-search') {
+        input.blur();
+      } else if (action === 'close-panel') {
+        closePanel();
+      }
+      return;
+    }
+    if (isEditableTarget(event.target)) return;
+    // Enter 在聚焦的链接/按钮/summary 上必须走原生激活 (文件名、排序与工具栏的
+    // 键盘可达性契约), 全局 Enter 只服务于无交互焦点时的选中行打开.
+    if (event.key === 'Enter' && event.target.closest('a, button, summary')) return;
+    switch (event.key) {
+      case 'j':
+      case 'ArrowDown':
+        moveSelection(1);
+        event.preventDefault();
+        break;
+      case 'k':
+      case 'ArrowUp':
+        moveSelection(-1);
+        event.preventDefault();
+        break;
+      case 'Enter': {
+        const target = selectedTarget();
+        if (target !== null) location.href = browseActionUrl(target, 'full').href;
+        event.preventDefault();
+        break;
+      }
+      case 'o': {
+        const target = selectedTarget();
+        if (target !== null) {
+          window.open(browseActionUrl(target, 'full').href, '_blank', 'noopener');
+        }
+        event.preventDefault();
+        break;
+      }
+      case 'p':
+        togglePreview();
+        event.preventDefault();
+        break;
+      case 'Backspace': {
+        const parent = $('[data-cb-parent]');
+        if (parent) location.href = parent.getAttribute('href');
+        event.preventDefault();
+        break;
+      }
+      case '/': {
+        const input = topbarSearchInput();
+        if (input) input.focus();
+        event.preventDefault();
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  /* ---------- 指针/文档事件 ---------- */
+
+  function onDocumentClick(event) {
+    const target = event.target;
+    // 顶部工具区: 视图组 / 隐藏开关 / 排序 (同一状态流程, 无第二份偏好)
+    const viewBtn = target.closest('[data-cb-view]');
+    if (viewBtn) {
+      event.preventDefault();
+      switchToView(viewBtn.getAttribute('data-cb-view'), { user: true });
+      return;
+    }
+    const hiddenBtn = target.closest('[data-cb-hidden-toggle]');
+    if (hiddenBtn) {
+      event.preventDefault();
+      if (isBrowseView()) applyRulesChange({ hidden: !state.rules.hidden });
+      return;
+    }
+    const sortLink = target.closest('a[data-cb-sort]');
+    if (sortLink) {
+      event.preventDefault();
+      const value = sortLink.getAttribute('data-cb-sort');
+      if (isValidSort(value) && isBrowseView()) applyRulesChange({ sort: value });
+      const details = sortLink.closest('details');
+      if (details) details.open = false;
+      return;
+    }
+    const actionBtn = target.closest(ACTION_SELECTOR);
+    if (actionBtn) {
+      handleAction(event, actionBtn);
+      return;
+    }
+    // 树节点: 单击打开 — 目录展开/收起, 文件 SPA 导航; 双击连击 (detail > 1)
+    // 不产生第二次动作.
+    const treeRow = target.closest('.cb-tree-row');
+    if (treeRow) {
+      if (event.detail > 1) return;
+      const li = treeRow.closest('li.cb-tree-node');
+      if (!li) return;
+      focusTreeRootUl(); // 先落焦点: active-descendant 公告 + 键盘可立即接管
+      selectTreeNode(li);
+      if (isDirNode(li)) toggleTreeNode(li); else navigateTreeNode(li);
+      closeTreeDrawer(); return; // 窄屏抽屉: 选择条目后收起 (宽屏 no-op)
+    }
+    // 内容区/面板内目录迷你列表: 拦截可操作 anchor.
+    const miniLink = target.closest('.cb-dir-mini a[data-native-path-encoded]');
+    if (miniLink) {
+      if (event.detail > 1) return;
+      event.preventDefault();
+      const path = encodedPathOf(miniLink);
+      if (path === null || path === '') return;
+      const li = miniLink.closest('li');
+      const kind = li ? li.dataset.kind : null;
+      if (kind === 'file' && isPdfFile(path, 'file')) {
+        window.open(browseActionUrl(path, 'full').href, '_blank', 'noopener');
+        return;
+      }
+      if (pane && pane.contains(miniLink)) {
+        paneNavigate({
+          kind: kind === 'dir' ? 'directory' : 'reading',
+          path: path,
+          history: 'push',
+        });
+        return;
+      }
+      if (panelContent() && panelContent().contains(miniLink)) {
+        openPreview(path, kind);
+        return;
+      }
+      location.href = browseActionUrl(path, 'full').href;
+      return;
+    }
+    // 内容区搜索片段结果行: 打开条目 = 离开当前搜索上下文 (实际导航).
+    const searchRow = target.closest('.cb-search-fragment [data-browser-entry]');
+    if (searchRow) {
+      if (event.detail > 1) return;
+      const path = encodedPathOf(searchRow);
+      if (path === null || path === '') return;
+      event.preventDefault();
+      const kind = entryKindOf(searchRow);
+      if (kind === 'file' && isPdfFile(path, 'file')) {
+        window.open(browseActionUrl(path, 'full').href, '_blank', 'noopener');
+        return;
+      }
+      if (pane && pane.contains(searchRow)) {
+        paneNavigate({
+          kind: kind === 'dir' ? 'directory' : 'reading',
+          path: path,
+          history: 'push',
+        });
+        return;
+      }
+      location.href = browseActionUrl(path, 'full').href;
+      return;
+    }
+    // 非链接点击: 选中行 (文件名 anchor 保持原生行为)
+    const entry = target.closest(ENTRY_SELECTOR);
+    if (entry && !target.closest('a')) {
+      selectEntry(entry);
+    }
+  }
+
+  function onDocumentDblclick(event) {
+    // 双击落在任何 action/button/control/link 上绝不触发行 Full 导航.
+    if (
+      event.target.closest('a, button, input, select, textarea, [data-cb-action]')
+    ) {
+      return;
+    }
+    // 树节点双击: 单击已打开, 双击必须无第二次动作.
+    if (event.target.closest('.cb-tree-row')) {
+      event.preventDefault();
+      return;
+    }
+    const entry = event.target.closest(ENTRY_SELECTOR);
+    if (entry) {
+      const target = encodedPathOf(entry);
+      if (target !== null && target !== '') location.href = browseActionUrl(target, 'full').href;
+    }
+  }
+
+  /* ---------- 历史/生命周期 ---------- */
+
+  // 活内存状态是否已对应该快照目标 (BFCache 恢复/锚点导航等幂等场景).
+  function snapshotMatchesState(snapshot) {
+    if (snapshot.surface !== state.kind || snapshot.view !== state.view) return false;
+    if (snapshot.surface === 'search') return (snapshot.q || '') === (state.q || '');
+    return (
+      canonicalTransportKey(snapshot.path) === canonicalTransportKey(state.path)
+    );
+  }
+
+  // back/forward: managed 快照优先按项恢复 (不重读偏好). 跨文档 BFCache 恢复与
+  // 同文档 SPA 项都会触发 popstate: 活 DOM 已匹配目标时绝不重载/重取; 只有
+  // 当前文档确实无法代表目标表面时才整页恢复.
+  function onPopState() {
+    if (!initialized) return;
+    const snapshot = readSnapshot();
+    if (snapshot && snapshotMatchesLocation(snapshot)) {
+      const alreadyCurrent = snapshotMatchesState(snapshot);
+      applySnapshot(snapshot);
+      syncControlState();
+      // 活 DOM 已对应该项 (跨文档 BFCache 恢复 / 锚点导航): 零 DOM 变更、零重取
+      // (树壳缺失时才重建, 属防御).
+      if (alreadyCurrent) {
+        if (state.view === 'tree' && !treeShell) ensureTreeShell();
+        return;
+      }
+      if (state.view === 'tree') {
+        ensureTreeShell(); // 同文档 SPA 项: 树壳保持, 按快照目标重同步
+        return;
+      }
+      location.reload(); // 目标表面非树壳且活 DOM 不匹配: 整页加载按快照恢复
+      return;
+    }
+    if (isSearchLocation()) {
+      const q = urlParams().get('q') || '';
+      if (state.kind !== 'search' || q !== (state.q || '')) location.reload();
+      return;
+    }
+    const urlPath = locationEncodedPath();
+    if (urlPath === null) {
+      location.reload();
+      return;
+    }
+    if (urlPath !== state.path) location.reload();
+    // hash-only 导航: 保留现状 (既有锚点规则: 不重取).
+  }
+
+  // BFCache 恢复: 按当前历史项快照幂等重放 (不重读偏好, 已安装内容不重取).
+  function onPageShow(event) {
+    if (!initialized || !event.persisted) return;
+    const snapshot = readSnapshot();
+    if (!snapshot || !snapshotMatchesLocation(snapshot)) return;
+    const alreadyCurrent = snapshotMatchesState(snapshot);
+    applySnapshot(snapshot);
+    syncControlState();
+    // BFCache 恢复: DOM 已冻结为该项状态 → 幂等重放, 不重取、不重读偏好.
+    if (alreadyCurrent) {
+      if (state.view === 'tree' && !treeShell) ensureTreeShell();
+      return;
+    }
+    if (state.view === 'tree') {
+      ensureTreeShell();
+      return;
+    }
+    if (state.view === 'list' || state.view === 'grid') {
+      applyViewContainers();
+      applyEntrySelection({ silent: true });
+    }
+  }
+
+  /* ---------- 启动 ---------- */
+
+  function installListeners() {
+    document.addEventListener('click', onDocumentClick);
+    document.addEventListener('dblclick', onDocumentDblclick);
+    document.addEventListener('keydown', onKeydown);
+    window.addEventListener('popstate', onPopState);
+    window.addEventListener('pageshow', onPageShow);
     if (window.matchMedia) {
       window
         .matchMedia('(prefers-color-scheme: dark)')
         .addEventListener('change', rethemeMermaids);
     }
-    if (isTreeCapablePage()) {
-      try {
-        treeMode = localStorage.getItem(MODE_KEY) === 'tree';
-      } catch (err) {
-        treeMode = false;
-      }
-      applyTreeMode();
+    installTocSpyMql();
+    const topbar = $('header.cb-topbar');
+    if (topbar) {
+      // 普通流中的共享工具区保持可达; 预览与抽屉从其下方开始, 跟随窄屏换行.
+      const updateTopbarBounds = function () {
+        document.body.style.setProperty(
+          '--cb-topbar-bottom',
+          topbar.offsetTop + topbar.offsetHeight + 'px'
+        );
+      };
+      new ResizeObserver(updateTopbarBounds).observe(topbar);
+      updateTopbarBounds();
     }
-    applyView();
-    setActionsEnabled(false); // 初始无 panel target
-    document.addEventListener('click', onDocumentClick);
-    document.addEventListener('dblclick', onDocumentDblclick);
-    document.addEventListener('keydown', onKeydown);
-    window.addEventListener('popstate', onPopState);
-    $$('[data-cb-view]').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        view = btn.getAttribute('data-cb-view');
-        applyView();
-      });
-    });
+  }
+
+  function init() {
+    if (initialized) return;
+    const tokenMeta = document.querySelector('meta[name="cb-native-open-token"]');
+    nativeToken = tokenMeta ? tokenMeta.getAttribute('content') : null;
+    // 内容特性 (TOC/公式图表) 与浏览增强独立: 无显式页面语义时只保留内容特性.
+    initFullPageTocSpy();
+    renderMermaidIn(document);
+    const surface = bodySurface();
+    if (surface === null) {
+      initialized = true;
+      installListeners();
+      return;
+    }
+    const pagePath = encodedPathOf(document.body);
+    if (pagePath === null) {
+      // 完整页缺少规范 identity 时 fail-closed, 不从 location 或可见标题猜 action.
+      initialized = true;
+      installListeners();
+      return;
+    }
+    // 1) 有效状态: managed 快照优先 (reload/popstate/BFCache 按该项恢复);
+    //    否则显式 URL > 保存偏好 > 默认.
+    const snapshot = readSnapshot();
+    const useSnapshot = !!(snapshot && snapshotMatchesLocation(snapshot));
+    bootSnapshot = useSnapshot;
+    if (useSnapshot) {
+      applySnapshot(snapshot);
+    } else {
+      const explicit = explicitUrlRules();
+      state.kind = surface;
+      state.path = pagePath;
+      state.q = surface === 'search' ? urlParams().get('q') || '' : null;
+      state.rules.sort = explicit.sort !== null ? explicit.sort : loadSortPref();
+      state.rules.hidden = explicit.hidden !== null ? explicit.hidden : loadHiddenPref();
+      state.view = surface === 'reading' ? null : loadViewPref();
+      state.opened = null;
+      state.openedKind = null;
+      state.selected = null;
+    }
+    // 2) 服务器渲染内容与有效规则不一致 (URL 未显式携带、偏好覆盖默认):
+    //    浏览布局整页重取一次对齐内容 (同位置 replace, 不写偏好, 不新增历史).
+    const bodySort = document.body.dataset.cbSort;
+    const bodyHidden = document.body.dataset.cbHidden;
+    const rulesMismatch =
+      (isValidSort(bodySort) && bodySort !== state.rules.sort) ||
+      (isValidHidden(bodyHidden) && (bodyHidden === '1') !== state.rules.hidden);
+    if (rulesMismatch && (state.view === 'list' || state.view === 'grid')) {
+      initialized = true;
+      replaceCurrentEntry(currentEntryUrlWithRules());
+      location.reload();
+      return;
+    }
+    // 3) 初始化规范化 (先于消费快照之后的 DOM 应用): 浏览页 URL 显式携带有效
+    //    规则与快照; 独立阅读页 URL 不变只补写快照.
+    if (surface === 'reading') {
+      if (!useSnapshot || rulesMismatch) replaceCurrentEntry();
+    } else {
+      const params = urlParams();
+      const canonical =
+        params.get('sort') === state.rules.sort &&
+        params.get('hidden') === (state.rules.hidden ? '1' : '0') &&
+        (surface !== 'search' || params.get('q') === (state.q || ''));
+      if (!canonical || !useSnapshot || rulesMismatch) {
+        replaceCurrentEntry(currentEntryUrlWithRules());
+      }
+    }
+    // 4) 应用视图与控件.
+    if (state.view === 'tree') {
+      ensureTreeShell(!useSnapshot);
+    } else if (state.view === 'list' || state.view === 'grid') {
+      syncControlState();
+      applyViewContainers();
+      applyEntrySelection({ silent: true });
+      restoreOpenedPanel();
+    } else {
+      syncControlState();
+    }
+    initialized = true;
+    installListeners();
+  }
+
+  // 恢复已打开条目 (reload/popstate/BFCache): 不打开回退项; PDF 不自动新 tab.
+  function restoreOpenedPanel() {
+    const opened = state.opened;
+    if (opened === null || opened === '' || !isValidEncodedPath(opened)) return;
+    const entry = findEntryByIdentity(opened);
+    const domKind = entry ? entryKindOf(entry) : null;
+    const kind = domKind !== null ? domKind : state.openedKind === 'directory' ? 'dir' : 'file';
+    // 目录名 *.pdf 不是 PDF: kind 双条件保证 (DOM kind=dir 从不匹配).
+    if (isPdfFile(opened, kind)) return;
+    openPreview(opened, kind, { silent: true });
   }
 
   if (typeof document !== 'undefined') {
@@ -2831,10 +3831,16 @@
       ownsTreeResize: ownsTreeResize,
       collapseFocusTarget: collapseFocusTarget,
       treeKeyScope: treeKeyScope,
-      treeNextExplicitIntent: treeNextExplicitIntent,
-      publishTreeExpansionIntent: publishTreeExpansionIntent,
-      treeLoadMayCommit: treeLoadMayCommit,
       isPdfFile: isPdfFile,
+      isValidSort: isValidSort,
+      isValidHidden: isValidHidden,
+      nextBrowseView: nextBrowseView,
+      parentEncodedPath: parentEncodedPath,
+      isHiddenName: isHiddenName,
+      isHiddenEncodedPath: isHiddenEncodedPath,
+      nearestVisibleIndex: nearestVisibleIndex,
+      treeLoadDecision: treeLoadDecision,
+      isValidSnapshot: isValidSnapshot,
     };
   }
 })();

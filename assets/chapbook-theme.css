@@ -110,52 +110,8 @@ body.cb-browser-page {
   border: 0;
 }
 
-/* 页头: 常驻搜索框 + 列表/网格切换, 窄屏可换行 */
-.cb-topbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.75rem;
-  padding: 0.4rem 0;
-}
-.cb-search {
-  flex: 1 1 16rem;
-  max-width: 32rem;
-}
-.cb-search input[type="search"] {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 0.35rem 0.6rem;
-  border: 1px solid var(--cb-border);
-  border-radius: 6px;
-  background-color: var(--cb-bg);
-  color: var(--cb-text);
-  font-size: 13px;
-}
-.cb-search input[type="search"]:focus {
-  outline: 2px solid var(--cb-accent);
-  outline-offset: 0;
-  border-color: transparent;
-}
-.cb-view-toggle {
-  display: flex;
-  gap: 0.25rem;
-}
-.cb-view-toggle button {
-  border: 1px solid var(--cb-border);
-  border-radius: 6px;
-  background-color: var(--cb-bg);
-  color: var(--cb-text);
-  padding: 0.25rem 0.6rem;
-  font-size: 12px;
-  cursor: pointer;
-}
-.cb-view-toggle button[aria-pressed="true"] {
-  background-color: var(--cb-hover);
-  border-color: var(--cb-accent);
-  color: var(--cb-accent);
-  font-weight: 600;
-}
+/* 页头工具区样式统一在 chapbook-doc.css (目录/搜索/独立阅读三表面共用资源):
+ * 目录/搜索完整页 link 该文件, 文档/阅读页随 DOC_STYLE 内嵌 — 不在此复制图标组. */
 
 /* 面包屑: 逐级链接 + 当前节点 (柔和色, 不生成链接) */
 .cb-breadcrumb {
@@ -273,7 +229,7 @@ table.striped tbody > tr.cb-selected {
 /* 预览打开后文档是主内容: 宽屏约占 56%, 目录保留为导航上下文; 窄屏全屏覆盖 */
 .cb-preview {
   position: fixed;
-  top: 0;
+  top: var(--cb-topbar-bottom, 0px);
   right: 0;
   bottom: 0;
   z-index: 20;

@@ -101,9 +101,9 @@ impl FromStr for SortBy {
 
     /// 解析 `Column:Order` 格式.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split(':').collect();
-        match parts.as_slice() {
-            [column, order] => {
+        let mut parts = s.split(':');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(column), Some(order), None) => {
                 let column: SortColumn = column.parse()?;
                 let order: SortOrder = order.parse()?;
                 Ok(SortBy { column, order })

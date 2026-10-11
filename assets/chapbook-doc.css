@@ -8,6 +8,7 @@
   --cb-muted: #57606a;
   --cb-border: #d1d9e0;
   --cb-soft-bg: #f6f8fa;
+  --cb-hover: rgba(9, 105, 218, 0.08);
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -17,6 +18,7 @@
     --cb-muted: #8b949e;
     --cb-border: #30363d;
     --cb-soft-bg: #161b22;
+    --cb-hover: rgba(68, 147, 248, 0.15);
   }
 }
 /* 视口滚动 (锚点平滑、落点偏移) 由根元素提供: body 上的 scroll-behavior/scroll-padding-top
@@ -198,61 +200,246 @@ html:has(> body.cb-doc-page) {
   }
 }
 
-/* ---------- 树模式外壳 (chapbook-browser.js) ---------- */
-
-/* 模式切换按钮: 树顶栏 (.cb-tree-toolbar) 末位控件与目录模式工具栏行
- * (.cb-mode-toolbar) 末位控件共用 — 方角、与折叠按钮同高, 绝不固定定位/悬浮 */
-.cb-mode-toggle {
-  flex: none;
-  height: 2rem;
-  padding: 0 0.8em;
-  font-size: 1em;
-  line-height: calc(2rem - 2px); /* border-box: 内容高 = 2rem - 上下边框 */
+/* ---------- 统一顶部工具区 (目录/搜索/独立阅读共用) ----------
+ * 唯一 toolbar: 左搜索表单, 右树/列表/网格图标组 + 隐藏项开关 + 排序入口.
+ * 样式只放本文件: 浏览器页 link 本文件, 文档/阅读页随 DOC_STYLE 内嵌 —
+ * 三种表面同源, 不复制第二套图标组/提示样式. 图标是自包含 SVG (无外部字体/
+ * CDN), 颜色继承主题变量与 currentColor; hover 与键盘焦点提示由 data-cb-tip +
+ * ::after 呈现 (title 不会在焦点时出现). 窄屏整组换行, 视图图标组自身永不拆行. */
+.cb-topbar {
+  position: relative;
+  z-index: 50; /* 排序菜单与提示盖过预览/抽屉, 工具区仍处于正常文档流 */
+  background-color: var(--cb-bg);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.625em;
+  padding: 0.3em 0;
+  font-size: 12.8px;
+}
+.cb-topbar .cb-search {
+  flex: 1 1 20em;
+  max-width: 40em;
+  min-width: 0;
+}
+.cb-topbar .cb-search input[type="search"] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.35em 0.5em;
   border: 1px solid var(--cb-border);
-  border-radius: 0;
-  background: var(--cb-soft-bg);
+  border-radius: 0.45em;
+  background-color: var(--cb-bg);
   color: var(--cb-text);
+  font-size: 1em;
+}
+.cb-topbar .cb-search input[type="search"]::placeholder {
+  color: var(--cb-muted);
+}
+/* 右侧图标组: margin-left auto 推到行尾; 整组是一个 flex item, 换行时不拆散 */
+.cb-view-group {
+  display: flex;
+  flex: none;
+  gap: 0.25em;
+  margin-left: auto;
+}
+.cb-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 2em;
+  height: 2em;
+  padding: 0;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.45em;
+  background-color: var(--cb-bg);
+  color: var(--cb-text);
+  text-decoration: none;
   cursor: pointer;
 }
-.cb-mode-toggle:hover {
+.cb-icon {
+  display: block;
+  width: 1.25em;
+  height: 1.25em;
+}
+.cb-icon-btn:hover {
+  border-color: var(--cb-accent);
+  color: var(--cb-accent);
+  text-decoration: none;
+}
+/* 选中态 (视图/隐藏项当前生效) 与禁用态 (无 JS 的树/网格; 阅读页隐藏/排序) */
+.cb-icon-btn[aria-pressed="true"] {
+  background-color: var(--cb-hover);
   border-color: var(--cb-accent);
   color: var(--cb-accent);
 }
-/* 目录模式左缘工具栏行: 搜索表单 (顶栏迁入或树结构表单) + 模式切换按钮;
- * 树模式隐藏 (JS hidden 属性), 搜索页不创建. 字号固定 px 与树壳一致
- * (dir 宿主 root 80% / doc 宿主 root 16px 不同, 两宿主观感统一) */
-.cb-mode-toolbar {
-  display: flex;
-  gap: 8px;
+.cb-icon-btn[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: default;
+}
+.cb-icon-btn[aria-disabled="true"]:hover {
+  border-color: var(--cb-border);
+  color: var(--cb-text);
+}
+/* 排序入口: 原生 details/summary — 无 JS 可打开并用查询链接选择方向 */
+.cb-sort {
+  position: relative;
+  flex: none;
+}
+.cb-sort > summary {
+  display: inline-flex;
   align-items: center;
-  padding: 0.4rem 0 0.6rem; /* 与树顶栏垂直呼吸一致 */
-  font-size: 12.8px;
+  gap: 0.35em;
+  box-sizing: border-box;
+  height: 2em;
+  padding: 0 0.6em;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.45em;
+  background-color: var(--cb-bg);
+  color: var(--cb-text);
+  font-size: 1em;
+  white-space: nowrap;
+  list-style: none;
+  cursor: pointer;
 }
-.cb-mode-toolbar[hidden] {
-  display: none; /* display:flex 基规则会覆盖 UA hidden 默认, 必须显式隐藏 */
+.cb-sort > summary::-webkit-details-marker {
+  display: none;
 }
-/* 迁入的顶栏搜索表单在行内增长 (原 max-width 32rem 让位), 输入框与树搜索
- * 同款 (方角 0.3em / 继承字号), 两工具栏观感一致 */
-.cb-mode-toolbar .cb-search {
-  flex: 1;
-  max-width: none;
+.cb-sort > summary:hover,
+.cb-sort[open] > summary {
+  border-color: var(--cb-accent);
+  color: var(--cb-accent);
 }
-.cb-mode-toolbar .cb-search input[type="search"] {
-  padding: 0.35em 0.5em;
-  font-size: inherit;
-  border-radius: 0.3em;
+.cb-sort-state {
+  color: var(--cb-muted);
+  font-size: 0.86em;
 }
+.cb-sort[open] .cb-sort-state {
+  color: inherit;
+}
+.cb-sort[aria-disabled="true"] > summary {
+  opacity: 0.45;
+  cursor: default;
+}
+.cb-sort[aria-disabled="true"] > summary:hover {
+  border-color: var(--cb-border);
+  color: var(--cb-text);
+}
+.cb-sort-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(7em, 1fr));
+  gap: 2px;
+  max-width: calc(100vw - 2rem);
+  padding: 6px;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.45em;
+  background-color: var(--cb-bg);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+}
+.cb-sort-menu a {
+  display: block;
+  padding: 0.3em 0.5em;
+  border-radius: 0.35em;
+  color: var(--cb-text);
+  font-size: 1em;
+  white-space: nowrap;
+  text-decoration: none;
+}
+.cb-sort-menu a:hover {
+  background-color: var(--cb-hover);
+  color: var(--cb-accent);
+  text-decoration: none;
+}
+/* 当前排序对: 视觉高亮 + aria-current (亮/暗主题同一变量) */
+.cb-sort-menu a[aria-current="true"] {
+  background-color: var(--cb-hover);
+  color: var(--cb-accent);
+  font-weight: 600;
+}
+/* hover/键盘焦点含义提示: data-cb-tip 由 CSS 呈现, 焦点也能看到 */
+.cb-topbar [data-cb-tip] {
+  position: relative;
+}
+.cb-topbar [data-cb-tip]::after {
+  content: attr(data-cb-tip);
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  padding: 0.3em 0.6em;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.35em;
+  background-color: var(--cb-soft-bg);
+  color: var(--cb-text);
+  font-size: 0.9em;
+  line-height: 1.4;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.cb-topbar [data-cb-tip]:hover::after,
+.cb-topbar [data-cb-tip]:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+}
+/* 排序面板展开时不再显示 summary 的提示 (两者同一位次, 提示会盖住菜单顶部) */
+.cb-sort[open] > summary[data-cb-tip]::after {
+  display: none;
+}
+/* 键盘焦点: 与树壳控件同一高对比 outline 体系 (输入框用 :focus, 输入即焦点) */
+.cb-topbar .cb-icon-btn:focus-visible,
+.cb-topbar .cb-sort > summary:focus-visible,
+.cb-topbar .cb-sort-menu a:focus-visible {
+  outline: 2px solid var(--cb-accent);
+  outline-offset: 2px;
+}
+.cb-topbar .cb-search input[type="search"]:focus {
+  outline: 2px solid var(--cb-accent);
+  outline-offset: 0;
+  border-color: transparent;
+}
+
+/* 工具区换行后, 以整条 header 而非左侧控件锚定菜单/提示, 避免裁出窄屏. */
+@media (width < 40rem) {
+  .cb-topbar .cb-sort,
+  .cb-topbar [data-cb-tip] {
+    position: static;
+  }
+  .cb-topbar .cb-sort-menu,
+  .cb-topbar [data-cb-tip]::after {
+    right: 8px;
+  }
+}
+
+/* ---------- 树模式外壳 (chapbook-browser.js) ---------- */
 
 /* 树模式布局: 左树 + 8px 调整器 + 右内容, 各自独立滚动. 列 1 宽由 JS 变量
  * --cb-tree-width 驱动 (默认 238px); 8px 调整器列即列间全部间隙 — 无额外 margin. */
 body.cb-tree-mode {
   display: grid;
   grid-template-columns: var(--cb-tree-width, 238px) 8px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
+  background-color: var(--cb-bg);
+  color: var(--cb-text);
 }
-body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer) {
+/* 共享工具区跨三列常驻壳顶行 (绝不隐藏/搬入树栏); 树/调整器/内容整体下移一行 */
+body.cb-tree-mode > .cb-topbar {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  padding: 0.3em 8px;
+  border-bottom: 1px solid var(--cb-border);
+  background-color: var(--cb-bg);
+}
+body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer):not(.cb-topbar) {
   grid-column: 3;
+  grid-row: 2;
   min-width: 0;
 }
 /* 树列: 滚动条隐藏 (wheel/PageDown 等滚动作不受影响), 可见宽度全给内容.
@@ -260,7 +447,7 @@ body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer) {
  * 内边距由顶栏 (.cb-tree-toolbar) 与根列表 (.cb-tree-root) 各自承担. */
 body.cb-tree-mode .cb-tree {
   grid-column: 1;
-  grid-row: 1 / -1;
+  grid-row: 2 / -1;
   overflow-y: auto;
   scrollbar-width: none; /* Firefox */
   background: var(--cb-soft-bg);
@@ -274,7 +461,7 @@ body.cb-tree-mode .cb-tree::-webkit-scrollbar {
  * 列左半 3px + 线半宽 1px; 内容侧镜像 (见宽屏 pane 左内边距规则). */
 .cb-tree-resizer {
   grid-column: 2;
-  grid-row: 1 / -1;
+  grid-row: 2 / -1;
   position: relative;
   cursor: col-resize;
   touch-action: none;
@@ -347,11 +534,10 @@ body.cb-tree-mode.cb-tree-collapsed .cb-tree-restore {
   cursor: pointer;
 }
 /* 键盘焦点可见性: 高对比 outline, 仅键盘触发 (鼠标点击不显示) — 树壳全部
- * 交互控件统一 (折叠/恢复/抽屉唤起/模式切换), 保证纯键盘操作可定位焦点 */
+ * 交互控件统一 (折叠/恢复/抽屉唤起), 保证纯键盘操作可定位焦点 */
 .cb-tree-collapse:focus-visible,
 .cb-tree-restore:focus-visible,
-.cb-tree-open:focus-visible,
-.cb-mode-toggle:focus-visible {
+.cb-tree-open:focus-visible {
   outline: 2px solid var(--cb-accent);
   outline-offset: 2px;
 }
@@ -360,8 +546,7 @@ body.cb-tree-resizing {
   cursor: col-resize;
   user-select: none;
 }
-/* 树模式下目录模式的顶栏/面包屑/预览面板隐藏 (树自身提供搜索与定位) */
-body.cb-tree-mode .cb-topbar,
+/* 树模式下仅面包屑/预览面板让位 (树自身提供导航与预览); 共享工具区保持可见 */
 body.cb-tree-mode .cb-breadcrumb,
 body.cb-tree-mode #cb-preview {
   display: none;
@@ -466,12 +651,17 @@ body.cb-tree-mode [data-cb-action="native"] {
 }
 
 @media (width < 64rem) {
-  /* 内容独占整宽 */
+  /* 内容独占整宽; 工具区仍占壳顶行 (row 1) */
   body.cb-tree-mode {
     grid-template-columns: minmax(0, 1fr);
   }
-  body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer) {
+  body.cb-tree-mode > .cb-topbar {
     grid-column: 1;
+    grid-row: 1;
+  }
+  body.cb-tree-mode > *:not(.cb-tree):not(.cb-tree-resizer):not(.cb-topbar) {
+    grid-column: 1;
+    grid-row: 2;
   }
   /* 窄屏抽屉: resizer 隐藏, --cb-tree-width 不参与 (树宽由抽屉宽度决定) */
   body.cb-tree-mode .cb-tree-resizer {
@@ -497,7 +687,7 @@ body.cb-tree-mode [data-cb-action="native"] {
   /* 树: off-canvas, 默认移出左缘; 打开时滑入 */
   body.cb-tree-mode .cb-tree {
     position: fixed;
-    top: 0;
+    top: var(--cb-topbar-bottom, 0px);
     left: 0;
     bottom: 0;
     z-index: 40;
@@ -519,7 +709,7 @@ body.cb-tree-mode [data-cb-action="native"] {
   body.cb-tree-mode .cb-tree-scrim {
     display: block;
     position: fixed;
-    inset: 0;
+    inset: var(--cb-topbar-bottom, 0px) 0 0;
     z-index: 25;
     background: rgba(0, 0, 0, 0.45);
     opacity: 0;
@@ -531,12 +721,12 @@ body.cb-tree-mode [data-cb-action="native"] {
     visibility: visible;
     transition: opacity 0.25s ease, visibility 0s;
   }
-  /* 唤起按钮: 左上角悬浮 (模式切换按钮在抽屉顶栏内, 互不重叠) */
+  /* 唤起按钮: 左下角悬浮 (壳顶行是共享工具区, 避免遮挡搜索/控件) */
   body.cb-tree-mode .cb-tree-open {
     display: block;
     position: fixed;
-    top: 0.75rem;
-    left: 0.75rem;
+    bottom: 1rem;
+    left: 1rem;
     z-index: 20;
     padding: 0.35em 0.8em;
     font-size: 0.85em;
@@ -598,7 +788,6 @@ body.cb-tree-mode.cb-doc-page {
   max-width: none;
   margin: 0;
   padding: 0;
-  background-color: transparent;
 }
 
 /* 宿主无关的树壳度量 (设计门 P1): dir 宿主 root 80% 与 doc 宿主 root 16px

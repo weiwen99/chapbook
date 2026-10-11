@@ -1,7 +1,8 @@
 name: Release
 
 # 打 v* tag 时自动构建 Linux/macOS 二进制并发布到 GitHub Releases.
-# 用法: git tag v0.2.0 && git push origin v0.2.0
+# Release 正文 = docs/release-notes-<tag>.md 全文 (中文, 需包含在被打 tag 的提交里).
+# 用法: git tag v0.4.0 && git push origin v0.4.0
 on:
   push:
     tags: ['v*']
@@ -14,7 +15,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: taiki-e/create-gh-release-action@v1
+      # GitHub 托管 runner 自带 gh; 正文直接取 docs/release-notes-<tag>.md 全文,
+      # 不经 parse-changelog 解析, 也不用自动生成的英文 commit 列表.
+      # --verify-tag: tag 必须已存在于远端 (防止 tag 不存在时 gh 自动从默认分支建 tag).
+      # notes 缺失或为空 -> 失败: 不创建空正文 release, 依赖本 job 的 build 也不会跑.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="docs/release-notes-${GITHUB_REF_NAME}.md"
+          if [[ ! -s "${notes}" ]]; then
+            echo "::error::release notes missing or empty: ${notes}"
+            exit 1
+          fi
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --verify-tag --title "${GITHUB_REF_NAME}" --notes-file "${notes}"
 
   build:
     name: ${{ matrix.target }}
@@ -23,7 +37,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64: musl 静态链接, 不依赖发行版 glibc 版本 (release 树纯 Rust, 无 C 依赖)
+          # Linux x86_64: musl 静态链接, 不依赖发行版 glibc 版本; 产物无运行时 C 依赖.
+          # 注: 构建期有 C 代码 (katex 经 QuickJS 执行, libquickjs-sys 内置 C 源码由 cc 编译),
+          # 依赖树并非 "纯 Rust 无 C".
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
           # macOS Apple Silicon (macos-latest 自 2026-06 起为 macOS 26 arm64)
@@ -40,7 +56,8 @@ jobs:
         with:
           target: ${{ matrix.target }}
           runner: none
-      # 构建 release 二进制, 打包 chapbook-<target>.tar.gz (+ sha256), 上传到 release
+      # 构建 release 二进制, 打包 chapbook-<target>.tar.gz (内含 LICENSE, README.md),
+      # 上传到该 tag 的 release; 未设 checksum 输入, 不生成 .sha256 等校验和产物
       - name: Build and upload
         uses: taiki-e/upload-rust-binary-action@v1
         with:

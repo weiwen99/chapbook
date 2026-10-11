@@ -1,42 +1,93 @@
 //! 目录遍历与排序, 以及确定性的递归文件名搜索核心.
 
+use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::meta::FileMeta;
 use crate::sort::{SortBy, SortColumn, SortOrder};
 
-/// 列出目录内容. 用安全构造器跳过无法读取的目录项 (悬空符号链接、权限不足等),
-/// 避免单个坏文件导致整个目录列表 500.
-pub fn list_dir(path: &Path, root: &Path, sort_by: SortBy) -> Vec<FileMeta> {
+/// 所有条目出口共用的显示规则; 隐藏仅过滤浏览条目, 不限制直接访问.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListingOptions {
+    pub sort_by: SortBy,
+    pub show_hidden: bool,
+}
+
+fn visible_name(name: &OsStr, options: ListingOptions) -> bool {
+    options.show_hidden || !name.as_encoded_bytes().starts_with(b".")
+}
+
+/// 目录优先, 主键按指定方向; 同值固定原始名称/完整相对路径升序.
+/// 比较器只借用原始字节, 不物化名称或小写扩展名.
+pub fn sort_entries(files: &mut [FileMeta], sort_by: SortBy) {
+    files.sort_unstable_by(|a, b| {
+        let grouping = b.is_directory.cmp(&a.is_directory);
+        if grouping != Ordering::Equal {
+            return grouping;
+        }
+        let primary = match sort_by.column {
+            SortColumn::Name => a
+                .raw_name()
+                .as_encoded_bytes()
+                .cmp(b.raw_name().as_encoded_bytes()),
+            SortColumn::Type => match (a.extension(), b.extension()) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (Some(a), Some(b)) => a
+                    .as_encoded_bytes()
+                    .iter()
+                    .map(u8::to_ascii_lowercase)
+                    .cmp(b.as_encoded_bytes().iter().map(u8::to_ascii_lowercase)),
+            },
+            SortColumn::Size => a.size.cmp(&b.size),
+            SortColumn::LastModified => a.last_modified_time.cmp(&b.last_modified_time),
+            SortColumn::LastAccess => a.last_access_time.cmp(&b.last_access_time),
+            SortColumn::Creation => a.creation_time.cmp(&b.creation_time),
+        };
+        let primary = if sort_by.order == SortOrder::Desc {
+            primary.reverse()
+        } else {
+            primary
+        };
+        primary
+            .then_with(|| {
+                a.raw_name()
+                    .as_encoded_bytes()
+                    .cmp(b.raw_name().as_encoded_bytes())
+            })
+            .then_with(|| {
+                a.relative_to_root
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .cmp(b.relative_to_root.as_os_str().as_encoded_bytes())
+            })
+    });
+}
+
+/// 列出目录内容. 跳过隐藏或不可读条目, 不因单个坏文件让整个列表失败.
+pub fn list_dir(path: &Path, root: &Path, options: ListingOptions) -> Vec<FileMeta> {
     let mut files: Vec<FileMeta> = match std::fs::read_dir(path) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
-            .filter_map(|e| FileMeta::from(root, &e.path()))
+            .map(|e| e.path())
+            .filter(|path| {
+                visible_name(path.file_name().unwrap_or_else(|| OsStr::new("")), options)
+            })
+            .filter_map(|path| FileMeta::from(root, &path))
             .collect(),
         Err(_) => Vec::new(),
     };
-    match sort_by.column {
-        SortColumn::Name => files.sort_by(|a, b| a.display_name.cmp(&b.display_name)),
-        SortColumn::Size => files.sort_by_key(|f| f.size),
-        SortColumn::Type => files
-            .sort_by(|a, b| (a.type_str(), &a.display_name).cmp(&(b.type_str(), &b.display_name))),
-        SortColumn::LastModified => files.sort_by_key(|f| f.last_modified_time),
-        SortColumn::LastAccess => files.sort_by_key(|f| f.last_access_time),
-        SortColumn::Creation => files.sort_by_key(|f| f.creation_time),
-    }
-    if sort_by.order == SortOrder::Desc {
-        files.reverse();
-    }
+    sort_entries(&mut files, options.sort_by);
     files
 }
 
 /// 搜索返回的最大结果数: 恰好 500 条不截断; 第 501 条匹配立即返回前 500 条并置 `truncated`.
 pub const MAX_SEARCH_RESULTS: usize = 500;
 
-/// 递归文件名搜索的结果: 按全局 BFS 顺序 (深度升序; 父级保持 BFS 序; 兄弟按原始文件名字节序)
-/// 排列的匹配条目, 以及是否因达到 [`MAX_SEARCH_RESULTS`] 而截断.
+/// 过滤后的确定性 BFS 候选集按显示规则排列, 并报告是否达到上限后仍有合格匹配.
 pub struct SearchResult {
     pub entries: Vec<FileMeta>,
     pub truncated: bool,
@@ -45,7 +96,7 @@ pub struct SearchResult {
 /// 确定性的递归文件名搜索核心.
 ///
 /// - 迭代式 BFS (`VecDeque<PathBuf>`), 绝不递归.
-/// - 每个目录先收集所有可读 `DirEntry` (连同其 `OsString` 文件名, 各提取一次),
+/// - 每个目录先收集可读条目的 `OsString` 文件名 (各提取一次),
 ///   按原始文件名字节升序排序后再依序处理; Unix 上 `as_encoded_bytes()` 即原始字节,
 ///   其他平台是确定性的 WTF-8 顺序. 排序仅借用编码字节, 不在比较器内物化 `file_name`.
 /// - 目录按 identity 去重 (Unix: `(dev, ino)`; 其他平台: 规范化路径), 只入队第一个
@@ -55,11 +106,11 @@ pub struct SearchResult {
 ///   入队. 普通文件从不进入 identity 集合, 硬链接的每个名字都是独立匹配.
 /// - 每个成功构造的 `FileMeta` 独立匹配
 ///   `display_name.to_lowercase().contains(normalized_query)`, 包括目录与符号链接别名.
-/// - 已跟随 metadata 失败的条目仍经 `FileMeta::from` 的既有符号链接回退产出可显示的
+/// - 跟随 metadata 失败时回退 symlink_metadata, 仍产出可显示的
 ///   非目录条目; 但只有已跟随 metadata 能授权入队目录. 不可读子目录仅跳过该子树.
 ///
 /// 调用方负责对查询做一次 trim/lowercase; 本函数不做逐候选归一化.
-pub fn search(root: &Path, normalized_query: &str) -> SearchResult {
+pub fn search(root: &Path, normalized_query: &str, options: ListingOptions) -> SearchResult {
     if normalized_query.is_empty() {
         return SearchResult {
             entries: Vec::new(),
@@ -78,12 +129,12 @@ pub fn search(root: &Path, normalized_query: &str) -> SearchResult {
     }
     let mut queue: VecDeque<PathBuf> = VecDeque::from([root.to_path_buf()]);
     while let Some(dir_path) = queue.pop_front() {
-        // 每个 DirEntry 连同其 OsString 文件名只收集一次; 排序仅借用编码字节,
-        // 不在比较器内反复物化 file_name()
-        let mut entries: Vec<(OsString, std::fs::DirEntry)> = match std::fs::read_dir(&dir_path) {
+        // 只保留排序需要的原始名字; 路径按需 join, 不保留无用的 DirEntry.
+        let mut entries: Vec<OsString> = match std::fs::read_dir(&dir_path) {
             Ok(read_dir) => read_dir
                 .filter_map(|e| e.ok())
-                .map(|e| (e.file_name(), e))
+                .map(|e| e.file_name())
+                .filter(|name| visible_name(name, options))
                 .collect(),
             Err(err) => {
                 // 只跳过该子树, 不影响其他分支
@@ -96,18 +147,23 @@ pub fn search(root: &Path, normalized_query: &str) -> SearchResult {
             }
         };
         // 兄弟目录项按原始文件名字节升序处理 (非 Unix 为确定性 WTF-8 编码序)
-        entries.sort_by(|(a_name, _), (b_name, _)| {
+        entries.sort_unstable_by(|a_name, b_name| {
             a_name.as_encoded_bytes().cmp(b_name.as_encoded_bytes())
         });
-        for (file_name, _entry) in entries {
+        for file_name in entries {
             let path = dir_path.join(&file_name);
             let followed = std::fs::metadata(&path);
-            let Some(meta) = FileMeta::from(root, &path) else {
+            let may_descend = followed.is_ok();
+            let Ok(attrs) = followed.or_else(|_| std::fs::symlink_metadata(&path)) else {
+                continue;
+            };
+            let Some(meta) = FileMeta::from_metadata(root, &path, &attrs) else {
                 continue;
             };
             if meta.display_name.to_lowercase().contains(normalized_query) {
                 // 第 501 条匹配: 立即返回前 500 条, 不再扫描或入队
                 if results.len() == MAX_SEARCH_RESULTS {
+                    sort_entries(&mut results, options.sort_by);
                     return SearchResult {
                         entries: results,
                         truncated: true,
@@ -118,15 +174,16 @@ pub fn search(root: &Path, normalized_query: &str) -> SearchResult {
             // 只有已跟随 metadata 能授权入队目录; identity 不可得 (非 Unix
             // canonicalize 失败) 时拒绝入队该子树, 循环终止 fail-closed.
             // Unix (dev, ino) 恒可得, 语义不变.
-            if let Ok(fm) = followed
-                && fm.is_dir()
-                && let Some(identity) = dir_identity(&path, &fm)
+            if may_descend
+                && attrs.is_dir()
+                && let Some(identity) = dir_identity(&path, &attrs)
                 && visited_dirs.insert(identity)
             {
                 queue.push_back(path);
             }
         }
     }
+    sort_entries(&mut results, options.sort_by);
     SearchResult {
         entries: results,
         truncated: false,
@@ -184,6 +241,172 @@ mod tests {
             .collect()
     }
 
+    fn sortable_entries() -> Vec<FileMeta> {
+        use std::time::{Duration, SystemTime};
+        [
+            ("z.txt", false, 2),
+            ("two/same.md", false, 3),
+            ("z-dir", true, 2),
+            ("a.txt", false, 1),
+            ("one/same.md", false, 3),
+            ("a-dir", true, 1),
+        ]
+        .into_iter()
+        .map(|(path, is_directory, rank)| {
+            let path = PathBuf::from(path);
+            let (modified, accessed, created) = if is_directory {
+                (rank, rank, rank)
+            } else {
+                match rank {
+                    1 => (3, 3, 2),
+                    2 => (1, 2, 1),
+                    _ => (2, 1, 3),
+                }
+            };
+            let time = |n| SystemTime::UNIX_EPOCH + Duration::from_secs(n);
+            FileMeta {
+                display_name: crate::meta::escape_os_name(path.file_name().unwrap()),
+                relative_to_root: path,
+                is_directory,
+                size: rank,
+                last_modified_time: time(modified),
+                last_access_time: time(accessed),
+                creation_time: time(created),
+            }
+        })
+        .collect()
+    }
+
+    #[test]
+    fn all_sort_keys_keep_directories_first_and_fixed_ties() {
+        let cases = [
+            (
+                SortColumn::Name,
+                ["a.txt", "one/same.md", "two/same.md", "z.txt"],
+                ["z.txt", "one/same.md", "two/same.md", "a.txt"],
+            ),
+            (
+                SortColumn::Type,
+                ["one/same.md", "two/same.md", "a.txt", "z.txt"],
+                ["a.txt", "z.txt", "one/same.md", "two/same.md"],
+            ),
+            (
+                SortColumn::Size,
+                ["a.txt", "z.txt", "one/same.md", "two/same.md"],
+                ["one/same.md", "two/same.md", "z.txt", "a.txt"],
+            ),
+            (
+                SortColumn::LastModified,
+                ["z.txt", "one/same.md", "two/same.md", "a.txt"],
+                ["a.txt", "one/same.md", "two/same.md", "z.txt"],
+            ),
+            (
+                SortColumn::LastAccess,
+                ["one/same.md", "two/same.md", "z.txt", "a.txt"],
+                ["a.txt", "z.txt", "one/same.md", "two/same.md"],
+            ),
+            (
+                SortColumn::Creation,
+                ["z.txt", "a.txt", "one/same.md", "two/same.md"],
+                ["one/same.md", "two/same.md", "a.txt", "z.txt"],
+            ),
+        ];
+        for (column, asc, desc) in cases {
+            for (order, expected_files) in [(SortOrder::Asc, asc), (SortOrder::Desc, desc)] {
+                let mut entries = sortable_entries();
+                sort_entries(&mut entries, SortBy { column, order });
+                let directories = if order == SortOrder::Desc && column != SortColumn::Type {
+                    ["z-dir", "a-dir"]
+                } else {
+                    ["a-dir", "z-dir"]
+                };
+                let expected: Vec<_> = directories.into_iter().chain(expected_files).collect();
+                let actual: Vec<_> = entries
+                    .iter()
+                    .map(|entry| entry.relative_to_root.to_str().unwrap())
+                    .collect();
+                assert_eq!(actual, expected, "{column}:{order}");
+            }
+        }
+    }
+
+    #[test]
+    fn type_groups_use_last_extension_and_ascii_case_insensitive_ties() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "no-extension",
+            ".env",
+            "b.txt",
+            "a.TXT",
+            "a.tar.gz",
+            "z.md",
+            "trailing.",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("folder.pdf")).unwrap();
+        let entries = list_dir(
+            dir.path(),
+            dir.path(),
+            ListingOptions {
+                sort_by: SortBy {
+                    column: SortColumn::Type,
+                    order: SortOrder::Asc,
+                },
+                show_hidden: true,
+            },
+        );
+        let names: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.raw_name().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "folder.pdf",
+                ".env",
+                "no-extension",
+                "trailing.",
+                "a.tar.gz",
+                "z.md",
+                "a.TXT",
+                "b.txt"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn name_order_uses_raw_bytes_not_visible_escapes() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let non_utf8 = OsString::from_vec(vec![0xff]);
+        std::fs::write(dir.path().join(&non_utf8), b"x").unwrap();
+        std::fs::write(dir.path().join("z"), b"x").unwrap();
+        let entries = list_dir(dir.path(), dir.path(), ListingOptions::default());
+        assert_eq!(entries[0].raw_name(), OsStr::new("z"));
+        assert_eq!(entries[1].raw_name(), &non_utf8);
+        assert_eq!(entries[1].display_name, "\\xFF");
+        assert!(entries[1].browser_path_encoded().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_directory_does_not_claim_visible_alias_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".target")).unwrap();
+        std::fs::write(dir.path().join(".target/needle.txt"), b"x").unwrap();
+        symlink(".target", dir.path().join("visible")).unwrap();
+        let result = search(dir.path(), "needle", ListingOptions::default());
+        assert_eq!(rels(&result), ["visible/needle.txt"]);
+        let direct = list_dir(
+            &dir.path().join(".target"),
+            dir.path(),
+            ListingOptions::default(),
+        );
+        assert_eq!(direct[0].raw_name(), OsStr::new("needle.txt"));
+    }
+
     #[test]
     fn search_matches_case_insensitive_substring() {
         let dir = tempfile::tempdir().unwrap();
@@ -191,7 +414,7 @@ mod tests {
         std::fs::write(root.join("Alpha.txt"), b"x").unwrap();
         std::fs::write(root.join("alpine.md"), b"x").unwrap();
         std::fs::write(root.join("Beta.txt"), b"x").unwrap();
-        let result = search(root, "al");
+        let result = search(root, "al", ListingOptions::default());
         assert!(!result.truncated);
         // 大小写不敏感子串: Alpha.txt 与 alpine.md; 字节序 0x41 < 0x61
         assert_eq!(rels(&result), ["Alpha.txt", "alpine.md"]);
@@ -204,7 +427,7 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir(root.join("Target")).unwrap();
         std::fs::write(root.join("Target").join("inner.txt"), b"x").unwrap();
-        let result = search(root, "target");
+        let result = search(root, "target", ListingOptions::default());
         assert!(!result.truncated);
         assert_eq!(result.entries.len(), 1);
         assert!(result.entries[0].is_directory);
@@ -213,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn search_is_breadth_first_byte_order_independent_of_creation_order() {
+    fn search_sorts_bfs_candidates_independent_of_creation_order() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         // 刻意按相反顺序创建: z-dir 先, a-dir 后; 结果必须无视创建顺序
@@ -222,22 +445,26 @@ mod tests {
         std::fs::create_dir(root.join("a-dir")).unwrap();
         std::fs::write(root.join("a-dir").join("q2.txt"), b"x").unwrap();
         std::fs::write(root.join("q1.txt"), b"x").unwrap();
-        let result = search(root, "q");
+        let result = search(root, "q", ListingOptions::default());
         assert!(!result.truncated);
-        // 深度升序 (q1 先于 q2/q3); 同深度父级按 BFS 顺序 (a-dir 字节序先于 z-dir)
+        // 候选集从 byte-ordered BFS 收集, 此处按原始 basename 排列展示.
         assert_eq!(rels(&result), ["q1.txt", "a-dir/q2.txt", "z-dir/q3.txt"]);
     }
 
     #[test]
     fn search_empty_query_returns_empty_without_touching_root() {
         // root 不存在也必须是空结果: 证明空查询不读取根目录
-        let result = search(Path::new("/nonexistent/chapbook-search-test"), "");
+        let result = search(
+            Path::new("/nonexistent/chapbook-search-test"),
+            "",
+            ListingOptions::default(),
+        );
         assert!(result.entries.is_empty());
         assert!(!result.truncated);
         // 真实目录同样为空
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("anything.txt"), b"x").unwrap();
-        let result = search(dir.path(), "");
+        let result = search(dir.path(), "", ListingOptions::default());
         assert!(result.entries.is_empty());
         assert!(!result.truncated);
     }
@@ -248,8 +475,9 @@ mod tests {
         let root = dir.path();
         for i in 0..MAX_SEARCH_RESULTS {
             std::fs::write(root.join(format!("x-{i:03}.txt")), b"x").unwrap();
+            std::fs::write(root.join(format!(".x-{i:03}.txt")), b"x").unwrap();
         }
-        let result = search(root, "x");
+        let result = search(root, "x", ListingOptions::default());
         assert_eq!(result.entries.len(), MAX_SEARCH_RESULTS);
         assert!(!result.truncated);
         assert_eq!(result.entries[0].display_name, "x-000.txt");
@@ -266,13 +494,24 @@ mod tests {
         for i in 0..=MAX_SEARCH_RESULTS {
             std::fs::write(root.join(format!("x-{i:03}.txt")), b"x").unwrap();
         }
-        let result = search(root, "x");
+        let result = search(
+            root,
+            "x",
+            ListingOptions {
+                sort_by: SortBy {
+                    column: SortColumn::Name,
+                    order: SortOrder::Desc,
+                },
+                show_hidden: false,
+            },
+        );
         assert_eq!(result.entries.len(), MAX_SEARCH_RESULTS);
         assert!(result.truncated);
-        assert_eq!(result.entries[0].display_name, "x-000.txt");
+        // 候选集仍是 BFS 先收集的 x-000..499, 降序不能变成全局 top-N.
+        assert_eq!(result.entries[0].display_name, "x-499.txt");
         assert_eq!(
             result.entries[MAX_SEARCH_RESULTS - 1].display_name,
-            "x-499.txt"
+            "x-000.txt"
         );
     }
 
@@ -289,7 +528,7 @@ mod tests {
             std::fs::metadata(root.join("link-A.txt")).unwrap().ino(),
             std::fs::metadata(root.join("link-B.txt")).unwrap().ino()
         );
-        let result = search(root, "link");
+        let result = search(root, "link", ListingOptions::default());
         assert!(!result.truncated);
         // 普通文件不进 identity 集合: 硬链接的两个名字都是独立匹配
         assert_eq!(rels(&result), ["link-A.txt", "link-B.txt"]);
@@ -308,7 +547,7 @@ mod tests {
         // sub/parent -> ..  指向 root (根 identity 已预插入)
         symlink("..", root.join("sub").join("parent")).unwrap();
         // 若任一循环被跟随, 遍历将无限进行, 测试会挂起; 通过即证明终止
-        let result = search(root, "file");
+        let result = search(root, "file", ListingOptions::default());
         assert!(!result.truncated);
         assert_eq!(rels(&result), ["file1.txt", "sub/file2.txt"]);
     }
@@ -326,16 +565,16 @@ mod tests {
         std::fs::create_dir(root.join("deep")).unwrap();
         symlink("../target", root.join("deep").join("d-alias")).unwrap();
 
-        // 所有别名行本身都是匹配, 且按全局 BFS 顺序保留
-        let result = search(root, "alias");
+        // 别名行全部保留, 展示按名称排序; 子树选择仍按 BFS identity 规则.
+        let result = search(root, "alias", ListingOptions::default());
         assert!(!result.truncated);
-        assert_eq!(rels(&result), ["a-alias", "z-alias", "deep/d-alias"]);
+        assert_eq!(rels(&result), ["a-alias", "deep/d-alias", "z-alias"]);
         assert!(result.entries.iter().all(|m| m.is_directory));
 
         // 子树 (target 目录内容) 只经最浅且字节序最靠前的 identity 展开一次:
         // 真实 target 与 a-alias 是同一 (dev, ino), a-alias 字节序先到先得,
         // z-alias 与 deep/d-alias 因 identity 去重不再展开
-        let result = search(root, "file");
+        let result = search(root, "file", ListingOptions::default());
         assert!(!result.truncated);
         assert_eq!(rels(&result), ["a-alias/file.txt"]);
     }
@@ -348,14 +587,14 @@ mod tests {
         symlink("does-not-exist", root.join("broken-link")).unwrap();
         std::fs::write(root.join("other.txt"), b"x").unwrap();
         // 已跟随 metadata 失败时, FileMeta::from 的符号链接回退仍产出可显示的非目录条目
-        let result = search(root, "broken");
+        let result = search(root, "broken", ListingOptions::default());
         assert!(!result.truncated);
         assert_eq!(result.entries.len(), 1);
         assert!(!result.entries[0].is_directory);
         assert_eq!(result.entries[0].display_name, "broken-link");
         assert_eq!(result.entries[0].relative_to_root, Path::new("broken-link"));
         // 悬空链接不影响其他匹配
-        let result = search(root, "other");
+        let result = search(root, "other", ListingOptions::default());
         assert_eq!(rels(&result), ["other.txt"]);
     }
 

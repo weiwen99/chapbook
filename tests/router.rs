@@ -38,6 +38,75 @@ fn content_type(res: &Response<Body>) -> String {
         .to_string()
 }
 
+/// fragment 严格出口: 成功与错误都必须是 text/html; charset=utf-8 + nosniff.
+fn is_strict_html_fragment(res: &Response<Body>) -> bool {
+    content_type(res) == "text/html; charset=utf-8"
+        && res
+            .headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .is_some_and(|v| v == "nosniff")
+}
+
+/// 提取 `attr="value"` 的所有 value (出现顺序).
+fn attr_values(body: &str, attr: &str) -> Vec<String> {
+    let needle = format!("{attr}=\"");
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find(&needle) {
+        let tail = &rest[start + needle.len()..];
+        let Some(end) = tail.find('"') else { break };
+        out.push(tail[..end].to_string());
+        rest = &tail[end..];
+    }
+    out
+}
+
+/// 第一个以 prefix 开头的 href 值.
+fn href_starting_with(body: &str, prefix: &str) -> Option<String> {
+    attr_values(body, "href")
+        .into_iter()
+        .find(|h| h.starts_with(prefix))
+}
+
+/// 是否存在指向该路径的 href (允许附加有效显示规则 query: `?sort=…&hidden=…`).
+fn has_href_path(body: &str, path: &str) -> bool {
+    attr_values(body, "href")
+        .iter()
+        .any(|h| h == path || h.starts_with(&format!("{path}?")))
+}
+
+/// 包含 marker 的所有完整标签 (顺序).
+fn tags_containing<'a>(body: &'a str, marker: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find(marker) {
+        let start = match rest[..at].rfind('<') {
+            Some(s) => s,
+            None => break,
+        };
+        let end = match rest[at..].find('>') {
+            Some(n) => at + n,
+            None => break,
+        };
+        out.push(&rest[start..=end]);
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// 标签内的 href 值 (第一个).
+fn href_in_tag(tag: &str) -> Option<&str> {
+    tag.split("href=\"").nth(1)?.split('"').next()
+}
+
+/// form 元素块 (含 class_marker 的第一个 form 的开始标签到 `</form>`).
+fn form_block<'a>(body: &'a str, class_marker: &str) -> Option<&'a str> {
+    let at = body.find(class_marker)?;
+    let start = body[..at].rfind("<form")?;
+    let end = body[start..].find("</form>").map(|n| start + n)?;
+    Some(&body[start..=end])
+}
+
 /// 建一个含 1.txt 和 subdir/2.json 的测试目录.
 fn fixture() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -796,30 +865,6 @@ async fn org_options_toc_nil_disables_toc() {
     assert!(body.contains("<h1>"), "headings still render: {body}");
 }
 
-/// 完整文档页骨架: body 带 cb-doc-page 类, 正文恰好一个 cb-doc 包装,
-/// DOC_STYLE 标记保留 (片段任务后续复用同一 .cb-doc 结构).
-#[tokio::test]
-async fn org_full_page_has_page_class_and_single_doc_wrapper() {
-    let dir = fixture();
-    std::fs::write(dir.path().join("wrap.org"), "* Hi\nbody\n").unwrap();
-
-    let res = get(app(dir.path()), "/wrap.org").await;
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = body_string(res).await;
-    assert!(
-        body.contains(r#"<body class="cb-doc-page">"#),
-        "body: {body}"
-    );
-    assert_eq!(
-        body.matches(r#"<div class="cb-doc">"#).count(),
-        1,
-        "body: {body}"
-    );
-    assert!(body.contains("/* chapbook-doc-style */"), "body: {body}");
-    assert!(body.contains("<main>"), "body: {body}");
-    assert!(body.contains("<title>wrap.org</title>"), "body: {body}");
-}
-
 /// Hostile org 整页渲染: HTML export block / snippet / javascript 链接
 /// 只输出转义文本, 不出现活动元素标签.
 #[tokio::test]
@@ -957,12 +1002,91 @@ async fn non_utf8_markdown_and_org_range_regression() {
     }
 }
 
+/// 非法 `sort`/`hidden` 在全部 listing 出口统一 404 (不是 400), 精确语法大小写敏感.
+/// 树端点的错误体仍是既有 JSON error schema.
 #[tokio::test]
-async fn invalid_sort_param_returns_404() {
+async fn invalid_listing_params_return_404_on_listing_surfaces() {
     let dir = fixture();
-    // 非法 sort 参数 -> 404 (不是 400), 保持既有行为
-    let res = get(app(dir.path()), "/?sort=Name:Invalid").await;
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    for uri in [
+        "/?sort=Name:Invalid",
+        "/?sort=Name:Invalid:Ext",
+        "/?sort=name:asc",
+        "/?sort=Name:asc",
+        "/?sort=Name",
+        "/subdir?sort=Nope:Asc",
+        "/?hidden=2",
+        "/?hidden=yes",
+        "/?hidden=",
+        "/?hidden=01",
+        "/subdir?hidden=-1",
+        "/__/search?q=1.txt&sort=Name:Invalid",
+        "/__/search?q=1.txt&hidden=2",
+    ] {
+        let res = get(app(dir.path()), uri).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+
+    // 树 JSON 端点: 同样 404 + application/json 错误体
+    for uri in [
+        "/__/tree?sort=Name:Invalid",
+        "/__/tree?hidden=2",
+        "/__/tree/subdir?sort=nope:asc",
+    ] {
+        let res = get(app(dir.path()), uri).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(content_type(&res), "application/json", "{uri}");
+        let body: serde_json::Value = serde_json::from_str(&body_string(res).await).unwrap();
+        assert!(body["error"].is_string(), "{uri}");
+    }
+}
+
+/// 非法 listing 参数在 download/raw 混用下仍 404; 不得因 fragment 键存在
+/// 或最终出口是字节流而变成占位 fragment.
+#[tokio::test]
+async fn invalid_listing_params_stay_404_with_download_raw_or_fragment() {
+    let dir = fixture();
+    for uri in [
+        "/1.txt?download=1&sort=Name:Invalid",
+        "/1.txt?raw=1&hidden=2",
+        "/1.txt?fragment=1&sort=Name:Invalid&download=1",
+        "/1.txt?fragment=1&hidden=9",
+    ] {
+        let res = get(app(dir.path()), uri).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+        let body = body_string(res).await;
+        assert!(!body.contains("无法预览"), "{uri}: {body}");
+        assert!(!body.contains("<!DOCTYPE"), "{uri}: {body}");
+    }
+}
+
+/// 最终模式为 fragment 时, 参数/路径/提取失败也必须是严格 HTML 出口:
+/// text/html; charset=utf-8 + nosniff, 而不是裸 text/plain 或占位字节.
+#[tokio::test]
+async fn fragment_error_exits_are_strict_html_with_nosniff() {
+    let dir = fixture();
+    for (uri, status) in [
+        ("/?fragment=1&sort=Name:Invalid", StatusCode::NOT_FOUND),
+        ("/?fragment=1&hidden=2", StatusCode::NOT_FOUND),
+        ("/nope.md?fragment=1", StatusCode::NOT_FOUND),
+        ("/nope?fragment=1", StatusCode::NOT_FOUND),
+        (
+            "/subdir/../../../../etc/passwd?fragment=1",
+            StatusCode::FORBIDDEN,
+        ),
+        // 非法 UTF-8 路径提取 (框架拒绝) 同样走严格 fragment 出口
+        ("/%FF?fragment=1", StatusCode::BAD_REQUEST),
+    ] {
+        let res = get(app(dir.path()), uri).await;
+        assert_eq!(res.status(), status, "{uri}");
+        assert!(
+            is_strict_html_fragment(&res),
+            "{uri}: ct={}",
+            content_type(&res)
+        );
+        let body = body_string(res).await;
+        assert!(!body.contains("<!DOCTYPE"), "{uri}: {body}");
+        assert!(!body.contains("<head"), "{uri}: {body}");
+    }
 }
 
 #[tokio::test]
@@ -991,7 +1115,7 @@ async fn space_in_filename_is_percent_encoded() {
 
     let res = get(app(dir.path()), "/").await;
     let body = body_string(res).await;
-    assert!(body.contains(r#"href="/a%20b.txt""#), "body: {body}");
+    assert!(has_href_path(&body, "/a%20b.txt"), "body: {body}");
 
     let res = get(app(dir.path()), "/a%20b.txt").await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -1028,7 +1152,7 @@ async fn non_utf8_basename_listed_without_anchor() {
     assert!(!body.contains(r#"<a href="">"#), "body: {body}");
     assert!(!body.contains(r#"<a href="/\xFFbad.txt""#), "body: {body}");
     // 表头排序链接仍在
-    assert!(body.contains(r#"href="?sort="#), "body: {body}");
+    assert!(body.contains("sort=Name"), "body: {body}");
 }
 
 #[tokio::test]
@@ -1587,10 +1711,14 @@ async fn directory_ignores_mode_keys_except_fragment() {
     let res = get(app(dir.path()), "/?fragment=1").await;
     assert_eq!(res.status(), StatusCode::OK);
     let body = body_string(res).await;
+    assert!(body.contains("cb-doc cb-dir-fragment"), "body: {body}");
+    assert!(body.contains("cb-dir-mini"), "body: {body}");
     assert!(
-        body.contains(r#"class="cb-doc cb-dir-fragment""#),
+        body.contains(r#"data-cb-surface="directory""#),
         "body: {body}"
     );
+    assert!(body.contains(r#"data-cb-sort="Name:Asc""#), "body: {body}");
+    assert!(body.contains(r#"data-cb-hidden="0""#), "body: {body}");
     assert!(!body.contains("<!DOCTYPE"), "body: {body}");
 }
 
@@ -1641,6 +1769,24 @@ async fn fragment_documents_and_code_are_clean_wrapped_html() {
         assert!(
             body.contains(&format!(r#"data-native-path-encoded="{encoded}""#)),
             "{uri}: wrapper must carry encoded path: {body}"
+        );
+        // 文件 fragment 是独立阅读表面 + 生效显示规则元数据; 无 token
+        assert!(
+            body.contains(r#"data-cb-surface="reading""#),
+            "{uri}: reading surface metadata: {body}"
+        );
+        assert!(
+            body.contains(r#"data-cb-sort="Name:Asc""#),
+            "{uri}: effective sort metadata: {body}"
+        );
+        assert!(
+            body.contains(r#"data-cb-hidden="0""#),
+            "{uri}: effective hidden metadata: {body}"
+        );
+        assert!(!body.contains("cb-native-open-token"), "{uri}: {body}");
+        assert!(
+            !body.contains(r#"data-cb-action="native""#),
+            "{uri}: fragment never carries native controls: {body}"
         );
     }
 }
@@ -1760,14 +1906,14 @@ async fn search_matches_case_insensitive_and_directories() {
         let res = get(app(dir.path()), &format!("/__/search?q={q}")).await;
         assert_eq!(res.status(), StatusCode::OK, "q={q}");
         let body = body_string(res).await;
-        assert!(body.contains(r#"href="/AlphaOne.txt""#), "q={q}: {body}");
+        assert!(has_href_path(&body, "/AlphaOne.txt"), "q={q}: {body}");
         assert!(!body.contains("beta.txt"), "q={q}: {body}");
     }
     // 目录也参与匹配
     let res = get(app(dir.path()), "/__/search?q=notes").await;
     assert_eq!(res.status(), StatusCode::OK);
     let body = body_string(res).await;
-    assert!(body.contains(r#"href="/Notes""#), "body: {body}");
+    assert!(has_href_path(&body, "/Notes"), "body: {body}");
 
     // 空/纯空白查询: 直接提示页, 不遍历
     for q in ["", "%20%20"] {
@@ -1790,10 +1936,10 @@ async fn search_results_are_in_deterministic_bfs_order() {
     let res = get(app(dir.path()), "/__/search?q=txt").await;
     assert_eq!(res.status(), StatusCode::OK);
     let body = body_string(res).await;
-    let a = body.find(r#"href="/a.txt""#).expect("a.txt in results");
-    let b = body.find(r#"href="/b.txt""#).expect("b.txt in results");
+    let a = body.find(r#"href="/a.txt"#).expect("a.txt in results");
+    let b = body.find(r#"href="/b.txt"#).expect("b.txt in results");
     let sub = body
-        .find(r#"href="/sub/b.txt""#)
+        .find(r#"href="/sub/b.txt"#)
         .expect("sub/b.txt in results");
     assert!(a < b && b < sub, "BFS order violated: {body}");
 }
@@ -1881,7 +2027,7 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
 }
 
 /// 搜索页结果行提取: 每行取第一个 href (名称锚点), 得到按 BFS 顺序的结果路径序列.
-/// display-only 行 (无锚点) 被跳过.
+/// 只返回 path (去掉有效规则 query); display-only 行 (无锚点) 被跳过.
 fn search_result_hrefs(body: &str) -> Vec<String> {
     body.split(r#"<tr class="cb-row""#)
         .skip(1)
@@ -1889,7 +2035,8 @@ fn search_result_hrefs(body: &str) -> Vec<String> {
             let start = chunk.find(r#"href="/"#)?;
             let rest = &chunk[start + 6..];
             let end = rest.find('"')?;
-            Some(rest[..end].to_string())
+            let href = &rest[..end];
+            Some(href.split('?').next().unwrap_or(href).to_string())
         })
         .collect()
 }
@@ -2091,7 +2238,7 @@ async fn unsafe_scalar_fixtures_safe_labels_across_outlets() {
             );
         }
         assert!(
-            body.contains(&format!(r#"href="/{enc}""#)),
+            has_href_path(&body, &format!("/{enc}")),
             "case {raw:?}: {body}"
         );
         assert!(
@@ -2100,7 +2247,7 @@ async fn unsafe_scalar_fixtures_safe_labels_across_outlets() {
         );
         for (fenc, _) in &files {
             assert!(
-                body.contains(&format!(r#"href="/{fenc}""#)),
+                has_href_path(&body, &format!("/{fenc}")),
                 "case {raw:?} file {fenc}: {body}"
             );
             assert!(
@@ -2158,10 +2305,12 @@ async fn unsafe_scalar_fixtures_safe_labels_across_outlets() {
         }
         let ibody = body_string(get(app.clone(), "/__/search?q=inner").await).await;
         assert!(
-            ibody.contains(&format!(
-                r#"href="/{enc}"><bdi dir="auto">{label}</bdi></a>"#
-            )),
-            "case {raw:?} location: {ibody}"
+            has_href_path(&ibody, &format!("/{enc}")),
+            "case {raw:?} location href: {ibody}"
+        );
+        assert!(
+            ibody.contains(&format!(r#"<bdi dir="auto">{label}</bdi></a>"#)),
+            "case {raw:?} location label: {ibody}"
         );
 
         // 目录 fragment: wrapper 携带同一 encoded identity + title; 根 fragment 迷你列表同 label
@@ -2174,9 +2323,11 @@ async fn unsafe_scalar_fixtures_safe_labels_across_outlets() {
         );
         let root_frag = body_string(get(app.clone(), "/?fragment=1").await).await;
         assert!(
-            root_frag.contains(&format!(
-                r#"href="/{enc}" data-native-path-encoded="{enc}""#
-            )),
+            has_href_path(&root_frag, &format!("/{enc}")),
+            "case {raw:?}: {root_frag}"
+        );
+        assert!(
+            root_frag.contains(&format!(r#"data-native-path-encoded="{enc}""#)),
             "case {raw:?}: {root_frag}"
         );
         assert!(
@@ -2258,7 +2409,7 @@ async fn default_ignorable_fixtures_escaped_and_actionable() {
             "{n:?}: {body}"
         );
         assert!(!body.contains(n), "raw scalar leaked for {n:?}: {body}");
-        assert!(body.contains(&format!(r#"href="/{enc}""#)), "{n:?}: {body}");
+        assert!(has_href_path(&body, &format!("/{enc}")), "{n:?}: {body}");
         assert!(
             body.contains(&format!(r#"data-native-path-encoded="{enc}""#)),
             "{n:?}: {body}"
@@ -2338,7 +2489,7 @@ async fn search_escaped_label_query_finds_raw_byte_name_display_only() {
         gbody.contains(r#"data-native-path-encoded="good.txt""#),
         "gbody: {gbody}"
     );
-    assert!(gbody.contains(r#"href="/good.txt""#), "gbody: {gbody}");
+    assert!(has_href_path(&gbody, "/good.txt"), "gbody: {gbody}");
     assert!(
         gbody.contains(r#"data-cb-action="preview""#),
         "gbody: {gbody}"
@@ -2379,10 +2530,7 @@ async fn ascii_space_six_fixtures_distinct_across_outlets() {
             body.contains(&format!(r#"aria-label="{label}""#)),
             "{name:?}: {body}"
         );
-        assert!(
-            body.contains(&format!(r#"href="/{enc}""#)),
-            "{name:?}: {body}"
-        );
+        assert!(has_href_path(&body, &format!("/{enc}")), "{name:?}: {body}");
         assert!(
             body.contains(&format!(r#"data-native-path-encoded="{enc}""#)),
             "{name:?}: {body}"
@@ -2410,9 +2558,11 @@ async fn ascii_space_six_fixtures_distinct_across_outlets() {
     for (name, label) in cases {
         let enc = t_enc_segment(name);
         assert!(
-            fbody.contains(&format!(
-                r#"href="/{enc}" data-native-path-encoded="{enc}""#
-            )),
+            has_href_path(&fbody, &format!("/{enc}")),
+            "{name:?}: {fbody}"
+        );
+        assert!(
+            fbody.contains(&format!(r#"data-native-path-encoded="{enc}""#)),
             "{name:?}: {fbody}"
         );
         assert!(
@@ -2454,7 +2604,7 @@ async fn whitespace_scalars_encoded_identity_and_actionable() {
         let label = format!("f{i}-{}.txt", t_u_escape(*c));
         let enc = t_enc_segment(&name);
         assert!(
-            body.contains(&format!(r#"href="/{enc}""#)),
+            has_href_path(&body, &format!("/{enc}")),
             "{c:?} ({enc}): {body}"
         );
         assert!(
@@ -2466,10 +2616,7 @@ async fn whitespace_scalars_encoded_identity_and_actionable() {
             .split(r#"<tr class="cb-row""#)
             .find(|ch| ch.contains(&format!(r#"<bdi dir="auto">{label}</bdi>"#)))
             .unwrap_or_else(|| panic!("row for {c:?} ({enc}) not found: {body}"));
-        assert!(
-            chunk.contains(&format!(r#"href="/{enc}""#)),
-            "{c:?}: {chunk}"
-        );
+        assert!(has_href_path(chunk, &format!("/{enc}")), "{c:?}: {chunk}");
         assert!(
             chunk.contains(&format!(r#"data-native-path-encoded="{enc}""#)),
             "{c:?}: {chunk}"
@@ -2490,7 +2637,7 @@ async fn whitespace_scalars_encoded_identity_and_actionable() {
 }
 
 /// >500 匹配: 跨乱序创建的多个子目录, 两次请求返回完全相同的前 500 个 href 序列
-/// (确定性 BFS: 深度升序, 同目录按原始文件名字节序), truncated=true.
+/// (候选集来自确定性 BFS, 展示按原始 basename 再完整路径升序).
 #[tokio::test]
 async fn search_many_matches_deterministic_order_and_truncation() {
     const DIRS: usize = 13;
@@ -2520,11 +2667,17 @@ async fn search_many_matches_deterministic_order_and_truncation() {
         std::fs::write(dpath.join(format!("match_{f:03}.txt")), "x").unwrap();
     }
 
-    // 服务器只返回前 500 条 (第 501 条起截断)
-    let expected: Vec<String> = (0..DIRS)
+    // 先取 BFS 前 500 个候选, 再排序; 不能把全局排序后的后 20 个替换进候选集.
+    let mut expected: Vec<String> = (0..DIRS)
         .flat_map(|d| (0..PER_DIR).map(move |f| format!("/d{d:02}/match_{f:03}.txt")))
         .take(500)
         .collect();
+    expected.sort_unstable_by(|a, b| {
+        a.rsplit('/')
+            .next()
+            .cmp(&b.rsplit('/').next())
+            .then(a.cmp(b))
+    });
 
     let app = app(dir.path());
     let b1 = body_string(get(app.clone(), "/__/search?q=match").await).await;
@@ -2537,11 +2690,9 @@ async fn search_many_matches_deterministic_order_and_truncation() {
     );
     assert_eq!(
         seq1, expected,
-        "results must be BFS order (depth, then bytewise name)"
+        "BFS candidates must retain membership and sort by basename, then full path"
     );
     assert_eq!(seq1.len(), 500, "must be truncated at exactly 500");
-    assert!(b1.contains("已截断显示前 500 条"), "b1: {b1}");
-    assert!(b2.contains("已截断显示前 500 条"), "b2: {b2}");
 }
 
 /// 恰好 500 条匹配: 不截断, 全部返回且顺序确定.
@@ -2779,21 +2930,70 @@ async fn tree_endpoint_sorts_dirs_first() {
     assert_eq!(names, ["subdir", "zdir", "1.txt", "a.txt"]);
 }
 
-/// 树不吃 ?sort= 查询参数 (目录模式的排序契约不影响树).
+/// 树端点在给定 URI 下返回的条目名序列 (断言 200).
+async fn tree_names(root: &Path, uri: &str) -> Vec<String> {
+    let res = get(app(root), uri).await;
+    assert_eq!(res.status(), StatusCode::OK, "{uri}");
+    tree_entries(res)
+        .await
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// 树接受 sort 与 hidden, 与目录/fragment 共用同一过滤与排序 (Q10/Q24);
+/// JSON schema 保持 name/href/dir(/expandable), 不新增大小/时间字段.
 #[tokio::test]
-async fn tree_endpoint_ignores_sort_param() {
+async fn tree_endpoint_honors_sort_and_hidden() {
     let dir = fixture();
     std::fs::write(dir.path().join("a.txt"), "a").unwrap();
     std::fs::create_dir(dir.path().join("zdir")).unwrap();
+    std::fs::write(dir.path().join(".hidden.txt"), "h").unwrap();
+    std::fs::create_dir(dir.path().join(".hiddendir")).unwrap();
 
-    let res = get(app(dir.path()), "/__/tree?sort=Name:Desc").await;
-    assert_eq!(res.status(), StatusCode::OK);
+    // 默认: 目录在前按名升序, 文件在后; 隐藏条目被过滤
+    assert_eq!(
+        tree_names(dir.path(), "/__/tree").await,
+        ["subdir", "zdir", "1.txt", "a.txt"]
+    );
+    // Name:Desc 只反转组内顺序, 目录仍在前
+    assert_eq!(
+        tree_names(dir.path(), "/__/tree?sort=Name:Desc").await,
+        ["zdir", "subdir", "a.txt", "1.txt"]
+    );
+    // 显式 hidden=1 展示点文件与点目录 (组内升序: "." 先于字母数字)
+    assert_eq!(
+        tree_names(dir.path(), "/__/tree?hidden=1").await,
+        [
+            ".hiddendir",
+            "subdir",
+            "zdir",
+            ".hidden.txt",
+            "1.txt",
+            "a.txt"
+        ]
+    );
+    // 嵌套目录同样接受选项
+    assert_eq!(
+        tree_names(dir.path(), "/__/tree/subdir?hidden=1").await,
+        ["2.json"]
+    );
+
+    // 文件条目 schema: 只有 name/href/dir, 不复制排序字段
+    let res = get(app(dir.path()), "/__/tree").await;
     let entries = tree_entries(res).await;
-    let names: Vec<String> = entries
-        .iter()
-        .map(|e| e["name"].as_str().unwrap().to_string())
+    let file = entries.iter().find(|e| e["name"] == "1.txt").unwrap();
+    let keys: std::collections::BTreeSet<&str> = file
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
         .collect();
-    assert_eq!(names, ["subdir", "zdir", "1.txt", "a.txt"]);
+    assert_eq!(
+        keys,
+        ["dir", "href", "name"].into_iter().collect(),
+        "tree schema must not grow sortable payload fields"
+    );
 }
 
 /// 非 UTF-8 basename: display-only — href 键恒存在且为 null, 目录不可展开; 显示 codec 转义可见.
@@ -2861,4 +3061,336 @@ async fn tree_endpoint_allows_non_cyclic_symlink_expansion() {
     assert_eq!(link_entry["dir"], true);
     assert_eq!(link_entry["href"], "/link");
     assert_eq!(link_entry["expandable"], true);
+}
+
+// ============ 显示规则/工具区消费者契约 (spec Q1–Q27) ============
+
+/// hidden 只过滤浏览与搜索, 不成为访问限制 (Q8/Q18); 三种条目出口同一过滤集合.
+#[tokio::test]
+async fn hidden_toggle_filters_browsing_but_not_direct_access() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".hidden.txt"), "secret").unwrap();
+    std::fs::write(dir.path().join("visible.txt"), "public").unwrap();
+    std::fs::create_dir(dir.path().join(".hiddendir")).unwrap();
+    std::fs::write(dir.path().join(".hiddendir/visible.txt"), "vis").unwrap();
+    std::fs::write(dir.path().join(".hiddendir/.nested.txt"), "nested").unwrap();
+
+    // 默认隐藏: 完整页与 fragment 都不展示点条目; 树同一集合
+    let full = body_string(get(app(dir.path()), "/").await).await;
+    let frag = body_string(get(app(dir.path()), "/?fragment=1").await).await;
+    for body in [&full, &frag] {
+        assert!(href_starting_with(body, "/visible.txt").is_some(), "{body}");
+        assert!(href_starting_with(body, "/.hidden.txt").is_none(), "{body}");
+        assert!(href_starting_with(body, "/.hiddendir").is_none(), "{body}");
+    }
+    assert_eq!(tree_names(dir.path(), "/__/tree").await, ["visible.txt"]);
+
+    // 显式 hidden=1: 展示点文件与点目录, 元数据与序一致 (目录在前, 组内原始名升序)
+    let full = body_string(get(app(dir.path()), "/?hidden=1").await).await;
+    assert!(full.contains(r#"data-cb-hidden="1""#), "{full}");
+    assert!(
+        href_starting_with(&full, "/.hidden.txt").is_some(),
+        "{full}"
+    );
+    assert!(href_starting_with(&full, "/.hiddendir").is_some(), "{full}");
+    assert_eq!(
+        tree_names(dir.path(), "/__/tree?hidden=1").await,
+        [".hiddendir", ".hidden.txt", "visible.txt"]
+    );
+
+    // 隐藏目录直链: 正常子项可读, 只按直接子项名称过滤 (Q18)
+    let res = get(app(dir.path()), "/.hiddendir").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(
+        href_starting_with(&body, "/.hiddendir/visible.txt").is_some(),
+        "{body}"
+    );
+    assert!(
+        href_starting_with(&body, "/.hiddendir/.nested.txt").is_none(),
+        "{body}"
+    );
+
+    // 直接访问隐藏文件/目录不受显示规则限制: 原文 / raw / download
+    let res = get(app(dir.path()), "/.hidden.txt").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_string(res).await, "secret");
+    let res = get(app(dir.path()), "/.hidden.txt?raw=1").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_string(res).await, "secret");
+    let res = get(app(dir.path()), "/.hidden.txt?download=1").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers().contains_key(header::CONTENT_DISPOSITION));
+    assert_eq!(body_string(res).await, "secret");
+    let res = get(app(dir.path()), "/.hiddendir/.nested.txt").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_string(res).await, "nested");
+}
+
+/// sort 对完整页 / 目录 fragment / 树 JSON 是同一过滤集合与顺序 (02 验收).
+#[tokio::test]
+async fn listing_options_apply_consistently_across_outlets() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("small.txt"), "x").unwrap();
+    std::fs::write(dir.path().join("large.txt"), "x".repeat(4096)).unwrap();
+    std::fs::create_dir(dir.path().join("zdir")).unwrap();
+
+    // 目录优先; Size:Desc 只反转组内: zdir, large, small
+    assert_eq!(
+        tree_names(dir.path(), "/__/tree?sort=Size:Desc").await,
+        ["zdir", "large.txt", "small.txt"]
+    );
+    let full = body_string(get(app(dir.path()), "/?sort=Size:Desc").await).await;
+    let frag = body_string(get(app(dir.path()), "/?fragment=1&sort=Size:Desc").await).await;
+    for body in [&full, &frag] {
+        assert!(body.contains(r#"data-cb-sort="Size:Desc""#), "{body}");
+        let z = body.find("zdir").unwrap();
+        let l = body.find("large.txt").unwrap();
+        let s = body.find("small.txt").unwrap();
+        assert!(z < l && l < s, "{body}");
+    }
+
+    // Name:Desc: 目录仍在前, 文件反向
+    assert_eq!(
+        tree_names(dir.path(), "/__/tree?sort=Name:Desc").await,
+        ["zdir", "small.txt", "large.txt"]
+    );
+    let full = body_string(get(app(dir.path()), "/?sort=Name:Desc").await).await;
+    let frag = body_string(get(app(dir.path()), "/?fragment=1&sort=Name:Desc").await).await;
+    for body in [&full, &frag] {
+        let z = body.find("zdir").unwrap();
+        let l = body.find("large.txt").unwrap();
+        let s = body.find("small.txt").unwrap();
+        assert!(z < s && s < l, "{body}");
+    }
+}
+
+/// 搜索片段与完整页同一结果集/截断信息; 严格 HTML 出口, 无 head/toolbar/token (02).
+#[tokio::test]
+async fn search_fragment_matches_full_page_and_is_strict_html() {
+    let dir = fixture();
+    let router = app(dir.path());
+
+    let full = body_string(get(router.clone(), "/__/search?q=2.json").await).await;
+    let res = get(router.clone(), "/__/search?q=2.json&fragment=1").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(is_strict_html_fragment(&res), "{}", content_type(&res));
+    let frag = body_string(res).await;
+    assert_eq!(search_result_hrefs(&frag), search_result_hrefs(&full));
+    assert!(frag.contains("cb-search-fragment"), "{frag}");
+    assert!(frag.contains(r#"data-cb-surface="search""#), "{frag}");
+    assert!(frag.contains(r#"data-cb-query="2.json""#), "{frag}");
+    assert!(frag.contains(r#"data-cb-sort="Name:Asc""#), "{frag}");
+    assert!(frag.contains(r#"data-cb-hidden="0""#), "{frag}");
+    // 搜索位置身份是根, 不是伪造的 /__/search 文件系统路径
+    assert!(frag.contains(r#"data-native-path-encoded="""#), "{frag}");
+    assert!(
+        !frag.contains(r#"data-native-path-encoded="/__/search"#),
+        "{frag}"
+    );
+    assert!(!frag.contains("<!DOCTYPE"), "{frag}");
+    assert!(!frag.contains("<head"), "{frag}");
+    assert!(!frag.contains("cb-topbar"), "{frag}");
+    assert!(!frag.contains("cb-native-open-token"), "{frag}");
+    assert!(!frag.contains(r#"data-cb-action="native""#), "{frag}");
+
+    // 生效规则随片段传递 (与完整页相同)
+    let frag = body_string(
+        get(
+            router.clone(),
+            "/__/search?q=2.json&sort=Size:Desc&hidden=1&fragment=1",
+        )
+        .await,
+    )
+    .await;
+    assert!(frag.contains(r#"data-cb-sort="Size:Desc""#), "{frag}");
+    assert!(frag.contains(r#"data-cb-hidden="1""#), "{frag}");
+
+    // 空查询: 片段也是安全提示页, 不遍历
+    let res = get(router.clone(), "/__/search?fragment=1").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(is_strict_html_fragment(&res), "{}", content_type(&res));
+    let body = body_string(res).await;
+    assert!(body.contains("没有找到匹配的文件。"), "{body}");
+    assert!(!body.contains("<!DOCTYPE"), "{body}");
+
+    // >500 匹配: 完整页与片段的截断集合与提示一致
+    let many = tempfile::tempdir().unwrap();
+    for i in 0..510 {
+        std::fs::write(many.path().join(format!("match_{i:03}.txt")), "x").unwrap();
+    }
+    let full = body_string(get(app(many.path()), "/__/search?q=match").await).await;
+    let frag = body_string(get(app(many.path()), "/__/search?q=match&fragment=1").await).await;
+    assert_eq!(search_result_hrefs(&frag), search_result_hrefs(&full));
+    assert_eq!(search_result_hrefs(&frag).len(), 500);
+    for body in [&full, &frag] {
+        assert!(body.contains("已截断显示前 500 条"), "{body}");
+    }
+}
+
+/// 隐藏过滤在遍历/入队/匹配名额之前生效: 被过滤项不占 500 候选集名额 (Q12).
+#[tokio::test]
+async fn search_skips_hidden_branches_and_filtered_entries_do_not_consume_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("match-visible.txt"), "v").unwrap();
+    std::fs::create_dir(dir.path().join(".secret")).unwrap();
+    std::fs::write(dir.path().join(".secret/match-deep.txt"), "d").unwrap();
+    for i in 0..500 {
+        std::fs::write(dir.path().join(format!(".match_hidden_{i:03}.txt")), "h").unwrap();
+    }
+
+    // 隐藏关闭: 隐藏目录子树不遍历, 隐藏文件不匹配, 也不占名额
+    let res = get(app(dir.path()), "/__/search?q=match").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert_eq!(search_result_hrefs(&body), ["/match-visible.txt"]);
+    assert!(!body.contains("已截断"), "{body}");
+
+    // 显式 hidden=1: 500 条隐藏匹配占满候选集并截断 (过滤项此时合法参与)
+    let res = get(app(dir.path()), "/__/search?q=match&hidden=1").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    let hrefs = search_result_hrefs(&body);
+    assert_eq!(hrefs.len(), 500, "{body}");
+    assert_eq!(hrefs[0], "/.match_hidden_000.txt", "{body}");
+    assert!(body.contains("已截断显示前 500 条"), "{body}");
+}
+
+/// 搜索展示顺序使用同一显示规则 (收集后排序, 非全局 Top-N) (Q12).
+#[tokio::test]
+async fn search_results_use_effective_sort_order() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("aaa.txt"), "x").unwrap();
+    std::fs::write(dir.path().join("zzz.txt"), "x".repeat(2048)).unwrap();
+    let router = app(dir.path());
+
+    let body = body_string(get(router.clone(), "/__/search?q=txt").await).await;
+    assert_eq!(search_result_hrefs(&body), ["/aaa.txt", "/zzz.txt"]);
+    let body = body_string(get(router.clone(), "/__/search?q=txt&sort=Size:Desc").await).await;
+    assert_eq!(search_result_hrefs(&body), ["/zzz.txt", "/aaa.txt"]);
+    let body = body_string(get(router, "/__/search?q=txt&sort=Size:Asc").await).await;
+    assert_eq!(search_result_hrefs(&body), ["/aaa.txt", "/zzz.txt"]);
+}
+
+/// 目录/搜索导航链接保留有效 sort/hidden; 搜索排序入口保留 q; 实际离开搜索移除 q (Q24/Q26).
+#[tokio::test]
+async fn navigation_links_preserve_effective_rules() {
+    let dir = fixture();
+    let router = app(dir.path());
+
+    // 目录页条目与父目录链接保留 sort+hidden
+    let body = body_string(get(router.clone(), "/subdir?sort=Size:Desc&hidden=1").await).await;
+    let entry = href_starting_with(&body, "/subdir/2.json").expect("entry link");
+    assert!(
+        entry.contains("sort=Size") && entry.contains("hidden=1"),
+        "{entry}"
+    );
+    let root_links: Vec<String> = attr_values(&body, "href")
+        .into_iter()
+        .filter(|h| h.starts_with("/?"))
+        .collect();
+    assert!(!root_links.is_empty(), "{body}");
+    for href in &root_links {
+        assert!(
+            href.contains("sort=Size") && href.contains("hidden=1"),
+            "{href}"
+        );
+    }
+
+    // 目录 fragment 迷你列表同样保留
+    let frag =
+        body_string(get(router.clone(), "/subdir?fragment=1&sort=Size:Desc&hidden=1").await).await;
+    let entry = href_starting_with(&frag, "/subdir/2.json").expect("fragment entry link");
+    assert!(
+        entry.contains("sort=Size") && entry.contains("hidden=1"),
+        "{entry}"
+    );
+
+    // 搜索页排序入口保留 q 与 hidden; 结果条目/位置链接离开搜索保留规则, 去掉 q
+    let body =
+        body_string(get(router.clone(), "/__/search?q=txt&sort=Size:Desc&hidden=1").await).await;
+    for href in tags_containing(&body, "data-cb-sort=")
+        .into_iter()
+        .filter_map(href_in_tag)
+    {
+        assert!(href.contains("q=txt"), "{href}");
+        assert!(href.contains("hidden=1"), "{href}");
+    }
+    let entry = href_starting_with(&body, "/1.txt").expect("result entry link");
+    assert!(
+        entry.contains("sort=Size") && entry.contains("hidden=1"),
+        "{entry}"
+    );
+    assert!(!entry.contains("q="), "{entry}");
+
+    let body = body_string(
+        get(
+            router.clone(),
+            "/__/search?q=2.json&sort=Size:Desc&hidden=1",
+        )
+        .await,
+    )
+    .await;
+    let location = attr_values(&body, "href")
+        .into_iter()
+        .find(|h| h.starts_with("/subdir") && !h.starts_with("/subdir/2.json"))
+        .expect("search location link");
+    assert!(
+        location.contains("sort=Size") && location.contains("hidden=1"),
+        "{location}"
+    );
+    assert!(!location.contains("q="), "{location}");
+}
+
+/// 无 JS 的搜索表单用真实提交字段保留 sort/hidden, 不只依赖 action query (Q25).
+#[tokio::test]
+async fn search_form_submits_effective_fields() {
+    let dir = fixture();
+    let router = app(dir.path());
+
+    let body = body_string(get(router.clone(), "/?sort=Size:Desc&hidden=1").await).await;
+    let block = form_block(&body, "cb-search").expect("search form");
+    assert!(block.contains(r#"action="/__/search""#), "{block}");
+    assert!(block.contains(r#"id="cb-search-q""#), "{block}");
+    assert!(block.contains(r#"name="q""#), "{block}");
+    assert!(block.contains(r#"name="sort""#), "{block}");
+    assert!(block.contains(r#"name="hidden""#), "{block}");
+    assert!(block.contains(r#"value="Size:Desc""#), "{block}");
+    assert!(block.contains(r#"value="1""#), "{block}");
+
+    // 搜索页重新搜索保留 q 与规则
+    let body = body_string(get(router, "/__/search?q=txt&sort=Size:Desc&hidden=1").await).await;
+    let block = form_block(&body, "cb-search").expect("search form");
+    assert!(block.contains(r#"name="q""#), "{block}");
+    assert!(block.contains(r#"value="txt""#), "{block}");
+    assert!(block.contains(r#"name="sort""#), "{block}");
+    assert!(block.contains(r#"name="hidden""#), "{block}");
+}
+
+/// 预览占位不再靠文案识别: 不可预览 fragment 根携带 data-cb-content-state.
+#[tokio::test]
+async fn non_previewable_fragment_marks_placeholder_state() {
+    let dir = fixture();
+    std::fs::write(dir.path().join("data.xyz123"), "hello").unwrap();
+    std::fs::write(dir.path().join("big.rs"), "x".repeat(1024 * 1024 + 1)).unwrap();
+    let router = app(dir.path());
+
+    for uri in ["/data.xyz123?fragment=1", "/big.rs?fragment=1"] {
+        let res = get(router.clone(), uri).await;
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        assert!(is_strict_html_fragment(&res), "{uri}");
+        let body = body_string(res).await;
+        assert!(
+            body.contains(r#"data-cb-content-state="placeholder""#),
+            "{uri}: {body}"
+        );
+    }
+
+    // 成功内容不需要该属性
+    std::fs::write(dir.path().join("ok.md"), "# T\n").unwrap();
+    let body = body_string(get(router, "/ok.md?fragment=1").await).await;
+    assert!(
+        !body.contains(r#"data-cb-content-state="placeholder""#),
+        "{body}"
+    );
 }

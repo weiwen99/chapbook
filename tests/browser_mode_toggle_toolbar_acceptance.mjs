@@ -1,4 +1,4 @@
-// 模式切换按钮移入左侧工具栏验收 — 确定性 CDP 浏览器验收.
+// 统一顶部图标工具区与三视图/显示规则验收 — 确定性 CDP 浏览器验收.
 //
 // 手动调用 (非 cargo test), 自包含: 仅 Node 内置模块 + 系统 Chrome 的 CDP
 // WebSocket; 自建临时 fixture, 自行启动 target/release/chapbook 并监听固定
@@ -11,19 +11,21 @@
 // 路径 (macOS 与 Linux) 与系统常见位置.
 //
 // 场景:
-//   M1  目录页目录模式: body 顶部左缘工具栏行含迁入的顶栏搜索表单 + 模式切换
-//       按钮 (末位); 无浮动 fixed/top/right 定位; 标签/aria-pressed 正确
-//   M2  切换进树模式 (宽屏): 目录工具栏行隐藏; 树顶栏顺序 搜索→折叠→模式切换;
-//       按钮同元素跨模式移动; localStorage 持久化; 无浮动定位; 无页面错误
-//   M3  切回目录模式: 工具栏行恢复; 按钮迁回; 键清除 (搜索框值随整页重载
-//       重置, 非本变更契约)
-//   M4  持久化: 树模式下整页重载仍为树模式 (localStorage 生效)
-//   M5  窄屏抽屉: 抽屉顶栏含搜索 + 模式切换, 折叠按钮隐藏; 抽屉内切换可用
-//   M6  搜索页: 无工具栏行/无切换按钮/无树壳; 顶栏搜索表单保持原位
-//   M7  文档页: 左缘工具栏行含树结构搜索表单 (独立 id) + 切换按钮; 树模式
-//       TOC 列几何不变 (240px); 分隔线几何不变
-//   M8  折叠/恢复: 折叠后恢复按钮可见、树隐藏; 恢复后展开; 偏好持久化
-//   M9  调整器拖拽: 指针拖拽改树宽 + 持久化; 网格列几何 (238px 8px 1fr)
+//   T1 目录列表默认: 统一顶栏 (搜索表单 + tree/list/grid 图标组 + 隐藏开关 +
+//       12 项排序入口), 页面语义元数据; 旧模式按钮/工具栏行已删除
+//   T2 视图切换: 浏览->树同一位置 replace (无重载); 树->网格整页补能力
+//       handoff (URL/历史项不变); 工具区在树模式仍位于树之上
+//   T3 v 键循环 list->grid->tree->list; 搜索框聚焦/修饰键组合时 v 不切换视图
+//   T4 隐藏开关: 同历史项内更新规则/URL/偏好; 活动文档保持同一 DOM, 零导航/
+//       零 fragment 重取
+//   T5 排序入口: Size:Desc 同历史项内生效 (URL/history/偏好/顺序/当前项一致)
+//   T5b 已打开文档 × 列表/网格 × 排序/隐藏: 列表原地更新, 活动文档不重转换
+//   T6 独立阅读页: 无选中视图; 隐藏/排序禁用并说明; 列表入口回父目录; 无 token
+//   T7 搜索页: 树视图右侧安全搜索片段; 换视图/补能力保留 q/sort/hidden 与历史
+//   T8 无 JS: 隐藏/排序链接与真实表单提交跨导航保留必要字段
+//
+// 本脚本显式禁用 BackForwardCache (--disable-features) 以隔离确定性场景;
+// 允许 BFCache 的 persisted pageshow 生命周期在 native-open 验收脚本中验证.
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -228,13 +230,29 @@ class Page {
     throw new Error('waitLoad timeout');
   }
 
-  // 应用侧全部经 document 级 click 监听分发, 无 isTrusted 依赖 — 合成 DOM
-  // click 与真实指针事件走同一处理器, 确定性最高.
+  // 真实指针 + 命中检查, 不用 el.click() 绕过遮挡/闭合菜单/不可见控件.
   async click(selector) {
-    const ok = await this.evaluate(
-      '(() => { const el = document.querySelector(' + JSON.stringify(selector) + '); if (!el) return false; el.click(); return true; })()'
-    );
-    if (!ok) throw new Error('click: no element for ' + selector);
+    for (let step = 0; step < 2; step++) {
+      const point = await this.evaluate(`(() => {
+        const el = document.querySelector(${JSON.stringify(selector)});
+        if (!el) throw new Error('click: missing element');
+        const details = el.closest('summary') ? null : el.closest('details:not([open])');
+        const target = details ? details.querySelector('summary') : el;
+        target.scrollIntoView({block:'nearest',inline:'nearest'});
+        const r = target.getBoundingClientRect();
+        const x = r.left + r.width / 2, y = r.top + r.height / 2;
+        const hit = document.elementFromPoint(x, y);
+        if (!r.width || !r.height || !hit || !target.contains(hit)) {
+          throw new Error('click: invisible or covered element ' + ${JSON.stringify(selector)});
+        }
+        return {x,y,opening:!!details};
+      })()`);
+      await this.send('Input.dispatchMouseEvent', {type:'mouseMoved',x:point.x,y:point.y});
+      await this.send('Input.dispatchMouseEvent', {type:'mousePressed',x:point.x,y:point.y,button:'left',clickCount:1});
+      await this.send('Input.dispatchMouseEvent', {type:'mouseReleased',x:point.x,y:point.y,button:'left',clickCount:1});
+      if (!point.opening) return;
+    }
+    throw new Error('click: menu did not open for ' + selector);
   }
 
   async close() {
@@ -260,6 +278,11 @@ class Page {
 function makeFixture() {
   const root = mkdtempSync(join(tmpdir(), 'cb-mode-accept-fixture-'));
   writeFileSync(join(root, 'a.md'), '# A\n\npage a.\n\n## A-2\n\nmore.\n');
+  writeFileSync(join(root, 'big.bin'), 'B'.repeat(4096));
+  writeFileSync(join(root, 'leaf.md'), '# Leaf\n\nleaf page.\n');
+  writeFileSync(join(root, '.hidden.txt'), 'hidden secret\n');
+  mkdirSync(join(root, '.hiddendir'), { recursive: true });
+  writeFileSync(join(root, '.hiddendir', 'secret.md'), '# Secret\n\nhidden dir page.\n');
   mkdirSync(join(root, 'adir', 'grand'), { recursive: true });
   writeFileSync(join(root, 'adir', 'child.md'), '# Child\n\nchild page.\n');
   writeFileSync(join(root, 'adir', 'grand', 'leaf.md'), '# Leaf\n\nleaf page.\n');
@@ -290,13 +313,59 @@ let server = null;
 let chrome = null;
 let chromeProfile = null;
 let fixture = null;
+let browserCdp = null;
+let BASE = null;
+let shutdownPromise = null;
 
-function cleanup() {
+// 等子进程真正退出 (收到 signal 后仍可能处于写入 profile 的关闭阶段).
+function waitExit(child, timeoutMs) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const onExit = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      child.removeListener('exit', onExit);
+      resolve(child.exitCode !== null || child.signalCode !== null);
+    }, timeoutMs);
+    child.once('exit', onExit);
+  });
+}
+
+// 确定性收尾: 关 CDP -> 终止并等待子进程 -> 删 profile/fixture. 幂等;
+// 收尾自身失败只告警, 不掩盖真实断言错误.
+function shutdown() {
+  if (!shutdownPromise) {
+    shutdownPromise = doShutdown().catch((err) => {
+      console.error('WARN: shutdown failed: ' + (err && err.message ? err.message : String(err)));
+    });
+  }
+  return shutdownPromise;
+}
+
+async function doShutdown() {
+  if (browserCdp) {
+    try {
+      browserCdp.close();
+    } catch {
+      /* 已关闭 */
+    }
+    browserCdp = null;
+  }
   if (server) {
     try {
       server.kill('SIGTERM');
     } catch {
       /* 已退出 */
+    }
+    if (!(await waitExit(server, 2000))) {
+      try {
+        server.kill('SIGKILL');
+      } catch {
+        /* 已退出 */
+      }
+      await waitExit(server, 2000);
     }
     server = null;
   }
@@ -306,22 +375,67 @@ function cleanup() {
     } catch {
       /* 已退出 */
     }
+    // Chrome 关闭阶段仍会写 profile: 等它真正退出后再删, 否则残留临时目录.
+    if (!(await waitExit(chrome, 4000))) {
+      try {
+        chrome.kill('SIGKILL');
+      } catch {
+        /* 已退出 */
+      }
+      await waitExit(chrome, 2000);
+    }
     chrome = null;
   }
   if (chromeProfile) {
     let lastErr = null;
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 20; i++) {
       try {
         rmSync(chromeProfile, { recursive: true, force: true });
         lastErr = null;
         break;
       } catch (err) {
         lastErr = err;
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        await sleep(100);
       }
     }
     if (lastErr) {
       console.error('WARN: chrome profile cleanup failed (left for OS): ' + lastErr.message);
+    }
+    chromeProfile = null;
+  }
+  if (fixture) {
+    try {
+      rmSync(fixture, { recursive: true, force: true });
+    } catch (err) {
+      console.error('WARN: fixture cleanup failed (left for OS): ' + err.message);
+    }
+    fixture = null;
+  }
+}
+
+// 进程退出兜底 (正常/失败路径已由 shutdown 收尾): 仅同步信号 + 尽力删除.
+function cleanup() {
+  if (server) {
+    try {
+      server.kill('SIGKILL');
+    } catch {
+      /* 已退出 */
+    }
+    server = null;
+  }
+  if (chrome) {
+    try {
+      chrome.kill('SIGKILL');
+    } catch {
+      /* 已退出 */
+    }
+    chrome = null;
+  }
+  if (chromeProfile) {
+    try {
+      rmSync(chromeProfile, { recursive: true, force: true });
+    } catch {
+      /* 退出兜底不重试 */
     }
     chromeProfile = null;
   }
@@ -333,120 +447,140 @@ function cleanup() {
 
 process.on('exit', cleanup);
 process.on('SIGINT', () => {
-  cleanup();
-  process.exit(130);
+  shutdown().finally(() => process.exit(130));
 });
 process.on('SIGTERM', () => {
-  cleanup();
-  process.exit(143);
+  shutdown().finally(() => process.exit(143));
 });
 
 /* ---------- 启动: fixture + server + chrome + CDP ---------- */
 
-fixture = makeFixture();
-const port = await pickPort();
-const BIN = join(import.meta.dirname, '..', 'target', 'release', 'chapbook');
+// 先解析外部前提 (二进制/Chrome), 再分配 fixture/server/chrome — 初始化失败
+// 不留下需要回收的临时资源 (fixture 在 makeFixture 之前无占用).
+const BIN = process.env.CB_BIN || join(import.meta.dirname, '..', 'target', 'release', 'chapbook');
 if (!existsSync(BIN)) {
   throw new Error('missing ' + BIN + ' — run `cargo build --release` first');
 }
-server = spawn(BIN, ['--port', String(port), fixture], { stdio: ['ignore', 'pipe', 'pipe'] });
-let serverErr = '';
-server.stderr.on('data', (d) => {
-  serverErr += d.toString();
-});
-{
-  let ready = false;
-  const t0 = Date.now();
-  while (Date.now() - t0 < 15000) {
-    if (server.exitCode !== null) {
-      throw new Error('chapbook exited early (' + server.exitCode + '): ' + serverErr.slice(-2000));
-    }
-    try {
-      const res = await fetch('http://127.0.0.1:' + port + '/');
-      if (res.ok) {
-        ready = true;
-        break;
-      }
-    } catch {
-      /* 未就绪 */
-    }
-    await sleep(100);
-  }
-  if (!ready) {
-    throw new Error('chapbook did not become ready on port ' + port + ': ' + serverErr.slice(-2000));
-  }
-}
-const BASE = 'http://127.0.0.1:' + port;
-
 const chromePath = findChrome();
 if (!chromePath) {
   throw new Error('no Chrome found — set CHROME_BIN or install ms-playwright chromium');
 }
-chromeProfile = mkdtempSync(join(tmpdir(), 'cb-mode-accept-chrome-'));
-const headlessFlag = chromePath.includes('headless_shell') ? [] : ['--headless=new'];
-chrome = spawn(
-  chromePath,
-  [
-    ...headlessFlag,
-    '--remote-debugging-port=0',
-    '--user-data-dir=' + chromeProfile,
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-background-networking',
-    '--disable-component-update',
-    '--disable-default-apps',
-    '--disable-sync',
-    '--metrics-recording-only',
-    '--disable-features=BackForwardCache',
-    ...(process.platform === 'linux' ? ['--no-sandbox', '--disable-dev-shm-usage'] : []),
-    'about:blank',
-  ],
-  { stdio: ['ignore', 'ignore', 'pipe'] }
-);
-let chromeErr = '';
-chrome.stderr.on('data', (d) => {
-  chromeErr += d.toString();
-});
-const portFile = join(chromeProfile, 'DevToolsActivePort');
-let cdpPort = null;
-let wsPath = null;
-{
-  const t0 = Date.now();
-  while (Date.now() - t0 < 20000) {
-    if (chrome.exitCode !== null) {
-      throw new Error('chrome exited early (' + chrome.exitCode + '): ' + chromeErr.slice(-2000));
-    }
-    try {
-      const txt = readFileSync(portFile, 'utf8').split('\n');
-      if (txt[0]) {
-        cdpPort = parseInt(txt[0], 10);
-        wsPath = txt[1] || '';
-        break;
+
+// 启动步骤整体可失败: 任一步失败先确定性收尾 (server/chrome/profile/fixture)
+// 再上报, 不用等进程退出兜底.
+async function boot() {
+  fixture = makeFixture();
+  const port = await pickPort();
+  server = spawn(BIN, ['--port', String(port), fixture], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let serverErr = '';
+  server.stderr.on('data', (d) => {
+    serverErr += d.toString();
+  });
+  {
+    let ready = false;
+    const t0 = Date.now();
+    while (Date.now() - t0 < 15000) {
+      if (server.exitCode !== null) {
+        throw new Error('chapbook exited early (' + server.exitCode + '): ' + serverErr.slice(-2000));
       }
-    } catch {
-      /* 端口文件未就绪 */
+      try {
+        const res = await fetch('http://127.0.0.1:' + port + '/');
+        if (res.ok) {
+          ready = true;
+          break;
+        }
+      } catch {
+        /* 未就绪 */
+      }
+      await sleep(100);
     }
-    await sleep(100);
+    if (!ready) {
+      throw new Error('chapbook did not become ready on port ' + port + ': ' + serverErr.slice(-2000));
+    }
   }
-  if (cdpPort === null) {
-    throw new Error('chrome DevToolsActivePort not ready: ' + chromeErr.slice(-2000));
+  BASE = 'http://127.0.0.1:' + port;
+
+  chromeProfile = mkdtempSync(join(tmpdir(), 'cb-mode-accept-chrome-'));
+  const headlessFlag = chromePath.includes('headless_shell') ? [] : ['--headless=new'];
+  chrome = spawn(
+    chromePath,
+    [
+      ...headlessFlag,
+      '--remote-debugging-port=0',
+      '--user-data-dir=' + chromeProfile,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-background-networking',
+      '--disable-component-update',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--disable-features=BackForwardCache',
+      ...(process.platform === 'linux' ? ['--no-sandbox', '--disable-dev-shm-usage'] : []),
+      'about:blank',
+    ],
+    { stdio: ['ignore', 'ignore', 'pipe'] }
+  );
+  let chromeErr = '';
+  chrome.stderr.on('data', (d) => {
+    chromeErr += d.toString();
+  });
+  const portFile = join(chromeProfile, 'DevToolsActivePort');
+  let cdpPort = null;
+  let wsPath = null;
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 20000) {
+      if (chrome.exitCode !== null) {
+        throw new Error('chrome exited early (' + chrome.exitCode + '): ' + chromeErr.slice(-2000));
+      }
+      try {
+        const txt = readFileSync(portFile, 'utf8').split('\n');
+        if (txt[0]) {
+          cdpPort = parseInt(txt[0], 10);
+          wsPath = txt[1] || '';
+          break;
+        }
+      } catch {
+        /* 端口文件未就绪 */
+      }
+      await sleep(100);
+    }
+    if (cdpPort === null) {
+      throw new Error('chrome DevToolsActivePort not ready: ' + chromeErr.slice(-2000));
+    }
   }
+  browserCdp = new Cdp('ws://127.0.0.1:' + cdpPort + wsPath);
+  await browserCdp.open();
 }
-const browserCdp = new Cdp('ws://127.0.0.1:' + cdpPort + wsPath);
-await browserCdp.open();
+
+try {
+  await boot();
+} catch (err) {
+  await shutdown();
+  throw err;
+}
 
 /* ---------- 通用场景工具 ---------- */
 
 let activePage = null;
 
 async function runScenario(name, fn) {
+  let failure = null;
   try {
     await fn();
+  } catch (err) {
+    failure = err;
   } finally {
     if (activePage) {
       await activePage.close();
       activePage = null;
     }
+  }
+  if (failure) {
+    // 断言失败: 先确定性收尾 (server/chrome/profile/fixture) 再上报.
+    await shutdown();
+    throw failure;
   }
 }
 
@@ -481,245 +615,758 @@ async function fresh(width = 1280, height = 800) {
   return { page, pageErrors };
 }
 
-// 切换进树模式并等待根列表落地
-async function enterTree(page, waitMs = 1500) {
-  if (!(await page.evaluate("document.body.classList.contains('cb-tree-mode')"))) {
-    await page.click('.cb-mode-toggle');
-  }
+/* ---------- 界面/状态查询与交互工具 ---------- */
+
+async function waitFor(fn, label = '?', timeoutMs = 10000, step = 50) {
   const t0 = Date.now();
-  while (Date.now() - t0 < 10000) {
-    if (await page.evaluate("!!document.querySelector('ul#cb-tree-root > li.cb-tree-node')")) break;
-    await sleep(100);
+  while (Date.now() - t0 < timeoutMs) {
+    try {
+      const v = await fn();
+      if (v) return v;
+    } catch {
+      /* 元素/状态未就绪 */
+    }
+    await sleep(step);
   }
+  throw new Error('waitFor timeout: ' + label);
+}
+
+// 下一次整页 load (点击/按键触发导航前注册; 未导航则超时失败).
+function waitForLoad(page, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      page.cdp.remove('Page.loadEventFired', h);
+      reject(new Error('load event timeout'));
+    }, timeoutMs);
+    const h = (params, sid) => {
+      if (sid !== page.sessionId) return;
+      clearTimeout(timer);
+      page.cdp.remove('Page.loadEventFired', h);
+      resolve();
+    };
+    page.on('Page.loadEventFired', h);
+  });
+}
+
+// 点击视图图标进入树视图并等待根列表落地 (同一位置 replace, 不整页重载).
+async function enterTreeView(page, waitMs = 400) {
+  if (!(await page.evaluate("document.body.classList.contains('cb-tree-mode')"))) {
+    await page.click('[data-cb-view="tree"]');
+  }
+  await waitFor(
+    () => page.evaluate("!!document.querySelector('ul#cb-tree-root > li.cb-tree-node')"),
+    'tree root attached'
+  );
   await sleep(waitMs);
 }
 
-/* =====================================================================
- * M1 目录页目录模式: body 顶部左缘工具栏行 (搜索表单迁入 + 模式切换末位),
- *     无浮动 fixed/top/right 定位, 标签/aria-pressed 正确.
- * ===================================================================== */
-await runScenario('M1 directory mode: left toolbar row with moved topbar search + trailing mode toggle, no floating', async () => {
-  const { page, pageErrors } = await fresh();
-  const s = await page.evaluate(
-    '(() => { const tb = document.querySelector(".cb-mode-toolbar"); const btn = document.querySelector(".cb-mode-toggle"); const topbar = document.querySelector("header.cb-topbar"); const cs = btn ? getComputedStyle(btn) : null; const cb = btn ? btn.getBoundingClientRect() : null; return { toolbarExists: !!tb, isFirstBodyChild: tb === document.body.firstElementChild, searchInToolbar: !!tb && !!tb.querySelector("form.cb-search #cb-search-q"), searchStillInTopbar: !!topbar && !!topbar.querySelector("form.cb-search"), toggleInToolbar: !!tb && !!tb.querySelector(".cb-mode-toggle"), toggleIsLastChild: !!tb && tb.lastElementChild.className === "cb-mode-toggle", toggleCount: document.querySelectorAll(".cb-mode-toggle").length, directBodyChild: btn ? btn.parentElement === document.body : null, pos: cs ? cs.position : null, top: cs ? cs.top : null, right: cs ? cs.right : null, radius: cs ? cs.borderRadius : null, height: cs ? cs.height : null, label: btn ? btn.textContent : null, pressed: btn ? btn.getAttribute("aria-pressed") : null, title: btn ? btn.title : null, rectRightGap: cb ? Math.round(window.innerWidth - cb.right) : null }; })()'
-  );
-  rec('M1 directory mode: left toolbar row with moved topbar search + trailing mode toggle, no floating',
-    s.toolbarExists && s.isFirstBodyChild && s.searchInToolbar && !s.searchStillInTopbar &&
-      s.toggleInToolbar && s.toggleIsLastChild && s.toggleCount === 1 && s.directBodyChild === false &&
-      s.pos === 'static' && s.top === 'auto' && s.right === 'auto' && s.radius === '0px' &&
-      parseFloat(s.height) >= 25 && parseFloat(s.height) <= 26 && s.label === '树' && s.pressed === 'false' &&
-      s.title === '切换到树模式' && pageErrors.length === 0,
-    JSON.stringify(s) + ' errors=' + JSON.stringify(pageErrors));
-});
-
-/* =====================================================================
- * M2 切换进树模式 (宽屏): 目录工具栏行隐藏; 树顶栏顺序 搜索→折叠→模式切换;
- *     按钮同元素跨模式移动; localStorage 持久化; 无浮动定位; 无页面错误.
- * ===================================================================== */
-await runScenario('M2 tree mode: toolbar row hidden, tree toolbar order search/collapse/toggle, same element moved, persisted', async () => {
-  const { page, pageErrors } = await fresh();
-  // 记录目录行内按钮元素身份 (跨模式移动必须同一节点)
-  const btnId = await page.evaluate(
-    '(() => { const b = document.querySelector(".cb-mode-toggle"); if (b) b.dataset.marker = "same-btn"; return !!b; })()'
-  );
-  await enterTree(page);
-  const s = await page.evaluate(
-    '(() => { const tb = document.querySelector(".cb-mode-toolbar"); const toolbar = document.querySelector(".cb-tree-toolbar"); const btn = document.querySelector(".cb-mode-toggle"); const cs = btn ? getComputedStyle(btn) : null; const kids = toolbar ? [...toolbar.children].map((el) => el.className) : null; return { treeMode: document.body.classList.contains("cb-tree-mode"), toolbarHidden: tb ? tb.hidden : null, toolbarDisplay: tb ? getComputedStyle(tb).display : null, toolbarKids: kids, sameBtn: btn ? btn.dataset.marker === "same-btn" : false, btnInTreeToolbar: btn ? btn.closest(".cb-tree-toolbar") !== null : false, label: btn ? btn.textContent : null, pressed: btn ? btn.getAttribute("aria-pressed") : null, stored: localStorage.getItem("cb-mode"), pos: cs ? cs.position : null, navFirstChildToolbar: (() => { const nav = document.getElementById("cb-tree-nav"); return nav ? nav.firstElementChild.className === "cb-tree-toolbar" : false; })() }; })()'
-  );
-  rec('M2 tree mode: toolbar row hidden, tree toolbar order search/collapse/toggle, same element moved, persisted',
-    s.treeMode && s.toolbarHidden === true && s.toolbarDisplay === 'none' &&
-      JSON.stringify(s.toolbarKids) === JSON.stringify(['cb-tree-search', 'cb-tree-collapse', 'cb-mode-toggle']) &&
-      s.sameBtn && s.btnInTreeToolbar && s.label === '目录' && s.pressed === 'true' &&
-      s.stored === 'tree' && s.pos === 'static' && s.navFirstChildToolbar &&
-      pageErrors.length === 0,
-    JSON.stringify(s) + ' errors=' + JSON.stringify(pageErrors));
-});
-
-/* =====================================================================
- * M3 切回目录模式: 工具栏行恢复; 按钮迁回; 搜索框值跨模式保留; 键清除.
- * ===================================================================== */
-await runScenario('M3 exit tree: toolbar row restored, button back, mode key cleared', async () => {
-  const { page, pageErrors } = await fresh();
-  // 目录页退出树模式走整页重载 (pane SPA 恢复完整页, 既有行为): 退出后必须
-  // 回到目录模式 — 左缘工具栏行恢复、切换按钮在行内、键清除. 搜索框值随
-  // 重载重置 (非本变更契约).
-  await page.click('.cb-mode-toggle'); // 进树模式
-  const t0 = Date.now();
-  while (Date.now() - t0 < 10000) {
-    if (await page.evaluate("!!document.querySelector('ul#cb-tree-root > li.cb-tree-node')")) break;
-    await sleep(100);
+async function pressKey(page, key, code, vk, text) {
+  const keyDown = {
+    type: 'keyDown',
+    key,
+    code,
+    windowsVirtualKeyCode: vk,
+    nativeVirtualKeyCode: vk,
+  };
+  // 字符键必须带 text 才走真实输入默认行为; 视图切换自身不依赖 text.
+  if (text !== undefined) {
+    keyDown.text = text;
+    keyDown.unmodifiedText = text;
   }
-  await sleep(300);
-  await page.click('.cb-mode-toggle'); // 退出
-  const t1 = Date.now();
-  while (Date.now() - t1 < 10000) {
-    if (await page.evaluate("!document.body.classList.contains('cb-tree-mode')")) break;
-    await sleep(100);
-  }
-  await sleep(300);
-  const s = await page.evaluate(
-    '(() => { const tb = document.querySelector(".cb-mode-toolbar"); const btn = document.querySelector(".cb-mode-toggle"); return { treeMode: document.body.classList.contains("cb-tree-mode"), toolbarVisible: tb ? !tb.hidden && getComputedStyle(tb).display !== "none" : false, btnInToolbar: btn ? btn.closest(".cb-mode-toolbar") !== null : false, searchInToolbar: tb ? !!tb.querySelector("form.cb-search #cb-search-q") : false, label: btn ? btn.textContent : null, stored: localStorage.getItem("cb-mode"), toggleInTree: !!document.querySelector(".cb-tree-toolbar .cb-mode-toggle"), count: document.querySelectorAll(".cb-mode-toggle").length }; })()'
+  await page.send('Input.dispatchKeyEvent', keyDown);
+  await page.send('Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key,
+    code,
+    windowsVirtualKeyCode: vk,
+    nativeVirtualKeyCode: vk,
+  });
+}
+
+// 完整 UI/状态快照: 视图按下态、隐藏开关、排序入口、页面语义、URL/历史、偏好.
+const uiState = (page) =>
+  page.evaluate(
+    '(() => { const views = {}; document.querySelectorAll("[data-cb-view]").forEach((el) => { views[el.getAttribute("data-cb-view")] = { pressed: el.getAttribute("aria-pressed"), disabled: el.getAttribute("aria-disabled"), label: el.getAttribute("aria-label"), tag: el.tagName }; }); const toggle = document.querySelector("[data-cb-hidden-toggle]"); const sort = document.querySelector("details.cb-sort"); const cur = sort ? sort.querySelector("[data-cb-sort][aria-current=true]") : null; return { path: location.pathname, search: location.search, len: history.length, treeMode: document.body.classList.contains("cb-tree-mode"), views, hidden: toggle ? { tag: toggle.tagName, pressed: toggle.getAttribute("aria-pressed"), disabled: toggle.getAttribute("aria-disabled"), href: toggle.getAttribute("href") } : null, sortDisabled: sort ? sort.getAttribute("aria-disabled") : null, sortCount: sort ? sort.querySelectorAll("[data-cb-sort]").length : -1, sortCurrent: cur ? cur.getAttribute("data-cb-sort") : null, surface: document.body.dataset.cbSurface, sort: document.body.dataset.cbSort, hiddenRule: document.body.dataset.cbHidden, query: document.body.dataset.cbQuery === undefined ? null : document.body.dataset.cbQuery, marker: window.__docMarker === undefined ? null : window.__docMarker, hiddenPref: localStorage.getItem("cb-hidden"), sortPref: localStorage.getItem("cb-sort"), viewPref: localStorage.getItem("cb-browse-view"), legacyMode: localStorage.getItem("cb-mode"), legacyView: localStorage.getItem("cb-view") }; })()'
   );
-  rec('M3 exit tree: toolbar row restored, button back, mode key cleared',
-    !s.treeMode && s.toolbarVisible && s.btnInToolbar && s.searchInToolbar &&
-      s.label === '树' && s.stored === null && !s.toggleInTree && s.count === 1 && pageErrors.length === 0,
-    JSON.stringify(s) + ' errors=' + JSON.stringify(pageErrors));
-});
+
+// 行条目顺序 (目录表) — data-native-path-encoded 序列.
+const rowOrder = (page) =>
+  page.evaluate(
+    '[...document.querySelectorAll("tr.cb-row[data-browser-entry]")].map((el) => el.getAttribute("data-native-path-encoded"))'
+  );
+
+/* ---------- 无 JS 工具 (脚本执行禁用后仅 DOM/Input/Page 域可用) ---------- */
+
+async function noJsHtml(page) {
+  await page.send('DOM.enable');
+  const { root } = await page.send('DOM.getDocument', { depth: 1 });
+  const { outerHTML } = await page.send('DOM.getOuterHTML', { nodeId: root.nodeId });
+  return outerHTML;
+}
+
+async function noJsBox(page, selector) {
+  const { root } = await page.send('DOM.getDocument', { depth: 1 });
+  const { nodeId } = await page.send('DOM.querySelector', { nodeId: root.nodeId, selector });
+  if (!nodeId) throw new Error('noJs: no element for ' + selector);
+  const { model } = await page.send('DOM.getBoxModel', { nodeId });
+  const c = model.content;
+  return {
+    nodeId,
+    x: (c[0] + c[2] + c[4] + c[6]) / 4,
+    y: (c[1] + c[3] + c[5] + c[7]) / 4,
+  };
+}
+
+async function noJsClick(page, selector) {
+  const { x, y } = await noJsBox(page, selector);
+  await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+  await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+}
+
+async function noJsUrl(page) {
+  const { currentIndex, entries } = await page.send('Page.getNavigationHistory');
+  return entries[currentIndex].url;
+}
+
+async function noJsGoto(page, url) {
+  const loaded = waitForLoad(page);
+  await page.send('Page.navigate', { url });
+  await loaded;
+  await sleep(200);
+}
+
+async function noJsWaitLoadAfter(page, action) {
+  const loaded = waitForLoad(page);
+  await action();
+  await loaded;
+  await sleep(200);
+}
 
 /* =====================================================================
- * M4 持久化: 树模式下整页重载仍为树模式 (localStorage 生效).
+ * T1 冷启动目录: 默认视图/显示规则有效; 无旧偏好时不写入任何持久偏好.
  * ===================================================================== */
-await runScenario('M4 persistence: full reload in tree mode stays tree mode', async () => {
+await runScenario('T1 cold directory: defaults apply without storing display preferences', async () => {
   const { page, pageErrors } = await fresh();
-  await enterTree(page);
-  await page.goto(BASE + '/'); // 同 origin 重载: localStorage 保留
-  await sleep(800);
-  const s = await page.evaluate(
-    '(() => { const btn = document.querySelector(".cb-mode-toggle"); return { treeMode: document.body.classList.contains("cb-tree-mode"), toolbarHidden: (() => { const tb = document.querySelector(".cb-mode-toolbar"); return tb ? tb.hidden : null; })(), btnInTreeToolbar: btn ? btn.closest(".cb-tree-toolbar") !== null : false, label: btn ? btn.textContent : null, pressed: btn ? btn.getAttribute("aria-pressed") : null }; })()'
+  const s = await uiState(page);
+  const ok =
+    s.surface === 'directory' &&
+    s.sort === 'Name:Asc' &&
+    s.hiddenRule === '0' &&
+    s.views.list.pressed === 'true' &&
+    s.views.tree.pressed === 'false' &&
+    s.views.grid.pressed === 'false' &&
+    s.views.tree.disabled !== 'true' &&
+    s.views.grid.disabled !== 'true' &&
+    s.hidden &&
+    s.hidden.pressed === 'false' &&
+    typeof s.hidden.href === 'string' &&
+    s.hidden.href.includes('hidden=1') &&
+    s.sortCount === 12 &&
+    s.sortCurrent === 'Name:Asc' &&
+    s.viewPref === null &&
+    s.sortPref === null &&
+    s.hiddenPref === null &&
+    pageErrors.length === 0;
+  rec(
+    'T1 cold directory: defaults apply without storing display preferences',
+    ok,
+    JSON.stringify({ s, errors: pageErrors })
   );
-  rec('M4 persistence: full reload in tree mode stays tree mode',
-    s.treeMode && s.toolbarHidden === true && s.btnInTreeToolbar && s.label === '目录' && s.pressed === 'true' && pageErrors.length === 0,
-    JSON.stringify(s) + ' errors=' + JSON.stringify(pageErrors));
 });
 
 /* =====================================================================
- * M5 窄屏抽屉: 抽屉顶栏含搜索 + 模式切换, 折叠按钮隐藏; 抽屉内切换可用.
+ * T2 视图切换: 浏览->树是同一位置 replace (无重载); 树->网格是整页补能力
+ *    handoff (URL/历史项不变, 真实重载); 工具区在树模式仍可见于树/网格之上;
+ *    list<->grid 同一位置 replace.
  * ===================================================================== */
-await runScenario('M5 narrow drawer: drawer toolbar has search + toggle, collapse hidden, toggle works', async () => {
-  const { page, pageErrors } = await fresh(700, 800);
-  await enterTree(page, 600);
-  const before = await page.evaluate(
-    '(() => { const ob = document.querySelector(".cb-tree-open"); return { openBtnVisible: ob ? getComputedStyle(ob).display !== "none" : false, collapseVisible: (() => { const c = document.querySelector(".cb-tree-collapse"); return c ? getComputedStyle(c).display !== "none" : null; })() }; })()'
-  );
-  await page.click('.cb-tree-open'); // 打开抽屉
-  await sleep(400);
-  const open = await page.evaluate(
-    '(() => { const drawer = document.getElementById("cb-tree-nav"); const toolbar = document.querySelector(".cb-tree-toolbar"); const kids = toolbar ? [...toolbar.children].map((el) => el.className) : null; const collapse = document.querySelector(".cb-tree-collapse"); const toggle = document.querySelector(".cb-mode-toggle"); return { drawerOpen: document.body.classList.contains("cb-drawer-open"), kids, collapseDisplay: collapse ? getComputedStyle(collapse).display : null, toggleInToolbar: toggle ? toggle.closest(".cb-tree-toolbar") !== null : false, toggleVisible: toggle ? getComputedStyle(toggle).display !== "none" : false }; })()'
-  );
-  // 抽屉内切换: 点击模式切换 → 退出树模式, 目录工具栏行恢复
-  await page.click('.cb-mode-toggle');
-  const t0 = Date.now();
-  while (Date.now() - t0 < 10000) {
-    if (await page.evaluate("!document.body.classList.contains('cb-tree-mode')")) break;
-    await sleep(100);
-  }
-  await sleep(300);
-  const after = await page.evaluate(
-    '(() => { const tb = document.querySelector(".cb-mode-toolbar"); const btn = document.querySelector(".cb-mode-toggle"); return { treeMode: document.body.classList.contains("cb-tree-mode"), toolbarVisible: tb ? !tb.hidden && getComputedStyle(tb).display !== "none" : false, btnInToolbar: btn ? btn.closest(".cb-mode-toolbar") !== null : false, label: btn ? btn.textContent : null }; })()'
-  );
-  rec('M5 narrow drawer: drawer toolbar has search + toggle, collapse hidden, toggle works',
-    before.openBtnVisible && before.collapseVisible === false &&
-      open.drawerOpen && JSON.stringify(open.kids) === JSON.stringify(['cb-tree-search', 'cb-tree-collapse', 'cb-mode-toggle']) &&
-      open.collapseDisplay === 'none' && open.toggleInToolbar && open.toggleVisible &&
-      !after.treeMode && after.toolbarVisible && after.btnInToolbar && after.label === '树' &&
-      pageErrors.length === 0,
-    'before=' + JSON.stringify(before) + ' open=' + JSON.stringify(open) + ' after=' + JSON.stringify(after) +
-      ' errors=' + JSON.stringify(pageErrors));
-});
-
-/* =====================================================================
- * M6 搜索页: 无工具栏行/无切换按钮/无树壳; 顶栏搜索表单保持原位.
- * ===================================================================== */
-await runScenario('M6 search page: no toolbar row, no toggle, no tree shell; topbar search untouched', async () => {
+await runScenario('T2 view switch: browse->tree replace without reload; tree->grid full-page handoff keeps URL/history; toolbar above tree shell', async () => {
   const { page, pageErrors } = await fresh();
-  await page.goto(BASE + '/__/search?q=leaf');
-  await sleep(500);
-  const s = await page.evaluate(
-    '(() => { const topbar = document.querySelector("header.cb-topbar"); return { toolbar: !!document.querySelector(".cb-mode-toolbar"), toggle: !!document.querySelector(".cb-mode-toggle"), tree: !!document.getElementById("cb-tree-nav"), treeMode: document.body.classList.contains("cb-tree-mode"), topbarSearch: !!topbar && !!topbar.querySelector("form.cb-search #cb-search-q"), hasResults: !!document.querySelector("main[data-cb-parent] .cb-view-list") }; })()'
+  await page.goto(BASE + '/?sort=Name:Asc&hidden=0');
+  const before = await uiState(page);
+  await page.evaluate("window.__docMarker = 'T2'");
+  await enterTreeView(page);
+  const tree = await uiState(page);
+  const layout = await page.evaluate(
+    '(() => { const bar = document.querySelector("header.cb-topbar"); const nav = document.getElementById("cb-tree-nav"); const b = bar.getBoundingClientRect(); const n = nav.getBoundingClientRect(); return { barVisible: getComputedStyle(bar).display !== "none", barBottom: Math.round(b.bottom), navTop: Math.round(n.top) }; })()'
   );
-  rec('M6 search page: no toolbar row, no toggle, no tree shell; topbar search untouched',
-    !s.toolbar && !s.toggle && !s.tree && !s.treeMode && s.topbarSearch && s.hasResults && pageErrors.length === 0,
-    JSON.stringify(s) + ' errors=' + JSON.stringify(pageErrors));
+  // 树 -> 网格: 整页 handoff (replace 当前历史项 + reload, 不新增历史)
+  const loaded = waitForLoad(page);
+  await page.click('[data-cb-view="grid"]');
+  await loaded;
+  await sleep(300);
+  const grid = await uiState(page);
+  const gridSections = await page.evaluate(
+    '(() => { const g = document.getElementById("cb-view-grid"); const l = document.getElementById("cb-view-list"); const t = document.getElementById("cb-tree-nav"); return { grid: g ? !g.hidden : false, list: l ? l.hidden : null, tree: !!t }; })()'
+  );
+  // 网格 -> 列表: 同一位置 replace (无 reload, 标记保留)
+  await page.evaluate("window.__docMarker = 'T2b'");
+  await page.click('[data-cb-view="list"]');
+  await sleep(300);
+  const list = await uiState(page);
+  const ok =
+    tree.treeMode &&
+    tree.views.tree.pressed === 'true' &&
+    tree.views.list.pressed === 'false' &&
+    tree.marker === 'T2' &&
+    tree.search === before.search &&
+    layout.barVisible &&
+    layout.barBottom <= layout.navTop &&
+    grid.marker === null &&
+    grid.treeMode === false &&
+    grid.views.grid.pressed === 'true' &&
+    grid.path === '/' &&
+    grid.search === before.search &&
+    grid.len === tree.len &&
+    gridSections.grid &&
+    gridSections.list === true &&
+    gridSections.tree === false &&
+    list.marker === 'T2b' &&
+    list.treeMode === false &&
+    list.views.list.pressed === 'true' &&
+    list.search === before.search &&
+    list.len === grid.len &&
+    pageErrors.length === 0;
+  rec(
+    'T2 view switch: browse->tree replace without reload; tree->grid full-page handoff keeps URL/history; toolbar above tree shell',
+    ok,
+    JSON.stringify({ before, tree, layout, grid, gridSections, list, errors: pageErrors })
+  );
 });
 
 /* =====================================================================
- * M7 文档页: 左缘工具栏行含树结构搜索表单 (独立 id) + 切换按钮; 树模式
- *     TOC 列几何不变 (240px); 分隔线几何不变.
+ * T3 v 键循环 list->grid->tree->list (树->列表整页 handoff); 搜索框聚焦或
+ *    修饰键组合时 v 原样输入/不切换视图.
  * ===================================================================== */
-await runScenario('M7 doc page: toolbar row with tree-structure search (own id) + toggle; TOC/separator geometry intact', async () => {
-  const { page, pageErrors } = await fresh(1280, 800);
+await runScenario('T3 v cycles list->grid->tree->list; editable focus keeps literal v', async () => {
+  const { page, pageErrors } = await fresh();
+  await page.goto(BASE + '/?sort=Name:Asc&hidden=0');
+  await page.evaluate("window.__docMarker = 'T3'");
+  await pressKey(page, 'v', 'KeyV', 86);
+  await sleep(250);
+  const grid = await uiState(page);
+  await pressKey(page, 'v', 'KeyV', 86);
+  await waitFor(() => page.evaluate("document.body.classList.contains('cb-tree-mode')"), 'tree via v');
+  await sleep(250);
+  const tree = await uiState(page);
+  const loaded = waitForLoad(page);
+  await pressKey(page, 'v', 'KeyV', 86);
+  await loaded;
+  await sleep(300);
+  const list = await uiState(page);
+  // 整页 handoff 后先等 JS 初始化完成 (hidden 开关 href 被规范化成根相对
+  // 路径是初始化已执行的标志), 否则按键守卫可能尚未安装而空过.
+  await waitFor(
+    () =>
+      page.evaluate(
+        "(() => { const t = document.querySelector('[data-cb-hidden-toggle]'); return !!t && (t.getAttribute('href') || '').startsWith('/'); })()"
+      ),
+    'list page app ready'
+  );
+  // 搜索框聚焦: 真实按键 v 原样输入, 不切换视图 (可编辑目标守卫).
+  await page.evaluate("document.querySelector('#cb-search-q').focus()");
+  await pressKey(page, 'v', 'KeyV', 86, 'v');
+  await sleep(200);
+  const editable = await page.evaluate(
+    '({ value: document.querySelector("#cb-search-q").value, active: document.activeElement ? (document.activeElement.id || document.activeElement.tagName) : null, treeMode: document.body.classList.contains("cb-tree-mode"), grid: document.getElementById("cb-view-grid") ? !document.getElementById("cb-view-grid").hidden : null })'
+  );
+  // 修饰键组合 (Ctrl+v) 不触发视图切换 (非可编辑焦点下验证).
+  await page.evaluate("document.activeElement.blur(); document.body.focus();");
+  await page.send('Input.dispatchKeyEvent', {
+    type: 'keyDown',
+    key: 'v',
+    code: 'KeyV',
+    windowsVirtualKeyCode: 86,
+    nativeVirtualKeyCode: 86,
+    modifiers: 2,
+  });
+  await page.send('Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key: 'v',
+    code: 'KeyV',
+    windowsVirtualKeyCode: 86,
+    nativeVirtualKeyCode: 86,
+    modifiers: 2,
+  });
+  await sleep(200);
+  const modifier = await uiState(page);
+  const ok =
+    grid.views.grid.pressed === 'true' &&
+    grid.marker === 'T3' &&
+    grid.treeMode === false &&
+    tree.treeMode &&
+    tree.views.tree.pressed === 'true' &&
+    tree.marker === 'T3' &&
+    list.marker === null &&
+    list.treeMode === false &&
+    list.views.list.pressed === 'true' &&
+    editable.value === 'v' &&
+    editable.active === 'cb-search-q' &&
+    editable.treeMode === false &&
+    editable.grid === false &&
+    modifier.treeMode === false &&
+    modifier.views.list.pressed === 'true' &&
+    modifier.views.grid.pressed === 'false' &&
+    pageErrors.length === 0;
+  rec(
+    'T3 v cycles list->grid->tree->list; editable focus keeps literal v',
+    ok,
+    JSON.stringify({ grid, tree, list, editable, modifier, errors: pageErrors })
+  );
+});
+
+/* =====================================================================
+ * T4 隐藏开关: 同历史项内更新规则/URL/偏好 (fetch 后选择性安装, 不整页导航);
+ *    已打开的文件预览保持同一活动文档 (不重转换, 不重新 fetch fragment).
+ * ===================================================================== */
+await runScenario('T4 hidden toggle: same-entry rules/history/pref update, live opened document preserved without navigation or fragment refetch', async () => {
+  const { page, pageErrors } = await fresh();
+  const before = await uiState(page);
+  const requests = [];
+  page.on('Network.requestWillBeSent', (params, sid) => {
+    if (sid !== page.sessionId) return;
+    requests.push({ url: params.request.url, type: params.type });
+  });
+  await page.send('Network.enable');
+
+  // 显示隐藏项: 点文件行 (标记活动文档) 后隐藏再显示, 文档必须保持同一 DOM.
+  await page.click('[data-cb-hidden-toggle]');
+  await waitFor(
+    () => page.evaluate("!!document.querySelector('tr.cb-row[data-native-path-encoded=\".hidden.txt\"]')"),
+    'hidden row shown'
+  );
+  await sleep(200);
+  const shown = await uiState(page);
+  const shownUrls = requests.map((r) => r.url);
+  await page.click('tr.cb-row[data-native-path-encoded=".hidden.txt"] [data-cb-action="preview"]');
+  await waitFor(
+    () =>
+      page.evaluate(
+        "(() => { const c = document.getElementById('cb-preview-content'); return !!c && c.textContent.includes('hidden secret'); })()"
+      ),
+    'hidden preview open'
+  );
+  const marked = await page.evaluate(
+    "(() => { const doc = document.querySelector('#cb-preview-content .cb-doc'); if (!doc) return false; doc.setAttribute('data-test-live-doc', 'T4'); window.__liveDoc = doc; return true; })()"
+  );
+  const fragFetches = () => requests.filter((r) => r.url.includes('/.hidden.txt?') && r.url.includes('fragment=1')).length;
+  const docNavigations = () => requests.filter((r) => r.type === 'Document').length;
+  const fragBefore = fragFetches();
+  const navigationsBefore = docNavigations();
+
+  await page.click('[data-cb-hidden-toggle]');
+  await waitFor(
+    () => page.evaluate("!document.querySelector('tr.cb-row[data-native-path-encoded=\".hidden.txt\"]')"),
+    'hidden row gone'
+  );
+  await sleep(250);
+  const hiddenAgain = await uiState(page);
+  const live = await page.evaluate(
+    "(() => { const doc = document.querySelector('#cb-preview-content .cb-doc'); return { sameNode: !!doc && doc === window.__liveDoc, marker: doc ? doc.getAttribute('data-test-live-doc') : null, text: doc ? doc.textContent.includes('hidden secret') : false, hidden: (document.getElementById('cb-preview') || {}).hidden }; })()"
+  );
+  const ok =
+    marked &&
+    before.len === shown.len &&
+    shown.len === hiddenAgain.len &&
+    shown.hidden.pressed === 'true' &&
+    shown.search.includes('hidden=1') &&
+    shown.hiddenPref === '1' &&
+    hiddenAgain.hidden.pressed === 'false' &&
+    !hiddenAgain.search.includes('hidden=1') &&
+    hiddenAgain.hiddenPref === '0' &&
+    live.sameNode &&
+    live.marker === 'T4' &&
+    live.text === true &&
+    live.hidden === false &&
+    fragFetches() === fragBefore &&
+    docNavigations() === navigationsBefore &&
+    pageErrors.length === 0;
+  rec(
+    'T4 hidden toggle: same-entry rules/history/pref update, live opened document preserved without navigation or fragment refetch',
+    ok,
+    JSON.stringify({ before, shown, hiddenAgain, live, fragBefore, fragAfter: fragFetches(), navigationsBefore, navigationsAfter: docNavigations(), shownUrls, errors: pageErrors })
+  );
+});
+
+/* =====================================================================
+ * T5 排序入口: 12 项 + 当前项 aria-current; Size:Desc 同历史项内生效
+ *    (URL/history/偏好/条目顺序/当前项一致).
+ * ===================================================================== */
+await runScenario('T5 keyboard sort: Size:Desc updates URL/history/pref/order in the same entry', async () => {
+  const { page, pageErrors } = await fresh();
+  await page.goto(BASE + '/?sort=Name:Asc&hidden=0');
+  const before = await uiState(page);
+  await page.click('#cb-search-q');
+  for (let i = 0; i < 5; i++) await pressKey(page, 'Tab', 'Tab', 9);
+  await waitFor(() => page.evaluate("document.activeElement.matches('summary[data-cb-sort-summary]')"), 'sort summary keyboard focus');
+  await pressKey(page, 'Enter', 'Enter', 13, '\r');
+  await waitFor(() => page.evaluate("document.querySelector('details.cb-sort').open"), 'sort menu keyboard open');
+  for (let i = 0; i < 6; i++) await pressKey(page, 'Tab', 'Tab', 9);
+  await waitFor(() => page.evaluate("document.activeElement.dataset.cbSort === 'Size:Desc'"), 'sort direction keyboard focus');
+  await pressKey(page, 'Enter', 'Enter', 13, '\r');
+  await waitFor(() => page.evaluate("location.search.includes('sort=Size')"), 'sort applied to URL');
+  await sleep(250);
+  const after = await uiState(page);
+  const order = await rowOrder(page);
+  const big = order.indexOf('big.bin');
+  const md = order.indexOf('a.md');
+  const ok =
+    before.sortCount === 12 &&
+    before.sortCurrent === 'Name:Asc' &&
+    before.len === after.len &&
+    after.sortCurrent === 'Size:Desc' &&
+    after.search.includes('sort=Size') &&
+    after.search.includes('hidden=0') &&
+    after.sortPref === 'Size:Desc' &&
+    big !== -1 &&
+    md !== -1 &&
+    big < md &&
+    pageErrors.length === 0;
+  rec(
+    'T5 keyboard sort: Size:Desc updates URL/history/pref/order in the same entry',
+    ok,
+    JSON.stringify({ before, after, order, errors: pageErrors })
+  );
+});
+
+/* =====================================================================
+ * T5b 已打开文档 × 列表/网格 × 排序/隐藏: 同历史项内列表内容更新, 活动文档
+ *     保持同一 DOM/内容/identity, 文档 fragment 请求数不增加, 零整页导航.
+ * ===================================================================== */
+await runScenario('T5b opened document: sort and hidden changes update listing in place for list and grid without refetching the live document', async () => {
+  const { page, pageErrors } = await fresh();
+  await page.goto(BASE + '/?sort=Name:Asc&hidden=0');
+  const requests = [];
+  page.on('Network.requestWillBeSent', (params, sid) => {
+    if (sid !== page.sessionId) return;
+    requests.push({ url: params.request.url, type: params.type });
+  });
+  await page.send('Network.enable');
+  const docFragFetches = () =>
+    requests.filter((r) => r.url.includes('/a.md?') && r.url.includes('fragment=1')).length;
+  const docNavigations = () => requests.filter((r) => r.type === 'Document').length;
+  const liveDoc = () =>
+    page.evaluate(
+      "(() => { const doc = document.querySelector('#cb-preview-content .cb-doc'); return { sameNode: !!doc && doc === window.__liveDoc, marker: doc ? doc.getAttribute('data-test-live-doc') : null, text: doc ? doc.textContent.includes('page a') : false, hidden: (document.getElementById('cb-preview') || {}).hidden }; })()"
+    );
+
+  // list: 打开 a.md 预览 (活动文档)
+  await page.click('tr.cb-row[data-native-path-encoded="a.md"] [data-cb-action="preview"]');
+  await waitFor(
+    () => page.evaluate("(() => { const c = document.getElementById('cb-preview-content'); return !!c && c.textContent.includes('page a'); })()"),
+    'list preview open'
+  );
+  const marked = await page.evaluate(
+    "(() => { const doc = document.querySelector('#cb-preview-content .cb-doc'); if (!doc) return false; doc.setAttribute('data-test-live-doc', 'T5b'); window.__liveDoc = doc; return true; })()"
+  );
+  const listFragBefore = docFragFetches();
+  const listNavBefore = docNavigations();
+  await page.evaluate("window.__docMarker = 'list'");
+  // 排序 (list): 列表顺序更新, 文档保持 live
+  await page.click('summary[data-cb-sort-summary]');
+  await sleep(150);
+  await page.evaluate("document.querySelector('details.cb-sort').open = true");
+  await page.click('[data-cb-sort="Size:Desc"]');
+  await waitFor(
+    () => page.evaluate("(() => { const rows = [...document.querySelectorAll('tr.cb-row[data-browser-entry]')].map((el) => el.getAttribute('data-native-path-encoded')); const b = rows.indexOf('big.bin'); const m = rows.indexOf('a.md'); return b !== -1 && m !== -1 && b < m; })()"),
+    'list reordered by Size:Desc'
+  );
+  // 隐藏 (list): 点文件出现/隐藏, 文档保持 live
+  await page.click('[data-cb-hidden-toggle]');
+  await waitFor(
+    () => page.evaluate("!!document.querySelector('tr.cb-row[data-native-path-encoded=\".hidden.txt\"]')"),
+    'list hidden row shown'
+  );
+  const listState = await uiState(page);
+  const listLive = await liveDoc();
+  // 切到网格 (同位置 replace, 不重载): 文档保持 live, 网格条目按新规则排列
+  await page.click('[data-cb-view="grid"]');
+  await waitFor(
+    () => page.evaluate("(() => { const g = document.getElementById('cb-view-grid'); return !!g && !g.hidden && !!g.querySelector('div.cb-grid-item[data-native-path-encoded=\"big.bin\"]'); })()"),
+    'grid visible with reordered items'
+  );
+  const gridLive = await liveDoc();
+  await page.evaluate("window.__docMarker = 'grid'");
+  // 排序 (grid): Size:Asc 重排网格, 文档保持 live
+  await page.click('summary[data-cb-sort-summary]');
+  await sleep(150);
+  await page.evaluate("document.querySelector('details.cb-sort').open = true");
+  await page.click('[data-cb-sort="Size:Asc"]');
+  await waitFor(
+    () => page.evaluate("(() => { const items = [...document.querySelectorAll('#cb-view-grid div.cb-grid-item')].map((el) => el.getAttribute('data-native-path-encoded')); const b = items.indexOf('big.bin'); const m = items.indexOf('a.md'); return b !== -1 && m !== -1 && m < b; })()"),
+    'grid reordered by Size:Asc'
+  );
+  // 隐藏 (grid): 再次隐藏, 文档保持 live
+  await page.click('[data-cb-hidden-toggle]');
+  await waitFor(
+    () => page.evaluate("!document.querySelector('tr.cb-row[data-native-path-encoded=\".hidden.txt\"]') && !document.querySelector('#cb-view-grid div.cb-grid-item[data-native-path-encoded=\".hidden.txt\"]')"),
+    'grid hidden row gone'
+  );
+  const gridState = await uiState(page);
+  const gridLiveAfter = await liveDoc();
+  const ok =
+    marked &&
+    listState.search.includes('sort=Size') &&
+    listState.search.includes('hidden=1') &&
+    listState.marker === 'list' &&
+    listLive.sameNode &&
+    listLive.marker === 'T5b' &&
+    listLive.text === true &&
+    listLive.hidden === false &&
+    gridLive.sameNode &&
+    gridLive.marker === 'T5b' &&
+    gridLive.text === true &&
+    gridLive.hidden === false &&
+    gridState.sortCurrent === 'Size:Asc' &&
+    gridState.search.includes('sort=Size') &&
+    !gridState.search.includes('hidden=1') &&
+    gridState.marker === 'grid' &&
+    gridLiveAfter.sameNode &&
+    gridLiveAfter.marker === 'T5b' &&
+    gridLiveAfter.text === true &&
+    gridLiveAfter.hidden === false &&
+    docFragFetches() === listFragBefore &&
+    docNavigations() === listNavBefore &&
+    pageErrors.length === 0;
+  rec(
+    'T5b opened document: sort and hidden changes update listing in place for list and grid without refetching the live document',
+    ok,
+    JSON.stringify({ listState, listLive, gridState, gridLive, gridLiveAfter, listFragBefore, docFragAfter: docFragFetches(), listNavBefore, docNavAfter: docNavigations(), errors: pageErrors })
+  );
+});
+
+/* =====================================================================
+ * T6 独立阅读页: 三图标无选中态; 隐藏/排序入口禁用并说明作用范围;
+ *    列表入口回父目录; 无 token; 禁用控件点击不导航.
+ * ===================================================================== */
+await runScenario('T6 reading page: no selected view, hidden/sort disabled with scope, parent-dir list entry, no token', async () => {
+  const { page, pageErrors } = await fresh();
   await page.goto(BASE + '/a.md');
-  await sleep(500);
-  const dir = await page.evaluate(
-    '(() => { const tb = document.querySelector(".cb-mode-toolbar"); const btn = document.querySelector(".cb-mode-toggle"); return { toolbarExists: !!tb, treeSearchForm: !!tb && !!tb.querySelector("form.cb-tree-search #cb-mode-search-q"), toggleLast: !!tb && tb.lastElementChild.className === "cb-mode-toggle", label: btn ? btn.textContent : null, topbarSearch: !!document.querySelector("header.cb-topbar form.cb-search") }; })()'
+  const s = await uiState(page);
+  const detail = await page.evaluate(
+    '(() => { const list = document.querySelector("[data-cb-view=list]"); const token = document.querySelector("meta[name=cb-native-open-token]"); const summary = document.querySelector("[data-cb-sort-summary]"); const toggle = document.querySelector("[data-cb-hidden-toggle]"); return { listHref: list ? list.getAttribute("href") : null, listTag: list ? list.tagName : null, pathEnc: document.body.dataset.nativePathEncoded, kind: document.body.dataset.kind, token: !!token, summaryTip: summary ? summary.getAttribute("data-cb-tip") : null, hiddenTip: toggle ? toggle.getAttribute("data-cb-tip") : null, sortHrefs: [...document.querySelectorAll("a[data-cb-sort]")].map((el) => el.getAttribute("href")) }; })()'
   );
-  await enterTree(page, 800);
-  const tree = await page.evaluate(
-    '(() => { const layout = document.querySelector(".cb-pane .cb-doc-layout"); const toc = document.querySelector(".cb-pane .cb-doc-toc"); const resizer = document.querySelector(".cb-tree-resizer"); const grid = getComputedStyle(document.body).gridTemplateColumns; const resizerBefore = resizer ? getComputedStyle(resizer, "::before").width : null; return { grid, resizerWidth: resizer ? resizer.getBoundingClientRect().width : null, resizerBefore, layoutColumns: layout ? getComputedStyle(layout).gridTemplateColumns : null, tocExists: !!toc, tocWidth: toc ? Math.round(toc.getBoundingClientRect().width) : null }; })()'
+  const beforeClick = { path: s.path, search: s.search };
+  await page.click('[data-cb-hidden-toggle]');
+  await sleep(250);
+  const afterDisabledClick = await uiState(page);
+  // 列表入口回父目录
+  const loaded = waitForLoad(page);
+  await page.click('[data-cb-view="list"]');
+  await loaded;
+  await sleep(300);
+  const dir = await uiState(page);
+  const listPath = detail.listHref ? detail.listHref.split('?')[0] : null;
+  const ok =
+    s.surface === 'reading' &&
+    detail.kind === 'file' &&
+    detail.pathEnc === 'a.md' &&
+    s.views.tree.pressed === 'false' &&
+    s.views.list.pressed === 'false' &&
+    s.views.grid.pressed === 'false' &&
+    detail.listTag === 'A' &&
+    listPath === '/' &&
+    s.hidden &&
+    s.hidden.disabled === 'true' &&
+    typeof detail.hiddenTip === 'string' &&
+    detail.hiddenTip.length > 0 &&
+    s.sortDisabled === 'true' &&
+    s.sortCount >= 12 &&
+    detail.sortHrefs.every((h) => h === null) &&
+    typeof detail.summaryTip === 'string' &&
+    detail.summaryTip.length > 0 &&
+    !detail.token &&
+    afterDisabledClick.path === beforeClick.path &&
+    afterDisabledClick.search === beforeClick.search &&
+    dir.path === '/' &&
+    dir.surface === 'directory' &&
+    dir.views.list.pressed === 'true' &&
+    pageErrors.length === 0;
+  rec(
+    'T6 reading page: no selected view, hidden/sort disabled with scope, parent-dir list entry, no token',
+    ok,
+    JSON.stringify({ s, detail, afterDisabledClick, dir, errors: pageErrors })
   );
-  rec('M7 doc page: toolbar row with tree-structure search (own id) + toggle; TOC/separator geometry intact',
-    dir.toolbarExists && dir.treeSearchForm && dir.toggleLast && dir.label === '树' && !dir.topbarSearch &&
-      tree.grid.startsWith('238px 8px ') && tree.resizerWidth === 8 && tree.resizerBefore === '2px' &&
-      tree.layoutColumns && tree.layoutColumns.endsWith('240px') && tree.tocExists && tree.tocWidth === 240 &&
-      pageErrors.length === 0,
-    'dir=' + JSON.stringify(dir) + ' tree=' + JSON.stringify(tree) + ' errors=' + JSON.stringify(pageErrors));
 });
 
 /* =====================================================================
- * M8 折叠/恢复: 折叠后恢复按钮可见、树隐藏; 恢复后展开; 偏好持久化.
+ * T7 搜索页: 换视图保留 q/sort/hidden; 树视图右侧是安全搜索片段 (无 token);
+ *    树->网格整页 handoff 保持 URL 与历史项数.
  * ===================================================================== */
-await runScenario('M8 collapse/restore: collapse hides tree + shows restore, restore expands, preference persisted', async () => {
+await runScenario('T7 search page: tree pane shows safe fragment, view handoff keeps q/sort/hidden and history', async () => {
   const { page, pageErrors } = await fresh();
-  await enterTree(page, 600);
-  await page.click('.cb-tree-collapse');
-  await sleep(400);
-  const collapsed = await page.evaluate(
-    '(() => { const restore = document.querySelector(".cb-tree-restore"); const tree = document.getElementById("cb-tree-nav"); return { cls: document.body.classList.contains("cb-tree-collapsed"), restoreVisible: restore ? !restore.hidden && getComputedStyle(restore).display !== "none" : false, treeDisplay: tree ? getComputedStyle(tree).display : null, stored: localStorage.getItem("cb-tree-collapsed"), toolbarToggleStillThere: !!document.querySelector(".cb-mode-toggle") }; })()'
+  await page.goto(BASE + '/__/search?q=leaf&sort=Name:Asc&hidden=0');
+  const before = await uiState(page);
+  const rowsBefore = await page.evaluate("document.querySelectorAll('tr.cb-row[data-browser-entry]').length");
+  await page.click('tr.cb-row[data-native-path-encoded="leaf.md"] [data-cb-action="preview"]');
+  await waitFor(
+    () => page.evaluate("!!document.querySelector('#cb-preview:not([hidden]) [data-native-path-encoded=\"leaf.md\"]')"),
+    'search document preview'
   );
-  await page.click('.cb-tree-restore');
-  await sleep(400);
-  const restored = await page.evaluate(
-    '(() => { const collapse = document.querySelector(".cb-tree-collapse"); return { cls: document.body.classList.contains("cb-tree-collapsed"), collapseVisible: collapse ? getComputedStyle(collapse).display !== "none" : false, treeVisible: (() => { const t = document.getElementById("cb-tree-nav"); return t ? getComputedStyle(t).display !== "none" : false; })() }; })()'
+  await page.evaluate("window.__docMarker = 'T7'");
+  await page.click('[data-cb-view="tree"]');
+  await waitFor(() => page.evaluate("!!document.querySelector('.cb-search-fragment')"), 'search fragment in pane');
+  await sleep(250);
+  const tree = await uiState(page);
+  const frag = await page.evaluate(
+    "(() => { const f = document.querySelector('.cb-search-fragment'); return { query: f.getAttribute('data-cb-query'), surface: f.getAttribute('data-cb-surface'), sort: f.getAttribute('data-cb-sort'), hidden: f.getAttribute('data-cb-hidden'), token: !!f.querySelector('meta[name=cb-native-open-token]') }; })()"
   );
-  rec('M8 collapse/restore: collapse hides tree + shows restore, restore expands, preference persisted',
-    collapsed.cls && collapsed.restoreVisible && collapsed.treeDisplay === 'none' &&
-      collapsed.stored === '1' && collapsed.toolbarToggleStillThere &&
-      !restored.cls && restored.collapseVisible && restored.treeVisible && pageErrors.length === 0,
-    'collapsed=' + JSON.stringify(collapsed) + ' restored=' + JSON.stringify(restored) + ' errors=' + JSON.stringify(pageErrors));
+  const loaded = waitForLoad(page);
+  await page.click('[data-cb-view="grid"]');
+  await loaded;
+  await sleep(300);
+  const grid = await uiState(page);
+  const rowsAfter = await page.evaluate("document.querySelectorAll('tr.cb-row[data-browser-entry]').length");
+  const ok =
+    before.surface === 'search' &&
+    before.query === 'leaf' &&
+    rowsBefore > 0 &&
+    tree.treeMode &&
+    tree.search === before.search &&
+    tree.marker === 'T7' &&
+    frag.query === 'leaf' &&
+    frag.surface === 'search' &&
+    frag.sort === 'Name:Asc' &&
+    frag.hidden === '0' &&
+    !frag.token &&
+    grid.marker === null &&
+    grid.path === '/__/search' &&
+    grid.search === before.search &&
+    grid.views.grid.pressed === 'true' &&
+    grid.len === tree.len &&
+    rowsAfter > 0 &&
+    pageErrors.length === 0;
+  rec(
+    'T7 search page: tree pane shows safe fragment, view handoff keeps q/sort/hidden and history',
+    ok,
+    JSON.stringify({ before, tree, frag, grid, rowsBefore, rowsAfter, errors: pageErrors })
+  );
 });
 
 /* =====================================================================
- * M9 调整器拖拽: 指针拖拽改树宽 + 持久化; 网格列几何 (238px 8px 1fr).
+ * T8 无 JS: 服务端字段/链接真实可用 — 隐藏开关、排序链接、搜索重搜、
+ *    条目与 ../ 导航都必须携带必要字段 (实际提交/导航, 非 form 源码断言).
  * ===================================================================== */
-await runScenario('M9 resizer drag: pointer drag resizes tree + persists; grid geometry 238px 8px 1fr', async () => {
+await runScenario('T8 no-JS: hidden/sort links and real form submission preserve fields across navigation', async () => {
   const { page, pageErrors } = await fresh();
-  await enterTree(page, 600);
-  const gridBefore = await page.evaluate("getComputedStyle(document.body).gridTemplateColumns");
-  const rect = await page.evaluate(
-    '(() => { const r = document.querySelector(".cb-tree-resizer").getBoundingClientRect(); return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }; })()'
+  await page.send('Emulation.setScriptExecutionDisabled', { value: true });
+  await noJsGoto(page, BASE + '/?sort=Name:Asc&hidden=0');
+  const html = await noJsHtml(page);
+  const fieldsOk =
+    html.includes('data-cb-surface="directory"') &&
+    html.includes('name="sort"') &&
+    html.includes('name="hidden"') &&
+    html.includes('id="cb-search-q"') &&
+    html.includes('data-cb-hidden-toggle') &&
+    html.includes('data-cb-sort="Size:Desc"');
+  // 隐藏开关: 点击 link -> 真实导航, hidden=1 且条目出现
+  await noJsWaitLoadAfter(page, () => noJsClick(page, '[data-cb-hidden-toggle]'));
+  const urlHidden = await noJsUrl(page);
+  const htmlHidden = await noJsHtml(page);
+  const hiddenNavOk = urlHidden.includes('hidden=1') && htmlHidden.includes('/.hidden.txt');
+  // 排序: 展开 details (无 JS 原生 summary), 点 Size:Desc -> sort 生效且 hidden 保留
+  await noJsClick(page, 'summary[data-cb-sort-summary]');
+  await sleep(150);
+  await noJsWaitLoadAfter(page, () => noJsClick(page, '[data-cb-sort="Size:Desc"]'));
+  const urlSort = await noJsUrl(page);
+  const htmlSort = await noJsHtml(page);
+  const sortOk =
+    urlSort.includes('sort=Size') &&
+    urlSort.includes('hidden=1') &&
+    htmlSort.indexOf('big.bin') !== -1 &&
+    htmlSort.indexOf('big.bin') < htmlSort.indexOf('a.md');
+  // 搜索: 真实字段; 重搜 (Enter 隐式提交) 保留 sort/hidden
+  await noJsGoto(page, BASE + '/__/search?q=leaf&sort=Name:Asc&hidden=0');
+  const searchHtml = await noJsHtml(page);
+  const searchFieldsOk =
+    searchHtml.includes('action="/__/search"') &&
+    searchHtml.includes('name="sort"') &&
+    searchHtml.includes('name="hidden"') &&
+    searchHtml.includes('data-cb-query="leaf"');
+  const { nodeId: qNode } = await noJsBox(page, '#cb-search-q');
+  await page.send('DOM.focus', { nodeId: qNode });
+  // 清空原 q 值 (无 JS 下经编辑命令全选, 再插入新查询)
+  await page.send('Input.dispatchKeyEvent', {
+    type: 'rawKeyDown',
+    key: 'a',
+    code: 'KeyA',
+    windowsVirtualKeyCode: 65,
+    nativeVirtualKeyCode: 65,
+    modifiers: 2,
+    commands: ['selectAll'],
+  });
+  await page.send('Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key: 'a',
+    code: 'KeyA',
+    windowsVirtualKeyCode: 65,
+    nativeVirtualKeyCode: 65,
+    modifiers: 2,
+  });
+  await page.send('Input.insertText', { text: 'a' });
+  await noJsWaitLoadAfter(page, async () => {
+    // 隐式提交依赖 Enter 的 text (\r) 才会走浏览器默认行为; 无 submit 按钮.
+    await page.send('Input.dispatchKeyEvent', {
+      type: 'keyDown',
+      key: 'Enter',
+      code: 'Enter',
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13,
+      text: '\r',
+      unmodifiedText: '\r',
+    });
+    await page.send('Input.dispatchKeyEvent', {
+      type: 'keyUp',
+      key: 'Enter',
+      code: 'Enter',
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13,
+    });
+  });
+  const urlSearch = await noJsUrl(page);
+  const htmlSearch = await noJsHtml(page);
+  const researchOk =
+    urlSearch.includes('q=a') &&
+    urlSearch.includes('sort=Name') &&
+    urlSearch.includes('hidden=0') &&
+    htmlSearch.includes('a.md');
+  // 条目导航离开搜索: 保留 sort/hidden, 移除 q
+  await noJsWaitLoadAfter(page, () => noJsClick(page, 'a[href^="/a.md?"]'));
+  const urlEntry = await noJsUrl(page);
+  const entryOk =
+    urlEntry.includes('/a.md') && urlEntry.includes('sort=Name') && urlEntry.includes('hidden=0') && !urlEntry.includes('q=');
+  // ../ 返回父目录: 保留 sort/hidden (在 /adir 上)
+  await noJsGoto(page, BASE + '/adir?sort=Name:Asc&hidden=0');
+  await noJsWaitLoadAfter(page, () => noJsClick(page, 'a[data-cb-parent]'));
+  const urlParent = await noJsUrl(page);
+  const parentOk = urlParent.includes('sort=Name') && urlParent.includes('hidden=0');
+  // 搜索位置导航离开搜索: 保留 sort/hidden, 移除 q
+  await noJsGoto(page, BASE + '/__/search?q=child&sort=Name:Asc&hidden=0');
+  await noJsWaitLoadAfter(page, () => noJsClick(page, 'a[href^="/adir?"]'));
+  const urlLocation = await noJsUrl(page);
+  const locationOk = urlLocation.includes('/adir') && urlLocation.includes('sort=Name') && !urlLocation.includes('q=');
+  const ok =
+    fieldsOk &&
+    hiddenNavOk &&
+    sortOk &&
+    searchFieldsOk &&
+    researchOk &&
+    entryOk &&
+    parentOk &&
+    locationOk &&
+    pageErrors.length === 0;
+  rec(
+    'T8 no-JS: hidden/sort links and real form submission preserve fields across navigation',
+    ok,
+    JSON.stringify({ fieldsOk, hiddenNavOk, sortOk, searchFieldsOk, researchOk, entryOk, parentOk, locationOk, errors: pageErrors })
   );
-  await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: rect.x, y: rect.y, button: 'left', clickCount: 1 });
-  await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: rect.x + 60, y: rect.y, button: 'left', buttons: 1 });
-  await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: rect.x + 60, y: rect.y, button: 'left', clickCount: 1 });
-  await sleep(400);
-  const s = await page.evaluate(
-    '(() => { const grid = getComputedStyle(document.body).gridTemplateColumns; return { grid, widthVar: document.body.style.getPropertyValue("--cb-tree-width"), stored: localStorage.getItem("cb-tree-width"), resizing: document.body.classList.contains("cb-tree-resizing") }; })()'
-  );
-  const w = parseInt(s.widthVar, 10);
-  rec('M9 resizer drag: pointer drag resizes tree + persists; grid geometry 238px 8px 1fr',
-    gridBefore.startsWith('238px 8px ') && w >= 290 && w <= 310 && s.stored === String(w) &&
-      !s.resizing && pageErrors.length === 0,
-    'gridBefore=' + gridBefore + ' after=' + JSON.stringify(s) + ' errors=' + JSON.stringify(pageErrors));
 });
 
-/* ---------- 收尾: 汇总 + 清理 ---------- */
+/* ---------- 收尾: 确定性清理 + 汇总 ---------- */
 
-try {
-  const pass = results.filter((r) => r.pass).length;
-  console.log('SUMMARY: ' + pass + '/' + results.length);
-  if (pass !== results.length) {
-    results.filter((r) => !r.pass).forEach((r) => console.log('  FAILED: ' + r.name));
-    process.exitCode = 1;
-  }
-} finally {
-  try {
-    browserCdp.close();
-  } catch {
-    /* 已关闭 */
-  }
-  try {
-    cleanup();
-  } catch (err) {
-    console.error('WARN: cleanup failed: ' + (err && err.message ? err.message : String(err)));
-  }
+await shutdown();
+const pass = results.filter((r) => r.pass).length;
+console.log('SUMMARY: ' + pass + '/' + results.length);
+if (pass !== results.length) {
+  results.filter((r) => !r.pass).forEach((r) => console.log('  FAILED: ' + r.name));
+  process.exitCode = 1;
 }

@@ -42,7 +42,7 @@ src/
   opts.rs      # clap CLI 定义与校验
   sort.rs      # SortBy/SortColumn/SortOrder，解析 "Column:Order"
   meta.rs      # FileMeta 精确 PathBuf identity、安全文件名显示、RFC 3986/RFC 8187 编码、时间格式化
-  listing.rs   # 目录排序 + 确定性递归搜索（sorted BFS、目录 identity 去环、500 条上限）
+  listing.rs   # 共享 ListingOptions：隐藏过滤 + 六键排序；sorted BFS 先取 500 个搜索候选再展示排序
   render.rs    # 目录/搜索/fragment HTML、面包屑、doc_page/.cb-doc 骨架、共享 slug/TOC
   highlight.rs # syntect 代码高亮（org src 块 / md 代码块 / 代码文件共用）+ 语言识别
   math.rs      # LaTeX 数学公式服务端 KaTeX 渲染（md span 替换 / org Text tokenize）
@@ -52,7 +52,7 @@ src/
   routes.rs    # axum 路由、ResponseMode、fragment/search/native-open 与安全响应出口
   assets.rs    # include_str! 内嵌前端资源
 assets/        # materialize.min.css / materialize.min.js（v2.3.3 社区分支）+ chapbook-theme.css（目录页主题）
-               # + chapbook-browser.js（键盘/列表网格/预览面板渐进增强，无构建步骤）
+               # + chapbook-browser.js（三态浏览、共享规则/偏好、历史快照、预览面板渐进增强，无构建步骤）
                # + chapbook-doc.css（`.cb-doc` 内容 + `.cb-doc-page` 页面双作用域）
                # + katex/（KaTeX 0.16.7 样式表 woff2 裁剪版 + 20 个 woff2 字体）
                # + mermaid.min.js（Mermaid 11.17.2 图表渲染，IIFE 单文件自包含构建；见 THIRD_PARTY_NOTICES）
@@ -69,7 +69,12 @@ tests/
 
 1. `GET /__/status` 返回 200，body 精确为 `simple static server is running.\n`。
 2. 静态资源挂载在 `/__/static/{css,js}/...`（目录列表页的 HTML 硬编码引用该前缀）。
-3. `?sort=Column:Order` 排序语法；**非法值返回 404**（不是 400，历史行为保持兼容）。
+3. 条目出口统一接受 `?sort=Column:Order&hidden=0|1`；**非法值返回 404**（不是 400）。
+   默认 Name:Asc、隐藏关闭；仅按条目自身原始 basename 的 `.` 前缀过滤，root 与 `../` 不过滤，
+   不限制隐藏目录/文件直链。六键双向排序始终目录优先，主键方向不反转次级名称/完整路径升序。
+   Name 与次级键用原始 bytes；Type 按末尾扩展名、忽略 ASCII 大小写、无扩展名独立成组，
+   目录不按后缀分类；目录大小用 metadata.len()，不递归。完整目录、树 JSON、目录 fragment、
+   搜索完整页/fragment 共用 `ListingOptions` 与比较器，不能让 JS 复制元信息排序。
 4. 目录列表页结构：面包屑是当前位置的唯一可见路径；一级标题使用 `.cb-visually-hidden` 供辅助技术读取，
    不再显示重复的 `Index of {dir}`；striped 表格的表头在 `<thead>` 中（放裸 `tr` 会被浏览器包进
    隐式 tbody 而染上条纹）、表头排序箭头（▲/▼）、非根目录含 `../` 行（`colspan="6"`，
@@ -133,9 +138,13 @@ tests/
     `text/html; charset=utf-8` + `nosniff` 片段；非 UTF-8、超限、Office 转换失败和不支持类型
     返回占位片段，**禁止**回退原始字节。文档/代码正文统一包在 `.cb-doc`，完整页 body 为
     `.cb-doc-page`；目录页同时加载 `chapbook-doc.css` 供预览使用。
+    最终 ResponseMode 为 fragment 时，参数/缺失路径 404、路径提取 400、穿越 403、搜索忙 429
+    等错误也使用安全 HTML + nosniff，保留状态与 Retry-After；download/raw 仍优先。
 11. `GET /__/search?q=...` 递归搜索文件名（目录也参与），大小写不敏感、上限 500。
-    遍历为按原始文件名 bytes 排序的 BFS；跟随目录符号链接但用 Unix `(dev, ino)` 去环，
-    hard link 的每个路径保留。进程级 `Semaphore(1)` 不排队：忙时 429 + `Retry-After: 1`；
+    原始文件名 bytes 排序的 BFS 决定候选集，第 501 个可见 match 标记截断，再按当前规则展示
+    前 500 个候选（不是全局 Top-N）。隐藏过滤先于目录 identity、入队和匹配名额；可见链接别名
+    仍能进入隐藏目标。跟随目录符号链接，用 Unix `(dev, ino)` 去环，hard link 每条路径保留。
+    进程级 `Semaphore(1)` 不排队：忙时 429 + `Retry-After: 1`；
     permit 必须由真实 `spawn_blocking` job 持有到结束。
 12. 浏览器 action identity 只来自完整 root-relative UTF-8 `Path` 的逐 segment RFC 3986 编码，
     DOM 只保存 ASCII `data-native-path-encoded`；URL action 全程不 decode，只有 native-open
@@ -151,6 +160,15 @@ tests/
     `.pdf` 文件（按 `data-kind="file"` + 编码后缀 `.pdf` 双条件判定，目录名 `folder.pdf`
     不受影响）的预览、树导航与迷你列表点击一律 `window.open` 新 tab 交给浏览器原生查看器，
     不 SPA、不进预览面板；服务端对 PDF 的 200/206 响应省略 sandbox 保证查看器可渲染。
+15. 树/列表/网格为同级互斥浏览视图，顶部一组 SVG 图标与 hover/focus 提示；共用隐藏开关
+    和六键排序。独立阅读页不是第四视图：图标均不选中、隐藏/排序禁用，返回父目录可定位文档。
+    冷进入显式 URL > 同源偏好 > 默认；有效历史快照在 reload/popstate/BFCache 时优先，
+    恢复不回写偏好，用户控件只保存改变的字段。同位置控件 replace，实际导航 push；
+    URL 分享 q/sort/hidden/hash，不含布局，`view=1` 仍是响应模式。无 JS 使用真实列表链接/表单。
+    显示规则版本使旧成功/错误失效；不同展开分支独立恢复，空分支不永久叶子化；
+    隐藏焦点回退不打开其他条目，不改变文档正文，排序/隐藏不重新转换打开的文档。
+    native-open 仅完整目录/搜索的列表、网格持有 token；进入树清除 token/动作/handler，
+    退出树经同上下文完整可信页恢复能力，fragment、快照与存储永不传播 token。
 
 ## 安全不变量
 

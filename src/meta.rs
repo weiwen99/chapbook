@@ -62,6 +62,14 @@ impl FileMeta {
         let attrs = std::fs::metadata(path)
             .or_else(|_| std::fs::symlink_metadata(path))
             .ok()?;
+        Self::from_metadata(root, path, &attrs)
+    }
+
+    pub(crate) fn from_metadata(
+        root: &Path,
+        path: &Path,
+        attrs: &std::fs::Metadata,
+    ) -> Option<FileMeta> {
         // display_name 只承载安全显示文本, 经显示 codec 转义, 绝不 lossy 转换
         let display_name = escape_os_name(path.file_name()?);
         let relative_to_root = path.strip_prefix(root).ok()?.to_path_buf();
@@ -95,11 +103,31 @@ impl FileMeta {
         }
     }
 
-    pub fn type_str(&self) -> &'static str {
+    /// 原始 basename, 供分类和排序借用, 不使用转义后的显示文本.
+    pub fn raw_name(&self) -> &OsStr {
+        self.relative_to_root
+            .file_name()
+            .unwrap_or(self.relative_to_root.as_os_str())
+    }
+
+    /// 文件末尾扩展名; 点文件及空后缀属于无扩展名, 目录不按后缀分类.
+    pub fn extension(&self) -> Option<&OsStr> {
         if self.is_directory {
-            "Directory"
+            None
         } else {
-            "File"
+            self.relative_to_root
+                .extension()
+                .filter(|ext| !ext.is_empty())
+        }
+    }
+
+    pub fn type_label(&self) -> String {
+        if self.is_directory {
+            "Directory".into()
+        } else {
+            self.extension()
+                .map(escape_os_name)
+                .unwrap_or_else(|| "File".into())
         }
     }
 
