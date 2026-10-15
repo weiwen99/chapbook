@@ -3,6 +3,10 @@
 chapbook（/ˈtʃæpbʊk/，小册子）—— 轻量高性能静态文件服务器：把一个目录变成一本可读的小册子。
 单文件可执行，前端资源全部内嵌，无外部文件依赖。
 
+本仓库是 [weiwen99/chapbook](https://github.com/weiwen99/chapbook) 的非官方 Windows 适配 Fork，
+保留上游提交历史与 Apache-2.0 许可证；原始许可证和第三方版权声明见
+[LICENSE](LICENSE) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
 ## Features
 
 - **Browser Views** — 树、列表、网格为三个同级视图，共用顶部图标工具区；hover/键盘焦点显示含义，隐藏项开关与六键双向排序适用于目录、树、搜索和目录预览
@@ -14,15 +18,31 @@ chapbook（/ˈtʃæpbʊk/，小册子）—— 轻量高性能静态文件服务
 - **Office / CSV Rendering** — `.doc/.docx/.ppt/.pptx/.xls/.xlsx/.odt/.ods/.odp/.rtf/.epub/.csv` 经 anydoc 纯 Rust 转为 GFM Markdown 后复用 comrak 渲染文档页（TOC/锚点/高亮与 `.md` 一致）；转换失败自动回退原文件下载；PDF 除外——浏览器原生打开
 - **Code Highlighting** — 源代码文件（含 `.txt`/`.log`）按 Accept 协商返回 syntect 高亮 HTML（带行号）或原文；`?raw=1` / `?view=1` 显式覆盖。覆盖 60+ 语言（内置 + 内嵌补充 TypeScript/TOML/Kotlin/Swift/Dockerfile/GraphQL 等）
 - **Range Requests & Media** — 支持断点续传（tower-http `ServeFile` 内置）；音视频浏览器内播放与 seek
-- **Open Locally & Download** — `?download=1` 显式下载（RFC 8187 编码文件名）；本机访问时可用系统默认应用打开文件（xdg-open / open，仅 loopback + token 校验通过时）
+- **Open Locally & Download** — `?download=1` 显式下载（RFC 8187 编码文件名）；本机访问时可用系统默认应用打开文件（Linux xdg-open / macOS open / Windows ShellExecuteExW，仅 loopback + token 校验通过时）
 - **Security** — 逐分量路径解析，路径穿越返回 403；原始内容用 `sandbox allow-scripts` CSP 隔离（非下载的成功 PDF/音视频响应例外，强制 nosniff）；所有 CB 完整页带 `frame-ancestors 'none'; script-src 'self'` 与 `X-Frame-Options: DENY`；Org 危险链接拒绝；悬空符号链接不会拖垮目录列表
 - **单文件分发** — 前端资源与 syntect 语法集全部内嵌进二进制，无外部文件依赖
+
+## Windows 双击使用
+
+源码仓库不包含编译产物，请先按下方步骤构建。构建后的 **`chapbook-launcher.exe`**
+可直接双击，也可复制并重命名为 **`打开文件夹浏览.exe`**：
+
+1. 在系统选择框中选中要浏览的文件夹，点击“选择文件夹”。
+2. 程序自动启动本机服务，并在默认浏览器中打开该文件夹。
+3. 保留“chapbook — 本地阅读服务”小窗口；需要时点“重新打开浏览器”。
+4. 用完点击“停止并退出”，或关闭这个小窗口，服务即停止。仅关闭浏览器不会停止服务。
+
+不需要命令行、手动填写路径或选择端口。中文、空格路径可直接选择；端口由系统分配，
+可同时打开多个文件夹，互不占用同一个端口。取消选择会直接退出，不启动服务。
+启动器是独立单文件，可复制到桌面或其他目录，不需要旁边有 `chapbook.exe`、源码或资源文件；
+运行不依赖 Rust、GCC、PowerShell 或 WSL。
 
 ## Build
 
 ### Prerequisites
 
 - Rust 1.88 或更新版本（edition 2024，建议通过 [rustup](https://rustup.rs) 安装）
+- 构建期需要 C 编译器（QuickJS 和 onig）；Windows 使用下述 GNU/MinGW-w64 工具链，不使用 MSVC
 - 无任何运行时外部依赖（pandoc/emacs 已随 Phase 2 完全退出）
 
 ### 构建可执行文件
@@ -36,6 +56,41 @@ cargo build --release
 ```
 
 开发期可用 `cargo build`（快，未优化），产物在 `target/debug/chapbook`。
+
+### Windows x64（原生运行，无需 WSL）
+
+本分支已适配 Windows：启动令牌使用跨平台系统安全随机源，本机打开使用 Windows 文件关联 API，
+中文与空格路径保持 UTF-16，不经 `cmd /c start` 或 PowerShell 拼接命令。
+Windows URL 路径拒绝盘符、反斜杠、UNC/设备路径及 NTFS alternate data streams（ADS）。
+上游 v0.4.1 Release 仍只有 Linux/macOS 产物，不能直接在 Windows 执行。
+
+构建需要 Rust GNU 工具链与 MinGW-w64 GCC（x86_64、SEH、MSVCRT；例如
+[mingw-builds](https://github.com/niXman/mingw-builds-binaries/releases) 的 `x86_64-…-posix-seh-msvcrt-…` 包）。
+QuickJS 使用 GNU C 扩展，不能仅安装 Visual Studio/MSVC 后直接构建。
+
+先安装 Rust GNU 工具链，并将上述 MinGW-w64 包解压到自选位置。
+下面以 `%LOCALAPPDATA%\chapbook-tools\mingw64` 为示例安装目录；请按实际位置调整路径。
+在项目目录打开 PowerShell：
+
+```powershell
+# 仅设置当前 PowerShell 会话；其他安装位置请相应调整 MinGW 路径
+$env:Path = "$env:USERPROFILE\.cargo\bin;$env:LOCALAPPDATA\chapbook-tools\mingw64\bin;$env:Path"
+# 首次安装 GNU 工具链
+rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+cargo +stable-x86_64-pc-windows-gnu build --release --locked
+
+# 生成便于双击的中文名称启动器（与 CLI 二进制相互独立）
+Copy-Item .\target\release\chapbook-launcher.exe .\打开文件夹浏览.exe
+
+# 服务当前目录；浏览器访问 http://127.0.0.1:8888/
+.\target\release\chapbook.exe .
+# 或指定需要浏览的目录
+.\target\release\chapbook.exe --port 9000 "D:\文档"
+```
+
+生成的 `chapbook-launcher.exe` 是图形启动器，`chapbook.exe` 保留原有命令行用法。
+两者均无需 Rust、GCC、Node 或 WSL 即可运行。CLI 按 `Ctrl+C` 停止，GUI 关闭控制窗口停止。
+默认只允许本机访问；除非确实需要局域网共享，不要改为 `--host 0.0.0.0`。
 
 ### Install
 

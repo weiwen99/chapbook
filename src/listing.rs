@@ -229,7 +229,7 @@ mod tests {
         result
             .entries
             .iter()
-            .map(|m| m.relative_to_root.to_string_lossy().into_owned())
+            .map(|m| crate::meta::display_path_text(&m.relative_to_root))
             .collect()
     }
 
@@ -333,6 +333,8 @@ mod tests {
     #[test]
     fn type_groups_use_last_extension_and_ascii_case_insensitive_ties() {
         let dir = tempfile::tempdir().unwrap();
+        // 与生产入口一致: Windows canonicalize 返回 verbatim 路径, 保留尾随点.
+        let root = dir.path().canonicalize().unwrap();
         for name in [
             "no-extension",
             ".env",
@@ -342,12 +344,12 @@ mod tests {
             "z.md",
             "trailing.",
         ] {
-            std::fs::write(dir.path().join(name), b"x").unwrap();
+            std::fs::write(root.join(name), b"x").unwrap();
         }
-        std::fs::create_dir(dir.path().join("folder.pdf")).unwrap();
+        std::fs::create_dir(root.join("folder.pdf")).unwrap();
         let entries = list_dir(
-            dir.path(),
-            dir.path(),
+            &root,
+            &root,
             ListingOptions {
                 sort_by: SortBy {
                     column: SortColumn::Type,

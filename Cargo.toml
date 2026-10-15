@@ -2,6 +2,7 @@
 name = "chapbook"
 version = "0.4.1"
 edition = "2024"
+default-run = "chapbook"
 # 实际 MSRV 由 anydoc (=0.1.8, MSRV 1.88) 决定; 显式声明让旧工具链报清晰错误
 rust-version = "1.88"
 description = "chapbook — serve a directory as a readable little book"
@@ -11,6 +12,10 @@ repository = "https://github.com/weiwen99/chapbook"
 [[bin]]
 name = "chapbook"
 path = "src/main.rs"
+
+[[bin]]
+name = "chapbook-launcher"
+path = "src/launcher/main.rs"
 
 [dependencies]
 axum = "0.8"
@@ -25,6 +30,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"]
 anydoc = "=0.1.8"
 chrono = "0.4"
 percent-encoding = "2"
+# 系统安全随机源: Windows 使用系统 RNG, 不依赖 Unix 的 /dev/urandom.
+getrandom = "0.4"
 # 树 JSON 端点序列化: serde 已在依赖树中 (传递), 此处显式声明为直接依赖.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,6 +42,11 @@ comrak = { version = "0.54", default-features = false }
 # 渲染失败返回 Err, 由 math.rs 回退原文显示
 katex = "0.4"
 syntect = "5"
+
+[target.'cfg(windows)'.dependencies]
+dunce = "1"
+rfd = { version = "0.15", default-features = false }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tempfile = "3"

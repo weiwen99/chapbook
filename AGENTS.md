@@ -17,9 +17,14 @@ cargo test                  # 全部测试（无外部依赖，恒跑）
 cargo fmt --check           # 格式检查（提交前必须过）
 cargo clippy --all-targets  # 静态检查（零警告基线，提交前必须过）
 ./target/release/chapbook /path/to/serve   # 运行；--help 查看参数
+cargo run --bin chapbook-launcher        # Windows 图形启动器（原生文件夹选择框）
 ```
 
-无 Makefile / 脚本封装，全部走 cargo 标准命令。
+无 Makefile / 脚本封装，全部走 cargo 标准命令。`default-run = "chapbook"` 保持既有 CLI 运行方式。
+Windows 的独立 `chapbook-launcher` 使用 GUI subsystem，不显示控制台；本地分发名为 `打开文件夹浏览.exe`。
+启动器内嵌同一 Router，同进程绑定 `127.0.0.1:0`，成功后打开默认浏览器；取消选择不启动服务。
+控制窗口显示安全路径与实际 URL，关闭/X/停止按钮统一发送 graceful shutdown，最多等待 2 秒后退出，
+不能遗留后台服务或依赖旁边另一个 CLI exe。默认浏览器失败时提示 URL，服务和重开按钮仍可用。
 
 ## CLI
 
@@ -39,6 +44,10 @@ chapbook [-h|--host <HOST>] [-p|--port <PORT>] <root-directory>
 src/
   main.rs      # 入口：日志初始化、TCP bind、优雅退出（Ctrl-C）
   lib.rs       # 库入口，导出下列模块（集成测试依赖 lib target）
+  desktop.rs   # 仅 Windows：CLI native-open 与 GUI 共用的 ShellExecuteExW 默认应用接口
+  launcher/
+    main.rs    # GUI 生命周期：选择目录、自动端口、默认浏览器、同进程 HTTP 服务与有界退出
+    gui.rs     # Windows 原生选择框、状态窗口与 Win32 消息事件（无 WebView）
   opts.rs      # clap CLI 定义与校验
   sort.rs      # SortBy/SortColumn/SortOrder，解析 "Column:Order"
   meta.rs      # FileMeta 精确 PathBuf identity、安全文件名显示、RFC 3986/RFC 8187 编码、时间格式化
@@ -154,9 +163,10 @@ tests/
     UTF-8 byte 必须显示为可见大写 escape；禁止用 `Path::display()` / `to_string_lossy()` 生成
     用户可见路径文本。
 14. `POST /__/native-open` 仅用于本机默认应用打开：公开 `routes::app(root) -> io::Result<Router>`
-    启动时从 `/dev/urandom` 生成 token；请求按 peer loopback → 字面 loopback Host →
+    启动时通过 `getrandom` 从系统安全随机源生成 token；请求按 peer loopback → 字面 loopback Host →
     精确 `http://Host` Origin → token → `resolve_within_root` → exists → opener 固定顺序校验。
-    `xdg-open`/`open` 使用单 path argv、null stdio、`kill_on_drop`，由 Tokio task 异步 wait 回收。
+    Linux/macOS 的 `xdg-open`/`open` 使用单 path argv、null stdio、`kill_on_drop`，由 Tokio task 异步 wait 回收；
+    Windows 使用 `ShellExecuteExW` 与 UTF-16 路径，无 shell、无参数拼接，由系统管理默认应用生命周期。
     `.pdf` 文件（按 `data-kind="file"` + 编码后缀 `.pdf` 双条件判定，目录名 `folder.pdf`
     不受影响）的预览、树导航与迷你列表点击一律 `window.open` 新 tab 交给浏览器原生查看器，
     不 SPA、不进预览面板；服务端对 PDF 的 200/206 响应省略 sandbox 保证查看器可渲染。
@@ -178,6 +188,7 @@ tests/
 - **路径穿越**：`routes::resolve_within_root` 逐分量解析 URL 路径，`..` 弹出到 root 时返回 403。
   任何重构不得退化为"字符串前缀比较"——词法比较不消除 `..` 分量，`/%2e%2e/...` 可读到根目录外文件，
   `tests/router.rs::path_traversal_is_forbidden` 锁定该行为。
+  Windows 另拒绝 URL 路径中的 `\` 与 `:`，防止盘符、UNC/设备路径与 NTFS ADS 绕过相对路径语义。
 - 符号链接**保持跟随**语义（允许把内容软链进服务根目录）；目录项元信息读取失败时
   回退 `symlink_metadata`，再失败则跳过该项，不允许单个坏文件导致列表 500。
 - href 编码使用 RFC 3986 percent-encoding（`meta::PATH_SEGMENT_ENCODE_SET`），空格为 `%20`；
@@ -220,6 +231,9 @@ tests/
 | serde | 树 JSON 端点序列化 | 本就在依赖树中（传递），显式声明为直接依赖；`derive` feature 供强类型 `Serialize` |
 | serde_json | 树 JSON 端点序列化 | `axum::Json` 强类型输出成功体与错误体，不手写 JSON 编码器；release 体积实测 +~48KB |
 | tracing + tracing-subscriber | 日志 | `RUST_LOG` 环境变量控制级别 |
+| getrandom 0.4 | 启动令牌 | 系统安全随机源，Windows 不访问 `/dev/urandom`；失败仍拒绝启动 |
+| windows-sys 0.61 + dunce 1（仅 Windows） | 系统默认应用打开 | COM 初始化后 `ShellExecuteExW`，仅在无损时简化 canonicalize 的 verbatim 前缀，无 shell |
+| rfd 0.15（仅 Windows） | 原生文件夹选择框 | GUI 启动器使用系统选择框；状态窗口通过 windows-sys 创建，无脚本/外部 runtime |
 
 Materialize 前端资源来自 [materializecss/materialize](https://github.com/materializecss/materialize)
 社区维护分支（v2.3.3，MIT），升级时替换 `assets/` 下两个 materialize 文件即可，无构建步骤。
@@ -228,8 +242,8 @@ Materialize 前端资源来自 [materializecss/materialize](https://github.com/m
 
 `assets/mermaid.min.js` 是 [mermaid-js/mermaid](https://github.com/mermaid-js/mermaid) v11.17.2（MIT）
 官方 dist 的 IIFE 单文件自包含构建（`mermaid.esm.min.mjs` 有 38 个懒加载 chunk，不可单文件嵌入，
-不可用），升级时替换该文件并同步 `tests/router.rs::mermaid_js_static_asset_served` 的字节数断言
-与 THIRD_PARTY_NOTICES。二进制 +~3.5MB。
+不可用），升级时替换该文件并同步 THIRD_PARTY_NOTICES，在浏览器验收中确认图表实际渲染为 SVG；
+不锁定资产字节长度（Git 的 LF/CRLF 检出转换会改变长度）。二进制 +~3.5MB。
 
 ## 设计决策
 
@@ -237,8 +251,9 @@ Materialize 前端资源来自 [materializecss/materialize](https://github.com/m
 2. 文件名链接使用 percent-encoding（空格 `%20`），不用表单语义（`+`）。
 3. 除受控 native-open 外零运行时外部依赖：.md/comrak、.org/orgize、代码/syntect、Office/CSV/anydoc
    全部纯 Rust；LaTeX 数学/katex crate（官方 KaTeX JS 经 quick-js 执行，quick-js 是构建期编译的
-   C 源码，静态链接进二进制）。唯一例外是本机打开的 `xdg-open`（Linux）/`open`（macOS）：
-   仅在完整安全校验后 spawn，使用 Tokio async wait 回收，runtime shutdown 时 kill-on-drop。
+   C 源码，静态链接进二进制）。本机打开例外：Linux 的 `xdg-open` / macOS 的 `open`
+   仅在完整安全校验后 spawn，使用 Tokio async wait 回收，runtime shutdown 时 kill-on-drop；
+   Windows 使用系统 `ShellExecuteExW` 文件关联，不启动命令解释器。
 4. `.md` 不走客户端 JS 渲染（Markdeep 依赖外部 CDN，离线即无法渲染，且与 org 页视觉不一致），
    改由 comrak 服务端渲染；无 `-c/--css` 选项。
    例外：Mermaid 图表只能浏览器端渲染（无纯 Rust 实现；quick-js 无 DOM 跑不了 mermaid；

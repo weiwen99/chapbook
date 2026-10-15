@@ -72,8 +72,7 @@ SOFTWARE.
 md fence ```` ```mermaid ```` 与 org `#+begin_src mermaid` 代码块由服务端输出为
 `<pre class="mermaid">` 容器，`chapbook-browser.js` 在页面含 mermaid 块时懒加载本文件，
 在浏览器端渲染为 SVG（`securityLevel: 'strict'`）。升级时替换
-`assets/mermaid.min.js` 并同步 `tests/router.rs::mermaid_js_static_asset_served`
-的字节数断言。
+`assets/mermaid.min.js`，并在浏览器验收中确认实际生成 SVG；不以 LF/CRLF 相关的资产字节长度判定版本。
 
 > The MIT License (MIT)
 >
