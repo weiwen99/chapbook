@@ -280,6 +280,15 @@
     if (!isValidSort(value.sort)) return false;
     if (!isValidHidden(String(value.hidden))) return false;
     if (typeof value.hash !== 'string') return false;
+    // 阅读位置 (独立阅读表面的窗口滚动, px): 可选字段. 存在时必须是有限非负数;
+    // 旧快照没有此键 — 缺失视为无恢复意图, 不视为失效.
+    if (
+      value.scroll !== undefined &&
+      value.scroll !== null &&
+      !(typeof value.scroll === 'number' && Number.isFinite(value.scroll) && value.scroll >= 0)
+    ) {
+      return false;
+    }
     if (value.opened !== null && !isValidEncodedPath(value.opened)) return false;
     if (value.openedKind !== null && value.openedKind !== 'reading' && value.openedKind !== 'directory') return false;
     if ((value.opened === null) !== (value.openedKind === null)) return false;
@@ -346,25 +355,34 @@
     }
   }
 
+  // 有效视图偏好解析 (只读): 新键优先; 否则按旧键一次性映射 (旧 tree 优先,
+  // 否则 list/grid); 无偏好 → 默认列表. migrated 表示结果需要落盘到新键.
+  function resolveViewPref() {
+    const stored = readPref(PREF_VIEW);
+    if (stored === 'tree' || stored === 'list' || stored === 'grid') {
+      return { view: stored, migrated: false };
+    }
+    const legacyMode = readPref(LEGACY_MODE_KEY);
+    const legacyView = readPref(LEGACY_VIEW_KEY);
+    let view = DEFAULT_VIEW;
+    if (legacyMode === 'tree') {
+      view = 'tree';
+    } else if (legacyView === 'grid') {
+      view = 'grid';
+    }
+    return { view: view, migrated: legacyMode !== null || legacyView !== null };
+  }
+
   // 一次性迁移旧 cb-mode / cb-view 到三态 cb-browse-view: 旧 tree 优先, 否则
   // 保留 grid/list; 写入新键后删除旧键, 不保留长期兼容别名.
   function loadViewPref() {
-    const stored = readPref(PREF_VIEW);
-    if (stored === 'tree' || stored === 'list' || stored === 'grid') return stored;
-    const legacyMode = readPref(LEGACY_MODE_KEY);
-    const legacyView = readPref(LEGACY_VIEW_KEY);
-    let migrated = DEFAULT_VIEW;
-    if (legacyMode === 'tree') {
-      migrated = 'tree';
-    } else if (legacyView === 'grid') {
-      migrated = 'grid';
-    }
-    if (legacyMode !== null || legacyView !== null) {
-      writePref(PREF_VIEW, migrated);
+    const resolved = resolveViewPref();
+    if (resolved.migrated) {
+      writePref(PREF_VIEW, resolved.view);
       removePref(LEGACY_MODE_KEY);
       removePref(LEGACY_VIEW_KEY);
     }
-    return migrated;
+    return resolved.view;
   }
 
   function loadSortPref() {
@@ -505,6 +523,28 @@
     return url;
   }
 
+  // 独立阅读位置 (px): 只有阅读表面 (阅读目标且无浏览视图) 记录窗口滚动 —
+  // 树壳下窗口不滚动 (树与内容区各有滚动容器), 其它表面与该导航无关.
+  function readingScrollY() {
+    if (state.kind !== 'reading' || state.view !== null) return null;
+    const y = window.scrollY;
+    return Number.isFinite(y) && y > 0 ? Math.round(y) : 0;
+  }
+
+  // 恢复窗口滚动位置: 立即应用一次, 文档未完全加载时在 load 后再应用一次
+  // (图片/字体撑高文档后 scrollTo 不被截断到旧高度). 显式 instant: 文档页 CSS
+  // 的 scroll-behavior: smooth 不得把恢复变成动画 (恢复必须是确定落点).
+  function restoreReadingScroll(y) {
+    if (typeof y !== 'number' || !Number.isFinite(y) || y <= 0) return;
+    const apply = function () {
+      window.scrollTo({ top: y, left: 0, behavior: 'instant' });
+    };
+    apply();
+    if (document.readyState !== 'complete') {
+      window.addEventListener('load', apply, { once: true });
+    }
+  }
+
   function snapshotNow() {
     return {
       v: SNAPSHOT_VERSION,
@@ -513,6 +553,7 @@
       path: state.path,
       q: state.kind === 'search' ? state.q : null,
       hash: location.hash,
+      scroll: readingScrollY(),
       sort: state.rules.sort,
       hidden: state.rules.hidden ? 1 : 0,
       opened: state.opened,
@@ -606,14 +647,16 @@
     return $$('a[data-cb-sort]');
   }
 
-  function searchForm() {
-    return $('header.cb-topbar form.cb-search') || $('form.cb-search');
+  // 搜索表单 = 共享工具区 + 独立阅读导航的桌面/移动副本 (同一 action, 各自
+  // 独立 id): 显示规则字段逐份同步, 任一可见表单提交都携带当前规则.
+  function searchForms() {
+    return $$('form.cb-search');
   }
 
-  // 控件可用性: 只有活跃浏览视图下 hidden/sort 才生效 (独立阅读页禁用, 由
-  // aria-disabled 表达; 客户端启用 = 清除 aria-disabled 并补 href/click).
+  // 控件状态同步: 视图/隐藏/排序控件只存在于浏览表面 (共享工具区, 或树壳克隆
+  // 的工具区; 独立阅读导航不承载这些控件). 客户端启用 = 清除服务端
+  // aria-disabled, 并让每个入口都携带有效显示规则.
   function syncControlState() {
-    const browse = isBrowseView();
     viewButtons().forEach(function (btn) {
       btn.removeAttribute('aria-disabled');
       btn.setAttribute('data-cb-tip', btn.getAttribute('aria-label'));
@@ -632,11 +675,12 @@
     });
     const toggle = hiddenToggle();
     if (toggle) {
+      toggle.removeAttribute('aria-disabled');
       toggle.setAttribute('aria-pressed', state.rules.hidden ? 'true' : 'false');
-      toggle.setAttribute('aria-disabled', browse ? 'false' : 'true');
-      toggle.setAttribute('data-cb-tip', browse
-        ? (state.rules.hidden ? '不显示隐藏项' : '显示隐藏项')
-        : '阅读模式不适用：请先在目录或搜索中使用');
+      toggle.setAttribute(
+        'data-cb-tip',
+        state.rules.hidden ? '不显示隐藏项' : '显示隐藏项'
+      );
       if (toggle.tagName === 'A') {
         toggle.setAttribute(
           'href',
@@ -649,14 +693,13 @@
     }
     const control = sortControl();
     if (control) {
-      control.setAttribute('aria-disabled', browse ? 'false' : 'true');
+      control.removeAttribute('aria-disabled');
       const summary = control.querySelector('summary');
-      if (summary) summary.setAttribute('data-cb-tip', browse
-        ? '排序' : '阅读模式不适用：请先在目录或搜索中使用');
+      if (summary) summary.setAttribute('data-cb-tip', '排序');
     }
     let currentLabel = null;
     sortLinks().forEach(function (link) {
-      link.setAttribute('aria-disabled', browse ? 'false' : 'true');
+      link.removeAttribute('aria-disabled');
       const value = link.getAttribute('data-cb-sort');
       // 表头链接表示下一次排序动作; 当前摘要只能取工具区内的选项标签.
       const current = !!control && control.contains(link) && value === state.rules.sort;
@@ -666,26 +709,24 @@
       } else {
         link.removeAttribute('aria-current');
       }
-      // 独立阅读页 (服务器不输出 href) 只有在浏览视图活跃时才补回可用链接.
-      if (browse || link.hasAttribute('href')) {
-        link.setAttribute(
-          'href',
-          hrefWithRules(link.getAttribute('href') || location.href, {
-            sort: value,
-            hidden: state.rules.hidden,
-          })
-        );
-      }
+      // 每个排序入口都是真实 anchor: href 延续有效显示规则 (保留 q).
+      link.setAttribute(
+        'href',
+        hrefWithRules(link.getAttribute('href') || location.href, {
+          sort: value,
+          hidden: state.rules.hidden,
+        })
+      );
     });
     const sortState = $('[data-cb-sort-state]');
     if (sortState && currentLabel) sortState.textContent = currentLabel;
-    const form = searchForm();
-    if (form) {
+    searchForms().forEach(function (form) {
       const sortField = form.querySelector('input[name="sort"]');
       const hiddenField = form.querySelector('input[name="hidden"]');
       if (sortField) sortField.value = state.rules.sort;
       if (hiddenField) hiddenField.value = state.rules.hidden ? '1' : '0';
-    }
+    });
+    syncReadingNav();
   }
 
   // 在既有 href 上就地替换 sort/hidden (保留 q 与其他必要字段; 非法 href 原样).
@@ -715,6 +756,216 @@
       pairs.push('hidden=' + (rules.hidden ? '1' : '0'));
     }
     return url.pathname + (pairs.length ? '?' + pairs.join('&') : '') + url.hash;
+  }
+
+  /* ---------- 独立阅读导航 (阅读页) ---------- */
+
+  // 独立阅读表面 = 阅读目标且无浏览视图 (树壳下的阅读目标是浏览表面).
+  function isReadingSurface() {
+    return state.kind === 'reading' && state.view === null;
+  }
+
+  function readingNav() {
+    return $('header.cb-reading-nav');
+  }
+
+  // 依赖 JS 的动作 (文件树/复制链接) 在服务端保持 hidden; 只有合法 identity 的
+  // 阅读页才启用 — identity 缺失时 init 已 fail-closed, 控件绝不解除 hidden.
+  function enableReadingActions() {
+    $$('[data-cb-reading-tree], [data-cb-reading-copy]').forEach(function (btn) {
+      btn.hidden = false;
+    });
+  }
+
+  // 阅读导航的规则延续: 面包屑/所在目录/下载等真实链接保持当前 sort/hidden
+  // (服务端渲染时的规则可能已被偏好或显式 URL 覆盖).
+  function syncReadingNav() {
+    const nav = readingNav();
+    if (!nav) return;
+    $$('a[href]', nav).forEach(function (link) {
+      const href = link.getAttribute('href');
+      if (!href || href.charAt(0) === '#') return;
+      link.setAttribute(
+        'href',
+        hrefWithRules(href, { sort: state.rules.sort, hidden: state.rules.hidden })
+      );
+    });
+  }
+
+  // 阅读导航高度 (sticky 顶栏 / scroll-padding / TOC 偏移): ResizeObserver
+  // 同步根变量, CSS 兜底高度在变量缺席时仍可用.
+  function installReadingNavHeight(nav) {
+    const update = function () {
+      document.documentElement.style.setProperty(
+        '--cb-reading-nav-height',
+        nav.offsetHeight + 'px'
+      );
+    };
+    new ResizeObserver(update).observe(nav);
+    update();
+  }
+
+  // 阅读搜索 (Q8): 原生 details 展开 + 原生表单提交; 展开时聚焦输入, 收起时把
+  // 焦点交回入口; Escape 关闭. 输入/可编辑目标永不抢键 (全局处理器已先放行).
+  function installReadingSearch() {
+    $$('details.cb-reading-search').forEach(function (details) {
+      details.addEventListener('toggle', function () {
+        const input = details.querySelector('form.cb-search input[name="q"]');
+        if (details.open) {
+          if (input) input.focus();
+          return;
+        }
+        if (details.contains(document.activeElement)) {
+          const summary = details.querySelector('summary');
+          if (summary) summary.focus();
+        }
+      });
+      details.addEventListener('keydown', function (event) {
+        if (event.key !== 'Escape' || !details.open) return;
+        event.preventDefault();
+        details.open = false; // toggle 处理器把焦点交回入口
+      });
+    });
+  }
+
+  // 阅读搜索展开并聚焦: 宽窄屏各有一份, 只打开并聚焦当前显示的那一份 (不复制
+  // 输入, 表单仍是唯一真源). 窄屏那份藏在"更多"弹层里 — 宿主弹层先展开, 绝不
+  // 把焦点交给不可见控件.
+  function focusReadingSearch() {
+    const groups = $$('details.cb-reading-search');
+    if (groups.length === 0) return false;
+    let group = groups.find(function (el) {
+      return el.getClientRects().length > 0;
+    });
+    if (!group) {
+      group =
+        groups.find(function (el) {
+          return el.closest('.cb-reading-more') !== null;
+        }) || groups[0];
+    }
+    // 关闭的 <details> 后代仍可能有 layout rect; 不能据此跳过宿主展开。
+    const host = group.closest('details.cb-reading-more');
+    if (host) host.open = true;
+    group.open = true;
+    const input = group.querySelector('form.cb-search input[name="q"]');
+    if (input) input.focus();
+    return true;
+  }
+
+  // '/' 焦点入口: 阅读表面聚焦阅读搜索, 其余表面沿用共享工具区搜索框.
+  function focusSearchInput() {
+    if (isReadingSurface() && focusReadingSearch()) return true;
+    const input = topbarSearchInput();
+    if (!input) return false;
+    input.focus();
+    return true;
+  }
+
+  function setReadingStatus(text) {
+    $$('[data-cb-reading-status]').forEach(function (el) {
+      el.textContent = text;
+    });
+  }
+
+  // 复制链接 (Q7): 复制当前页面真实 URL (含已有章节锚点, 绝不写入滚动高亮的
+  // 章节); 剪贴板不可用或被拒绝时展开可手动选择的完整链接, 不显示虚假成功.
+  function copyReadingLink() {
+    const url = location.href;
+    const fallback = $('[data-cb-reading-copy-fallback]');
+    const fail = function () {
+      if (fallback) {
+        const input = fallback.querySelector('input');
+        if (input) input.value = url;
+        fallback.hidden = false;
+        if (input) {
+          input.focus();
+          input.select();
+        }
+      }
+      setReadingStatus('无法自动复制：请手动复制完整链接');
+    };
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+      fail();
+      return;
+    }
+    navigator.clipboard.writeText(url).then(
+      function () {
+        if (fallback) fallback.hidden = true;
+        setReadingStatus('已复制链接');
+      },
+      fail
+    );
+  }
+
+  // 定位 identity: 当前文件被隐藏规则过滤 (hidden=0 时不显示隐藏项) 时不定位 —
+  // 只进入所在目录, 不开启隐藏项、不注入过滤例外、不打开替代条目.
+  function readingLocateIdentity() {
+    if (!isValidEncodedPath(state.path) || state.path === '') return null;
+    return isHiddenEncodedPath(state.path) && !state.rules.hidden ? null : state.path;
+  }
+
+  // 所在目录 (Q4/Q11/Q12): 按保存的浏览视图 (无偏好 → 列表) 延续当前显示规则
+  // 进入父目录; 只定位当前文件 (被隐藏规则过滤时不定位, 不开启隐藏项、不注入
+  // 过滤例外、不打开替代条目), 不打开预览, 不改写显示偏好.
+  function navigateReadingParent() {
+    if (!isReadingSurface() || state.path === '') return;
+    const parent = parentEncodedPath(state.path);
+    if (parent === null) return; // 非法 identity: 不猜目标
+    replaceCurrentEntry(); // 阅读项记录当前滚动 (后退回到阅读页时恢复实际位置)
+    handoff(
+      {
+        kind: 'directory',
+        path: parent,
+        locate: readingLocateIdentity(),
+        opened: null,
+        openedKind: null,
+        sameLocation: false,
+      },
+      resolveViewPref().view
+    );
+  }
+
+  // 在文件树中浏览 (Q6/Q13): 当前阅读历史项先记录进入树前的真实阅读位置, 再
+  // 只新增一个树历史项 (同一 URL 允许) — 当前文件仍是阅读对象, 树展开并选中
+  // 它; 进入树只写视图偏好, 历史恢复不回写偏好.
+  function enterReadingTree() {
+    if (!isReadingSurface() || state.path === '') return;
+    if (!isValidEncodedPath(state.path)) return;
+    replaceCurrentEntry(); // 阅读项记录当前滚动 (back 恢复实际位置而非锚点)
+    state.view = 'tree';
+    state.selected = state.path;
+    persistView('tree');
+    pushEntry(contextUrl('reading', state.path, null, location.hash));
+    ensureTreeShell(true);
+  }
+
+  // 工具区交接: 树壳使用既有浏览工具区 (克隆惰性模板), 不叠加独立阅读导航;
+  // 模板缺失 (旧页) 时不隐藏导航, 避免树壳失去全部控件.
+  function installBrowseTopbarReplacement() {
+    const nav = readingNav();
+    if (!nav) return;
+    if ($('header.cb-topbar')) {
+      nav.hidden = true; // 已交接 (幂等)
+      return;
+    }
+    const template = document.getElementById('cb-browse-topbar');
+    if (!template || !template.content) return;
+    nav.before(template.content.cloneNode(true));
+    nav.hidden = true;
+    // 克隆出来的工具区必须重新量一次边界变量: 窄屏抽屉/遮罩以
+    // --cb-topbar-bottom 定位 (回退 0px 会盖住工具区).
+    const topbar = $('header.cb-topbar');
+    if (topbar) installTopbarBounds(topbar);
+  }
+
+  // 阅读导航安装: 只在合法 identity 的阅读页调用 (fail-closed 分支直接返回,
+  // 不启用任何依赖 JS 的能力).
+  function installReadingNav() {
+    const nav = readingNav();
+    if (!nav) return;
+    enableReadingActions();
+    installReadingSearch();
+    installReadingNavHeight(nav);
   }
 
   /* ---------- 列表/网格条目与选中 ---------- */
@@ -928,19 +1179,6 @@
     };
   }
 
-  // 独立阅读页 → list/grid: 父目录并定位当前文档.
-  function readingListGridTarget() {
-    const parent = parentEncodedPath(state.path);
-    return {
-      kind: 'directory',
-      path: parent === null ? '' : parent,
-      locate: state.path,
-      opened: state.path,
-      openedKind: 'reading',
-      sameLocation: false,
-    };
-  }
-
   // 用户视图切换 (控件或 v 键): 同位置变化 replace 当前项; 需要完整页能力时
   // 交接 (同路径 replace+reload, 跨路径只新增一个目标项+reload).
   function switchToView(next, opts) {
@@ -970,10 +1208,6 @@
     if (user) persistView(next);
     if (state.view === 'tree') {
       handoff(listGridTargetFromTree(), next);
-      return;
-    }
-    if (state.view === null) {
-      handoff(readingListGridTarget(), next);
       return;
     }
     state.view = next;
@@ -2004,6 +2238,7 @@
     li.classList.add('cb-selected');
     li.setAttribute('aria-selected', 'true');
     if (treeRootUl) treeRootUl.setAttribute('aria-activedescendant', li.id);
+    li.scrollIntoView({ block: 'nearest' }); // 定位: 选中即保证可见
     const path = encodedPathOf(li);
     state.selected = path;
     if (!(opts && opts.silent)) {
@@ -2086,7 +2321,6 @@
     const base = idx < 0 ? (delta > 0 ? -1 : 0) : idx;
     const next = Math.max(0, Math.min(base + delta, nodes.length - 1));
     selectTreeNode(nodes[next]);
-    nodes[next].scrollIntoView({ block: 'nearest' });
   }
 
   // 树根聚焦 (preventScroll): 指针选中树行后焦点落树根 — active-descendant 由根
@@ -2374,6 +2608,7 @@
   // 进入/恢复 tree 视图 (唯一入口; 幂等): 新壳构建; 已有壳只重同步 - 内容区按
   // 快照目标重取 (已成功安装同一目标则不重取), 树标记 current 并恢复选中 identity.
   function ensureTreeShell(revealCurrent) {
+    installBrowseTopbarReplacement(); // 工具区交接先于控件同步 (树壳无阅读导航)
     syncControlState();
     if (!treeShell) {
       buildTreeShell(revealCurrent);
@@ -3487,8 +3722,7 @@
         break;
       }
       case '/': {
-        const input = topbarSearchInput();
-        if (input) input.focus();
+        if (!focusSearchInput()) return; // 无可用搜索入口: 不取消默认行为
         event.preventDefault();
         break;
       }
@@ -3501,6 +3735,41 @@
 
   function onDocumentClick(event) {
     const target = event.target;
+    // 独立阅读导航: 文件树 / 复制链接 / 所在目录. 动作按钮在客户端启用前保持
+    // 服务端 hidden (未启用即 no-op); 所在目录是真实链接, 只拦截主键无修饰点击.
+    const treeAction = target.closest('[data-cb-reading-tree]');
+    if (treeAction) {
+      event.preventDefault();
+      if (!treeAction.hidden) enterReadingTree();
+      return;
+    }
+    const copyAction = target.closest('[data-cb-reading-copy]');
+    if (copyAction) {
+      event.preventDefault();
+      if (!copyAction.hidden) {
+        // 反馈区 (状态/手动选择字段) 在导航栏内, 不能藏在窄屏"更多"弹层之下.
+        const panel = copyAction.closest('details');
+        if (panel) panel.open = false;
+        copyReadingLink();
+      }
+      return;
+    }
+    const parentAction = target.closest('[data-cb-reading-parent]');
+    if (parentAction) {
+      if (
+        event.defaultPrevented ||
+        event.button !== 0 ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey
+      ) {
+        return; // 修饰点击/中键: 保留原生链接语义 (新 tab/新窗口)
+      }
+      event.preventDefault();
+      navigateReadingParent();
+      return;
+    }
     // 顶部工具区: 视图组 / 隐藏开关 / 排序 (同一状态流程, 无第二份偏好)
     const viewBtn = target.closest('[data-cb-view]');
     if (viewBtn) {
@@ -3628,6 +3897,21 @@
     );
   }
 
+  // 树壳恢复的展开意图:
+  // - 冷访问 (无快照): 既有约定 — 展开当前内容路径;
+  // - 快照携带的定位选中落在当前内容目标之内 (自身或后代) 时是"定位"语义: 展开
+  //   当前路径链, 让定位目标可见并选中 (父目录定位文件 / 阅读目标进树);
+  // - 其余快照恢复只恢复既有展开 — 用户显式折叠的祖先不因内容定位重新展开.
+  function treeRestoreReveal() {
+    if (!bootSnapshot) return true;
+    const selected = state.selected;
+    if (selected === null || !isValidEncodedPath(selected) || selected === '') return false;
+    const current = currentPathFromState();
+    if (current === null) return false;
+    if (selected === current) return true;
+    return current === '' || selected.indexOf(current + '/') === 0;
+  }
+
   // back/forward: managed 快照优先按项恢复 (不重读偏好). 跨文档 BFCache 恢复与
   // 同文档 SPA 项都会触发 popstate: 活 DOM 已匹配目标时绝不重载/重取; 只有
   // 当前文档确实无法代表目标表面时才整页恢复.
@@ -3641,11 +3925,11 @@
       // 活 DOM 已对应该项 (跨文档 BFCache 恢复 / 锚点导航): 零 DOM 变更、零重取
       // (树壳缺失时才重建, 属防御).
       if (alreadyCurrent) {
-        if (state.view === 'tree' && !treeShell) ensureTreeShell();
+        if (state.view === 'tree' && !treeShell) ensureTreeShell(treeRestoreReveal());
         return;
       }
       if (state.view === 'tree') {
-        ensureTreeShell(); // 同文档 SPA 项: 树壳保持, 按快照目标重同步
+        ensureTreeShell(treeRestoreReveal()); // 同文档 SPA 项: 树壳保持, 按快照目标重同步
         return;
       }
       location.reload(); // 目标表面非树壳且活 DOM 不匹配: 整页加载按快照恢复
@@ -3675,11 +3959,11 @@
     syncControlState();
     // BFCache 恢复: DOM 已冻结为该项状态 → 幂等重放, 不重取、不重读偏好.
     if (alreadyCurrent) {
-      if (state.view === 'tree' && !treeShell) ensureTreeShell();
+      if (state.view === 'tree' && !treeShell) ensureTreeShell(treeRestoreReveal());
       return;
     }
     if (state.view === 'tree') {
-      ensureTreeShell();
+      ensureTreeShell(treeRestoreReveal());
       return;
     }
     if (state.view === 'list' || state.view === 'grid') {
@@ -3688,7 +3972,29 @@
     }
   }
 
+  // 离开文档 (reload/导航/BFCache) 前把真实阅读位置写回当前历史项: 恢复时不会
+  // 拿到陈旧滚动值 (只对阅读表面生效, 不触碰其它表面与浏览视图). 树壳文档的
+  // window 不滚动 (body overflow:hidden) — 回退到阅读项 (popstate 后的 reload)
+  // 时绝不用树壳的 0 覆盖已记录的阅读位置.
+  function onPageHide() {
+    if (!initialized || !isReadingSurface() || treeShell) return;
+    replaceCurrentEntry();
+  }
+
   /* ---------- 启动 ---------- */
+
+  // 共享工具区边界变量 (--cb-topbar-bottom): 普通流中的工具区底部, 预览面板与
+  // 窄屏抽屉/遮罩从其下方开始, 跟随窄屏换行与克隆后的实际高度.
+  function installTopbarBounds(topbar) {
+    const update = function () {
+      document.body.style.setProperty(
+        '--cb-topbar-bottom',
+        topbar.offsetTop + topbar.offsetHeight + 'px'
+      );
+    };
+    new ResizeObserver(update).observe(topbar);
+    update();
+  }
 
   function installListeners() {
     document.addEventListener('click', onDocumentClick);
@@ -3696,6 +4002,7 @@
     document.addEventListener('keydown', onKeydown);
     window.addEventListener('popstate', onPopState);
     window.addEventListener('pageshow', onPageShow);
+    window.addEventListener('pagehide', onPageHide);
     if (window.matchMedia) {
       window
         .matchMedia('(prefers-color-scheme: dark)')
@@ -3703,17 +4010,7 @@
     }
     installTocSpyMql();
     const topbar = $('header.cb-topbar');
-    if (topbar) {
-      // 普通流中的共享工具区保持可达; 预览与抽屉从其下方开始, 跟随窄屏换行.
-      const updateTopbarBounds = function () {
-        document.body.style.setProperty(
-          '--cb-topbar-bottom',
-          topbar.offsetTop + topbar.offsetHeight + 'px'
-        );
-      };
-      new ResizeObserver(updateTopbarBounds).observe(topbar);
-      updateTopbarBounds();
-    }
+    if (topbar) installTopbarBounds(topbar);
   }
 
   function init() {
@@ -3736,6 +4033,9 @@
       installListeners();
       return;
     }
+    // 独立阅读导航: 只有合法 identity 才启用服务端 hidden 的依赖 JS 动作
+    // (上一分支 fail-closed 时不触及任何控件).
+    if (surface === 'reading') installReadingNav();
     // 1) 有效状态: managed 快照优先 (reload/popstate/BFCache 按该项恢复);
     //    否则显式 URL > 保存偏好 > 默认.
     const snapshot = readSnapshot();
@@ -3743,6 +4043,11 @@
     bootSnapshot = useSnapshot;
     if (useSnapshot) {
       applySnapshot(snapshot);
+      // 独立阅读位置: 只消费快照记录的窗口滚动 (进入树前的真实位置), 不依赖
+      // 浏览器对锚点或历史项的默认滚动恢复.
+      if (snapshot.surface === 'reading' && snapshot.view === null) {
+        restoreReadingScroll(snapshot.scroll);
+      }
     } else {
       const explicit = explicitUrlRules();
       state.kind = surface;
@@ -3784,7 +4089,7 @@
     }
     // 4) 应用视图与控件.
     if (state.view === 'tree') {
-      ensureTreeShell(!useSnapshot);
+      ensureTreeShell(treeRestoreReveal());
     } else if (state.view === 'list' || state.view === 'grid') {
       syncControlState();
       applyViewContainers();

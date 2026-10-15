@@ -1,19 +1,27 @@
 //! HTML 生成 (maud).
 //!
 //! - 目录/搜索完整页共用 [`page_shell`]: 同一套顶部工具区 ([`topbar`])、面包屑、
-//!   预览面板与 native token meta; 独立阅读页由 [`doc_page`] 输出同一工具区.
+//!   预览面板与 native token meta; 独立阅读页由 [`doc_page`] 输出自己的
+//!   [`reading_nav`] (位置/返回浏览/文件动作), 浏览工具区只以惰性
+//!   `<template id="cb-browse-topbar">` 供树视图克隆 — 初始阅读 DOM 不含活的
+//!   浏览控件.
 //! - 列表/网格/fragment 的全部导航链接与搜索表单统一保留有效显示规则
 //!   (`sort=Column:Order&hidden=0|1`; 搜索页带 q), 实际离开搜索才移除 q.
 //! - 非 UTF-8 名称一律 display-only (无 anchor / 无 action identity), 仅显示
 //!   codec 转义文本; 规范 filesystem identity 只用 `data-native-path-encoded`.
+//! - 阅读导航的 href/identity 一律取自 canonical encoded path (显示文本只经其
+//!   逐段解码 + 显示 codec), 两者绝不互推; identity 缺失时 fail-closed.
 //! - 工具区不含 inline handler: 视图图标组/隐藏项开关/排序入口在无 JS 时以
-//!   真实链接或原生 details/summary 工作 (树/网格按真实能力渐进增强).
+//!   真实链接或原生 details/summary 工作 (树/网格按真实能力渐进增强);
+//!   阅读导航的树/复制入口在客户端就绪前保持 `hidden`, 不伪装可执行.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use maud::{DOCTYPE, Markup, html};
+use percent_encoding::percent_decode_str;
 
 use crate::listing::{ListingOptions, SearchResult};
 use crate::meta::{
@@ -76,25 +84,24 @@ fn sort_href(q: Option<&str>, options: ListingOptions, target: SortBy) -> String
     }
 }
 
-/// 排序菜单的十二个 (列, 方向) 选项.
-/// `enabled` 为 false (独立阅读表面) 时省略 href: 无 JS 不可导航 (禁用),
-/// 客户端启用时再补 href.
+/// 排序菜单的十二个 (列, 方向) 选项: 每个选项都是带 href 的真实链接
+/// (无 JS 可导航, 保留 q/hidden), 不出现禁用分支.
 struct SortChoice {
     /// `Column:Order` (data-cb-sort 与 query 值).
     value: String,
-    href: Option<String>,
+    href: String,
     label: String,
     active: bool,
 }
 
-fn sort_choices(q: Option<&str>, options: ListingOptions, enabled: bool) -> Vec<SortChoice> {
+fn sort_choices(q: Option<&str>, options: ListingOptions) -> Vec<SortChoice> {
     let mut choices = Vec::with_capacity(12);
     for column in SortColumn::ALL {
         for order in [SortOrder::Asc, SortOrder::Desc] {
             let target = SortBy { column, order };
             choices.push(SortChoice {
                 value: format!("{column}:{order}"),
-                href: enabled.then(|| sort_href(q, options, target)),
+                href: sort_href(q, options, target),
                 label: sort_option_label(column, order),
                 active: target == options.sort_by,
             });
@@ -178,31 +185,66 @@ fn icon_eye() -> Markup {
     })
 }
 
-/// 统一顶部工具区 (目录/搜索/独立阅读共用): 左搜索, 右树/列表/网格图标组 +
-/// 隐藏项开关 + 排序入口.
+/// 所在目录 (阅读导航): 向上回到父目录.
+fn icon_parent() -> Markup {
+    icon(html! {
+        path d="M8 13.5V3" {}
+        path d="M4 7l4-4 4 4" {}
+    })
+}
+
+/// 文件搜索 (阅读导航次级入口): 放大镜.
+fn icon_search() -> Markup {
+    icon(html! {
+        circle cx="7" cy="7" r="4.5" {}
+        path d="M10.5 10.5 14 14" {}
+    })
+}
+
+/// 下载原文件: 下箭头 + 落点基线.
+fn icon_download() -> Markup {
+    icon(html! {
+        path d="M8 2.5v7" {}
+        path d="M5 6.5 8 9.5l3-3" {}
+        path d="M3 13.5h10" {}
+    })
+}
+
+/// 复制链接: 两个叠放方框.
+fn icon_copy() -> Markup {
+    icon(html! {
+        rect x="5.5" y="2.5" width="8" height="8" {}
+        path d="M10.5 10.5v3h-8v-8h3" {}
+    })
+}
+
+/// 窄屏"更多": 三点.
+fn icon_more() -> Markup {
+    icon(html! {
+        circle cx="3.5" cy="8" r="1.1" fill="currentColor" stroke="none" {}
+        circle cx="8" cy="8" r="1.1" fill="currentColor" stroke="none" {}
+        circle cx="12.5" cy="8" r="1.1" fill="currentColor" stroke="none" {}
+    })
+}
+
+/// 统一顶部工具区 (目录/搜索完整页共用; 独立阅读页只经 [`doc_page`] 的惰性
+/// template 提供给树视图): 左搜索, 右树/列表/网格图标组 + 隐藏项开关 + 排序入口.
 ///
 /// - 树/网格图标服务端 `aria-disabled` (无 JS 不伪造树/网格), 由客户端启用;
-///   列表入口是真实 anchor (阅读页指向父目录), 无 JS 可用.
-/// - 隐藏项开关在浏览表面是 anchor (href = 切换后的 hidden, 保留 sort/q),
-///   阅读表面是 `aria-disabled` button (href 缺失, 保留 hover/focus 提示).
+///   列表入口是真实 anchor (当前浏览位置 + 有效显示规则), 无 JS 可用.
+/// - 隐藏项开关是 anchor (href = 切换后的 hidden, 保留 sort/q).
 /// - 排序入口是原生 details/summary (键盘可打开, 无 JS 可用), 十二个链接
-///   保留 q/hidden; 阅读表面 `aria-disabled` 且链接不带 href (客户端启用时补).
+///   保留 q/hidden.
+/// - 无阅读表面的禁用分支: 阅读导航有自己的 [reading_nav] 动作组.
 /// - hover 与键盘焦点提示统一由 `data-cb-tip` + CSS ::after 呈现.
-fn topbar(
-    surface: &str,
-    q: Option<&str>,
-    options: ListingOptions,
-    list_href: Option<&str>,
-) -> Markup {
-    let reading = surface == "reading";
+fn topbar(q: Option<&str>, options: ListingOptions, list_href: &str) -> Markup {
     let hidden_pressed = if options.show_hidden { "true" } else { "false" };
-    let list_pressed = if reading { "false" } else { "true" };
     let toggled = ListingOptions {
         sort_by: options.sort_by,
         show_hidden: !options.show_hidden,
     };
-    let hidden_toggle_href = (!reading).then(|| browse_href(q, toggled));
-    let choices = sort_choices(q, options, !reading);
+    let hidden_toggle_href = browse_href(q, toggled);
+    let choices = sort_choices(q, options);
     html! {
         header.cb-topbar {
             form.cb-search action="/__/search" method="get" role="search" {
@@ -217,17 +259,9 @@ fn topbar(
                     data-cb-tip="树视图（需启用 JavaScript）" {
                     (icon_tree())
                 }
-                @if let Some(href) = list_href {
-                    a class="cb-icon-btn cb-view-btn" data-cb-view="list" href=(href)
-                        aria-pressed=(list_pressed) aria-label="列表视图" data-cb-tip="列表视图" {
-                        (icon_list())
-                    }
-                } @else {
-                    button type="button" class="cb-icon-btn cb-view-btn" data-cb-view="list"
-                        aria-pressed="false" aria-disabled="true" aria-label="列表视图"
-                        data-cb-tip="列表视图（需启用 JavaScript）" {
-                        (icon_list())
-                    }
+                a class="cb-icon-btn cb-view-btn" data-cb-view="list" href=(list_href)
+                    aria-pressed="true" aria-label="列表视图" data-cb-tip="列表视图" {
+                    (icon_list())
                 }
                 button type="button" class="cb-icon-btn cb-view-btn" data-cb-view="grid"
                     aria-pressed="false" aria-disabled="true" aria-label="网格视图"
@@ -235,30 +269,21 @@ fn topbar(
                     (icon_grid())
                 }
             }
-            @if let Some(href) = hidden_toggle_href {
-                a class="cb-icon-btn cb-hidden-toggle" data-cb-hidden-toggle href=(href)
-                    aria-pressed=(hidden_pressed) aria-label="显示隐藏项"
-                    data-cb-tip="显示隐藏项" {
-                    (icon_eye())
-                }
-            } @else {
-                button type="button" class="cb-icon-btn cb-hidden-toggle" data-cb-hidden-toggle
-                    aria-pressed=(hidden_pressed) aria-disabled="true" aria-label="显示隐藏项"
-                    data-cb-tip="阅读模式不适用：请先在目录或搜索中使用" {
-                    (icon_eye())
-                }
+            a class="cb-icon-btn cb-hidden-toggle" data-cb-hidden-toggle href=(hidden_toggle_href)
+                aria-pressed=(hidden_pressed) aria-label="显示隐藏项"
+                data-cb-tip="显示隐藏项" {
+                (icon_eye())
             }
-            details class="cb-sort" aria-disabled=[reading.then_some("true")] {
-                summary data-cb-sort-summary
-                    data-cb-tip=(if reading { "阅读模式不适用：请先在目录或搜索中使用" } else { "排序" }) {
+            details class="cb-sort" {
+                summary data-cb-sort-summary data-cb-tip="排序" {
                     "排序"
                     span class="cb-sort-state" data-cb-sort-state { (sort_state_label(options.sort_by)) }
                 }
                 div class="cb-sort-menu" role="group" aria-label="排序方式" {
                     @for choice in choices {
-                        a href=[choice.href.as_deref()] data-cb-sort=(&choice.value)
+                        a href=(choice.href) data-cb-sort=(choice.value)
                             aria-current=[choice.active.then_some("true")] {
-                            (&choice.label)
+                            (choice.label)
                         }
                     }
                 }
@@ -294,7 +319,7 @@ pub fn dir_page(
         native_token: native_token.map(str::to_string),
         breadcrumb: breadcrumb_markup(root, path, options),
         content,
-        list_href: Some(browse_href(None, options)),
+        list_href: browse_href(None, options),
         parent_href: None,
     })
 }
@@ -337,7 +362,7 @@ pub fn search_page(
         native_token: native_token.map(str::to_string),
         breadcrumb,
         content,
-        list_href: Some(browse_href(Some(query), options)),
+        list_href: browse_href(Some(query), options),
         parent_href: Some(path_href("", options)),
     })
 }
@@ -445,7 +470,8 @@ struct PageShell {
     native_token: Option<String>,
     breadcrumb: Markup,
     content: Markup,
-    list_href: Option<String>,
+    /// 浏览位置的列表入口 (当前目录/搜索 + 有效显示规则).
+    list_href: String,
     parent_href: Option<String>,
 }
 
@@ -475,7 +501,7 @@ fn page_shell(shell: PageShell) -> Markup {
                 data-native-path-encoded=[shell.identity.as_deref()]
                 data-cb-query=[shell.q.as_deref()]
                 data-kind=[shell.kind] {
-                (topbar(shell.surface, shell.q.as_deref(), shell.options, shell.list_href.as_deref()))
+                (topbar(shell.q.as_deref(), shell.options, &shell.list_href))
                 (shell.breadcrumb)
                 // 搜索页 Backspace 目标: root (保留有效显示规则); 目录页由 ../ 行
                 // 链接承担同一职责.
@@ -869,18 +895,338 @@ pub fn doc_fragment(body: &str) -> String {
     .into_string()
 }
 
+/* ---------- 独立阅读页导航 (Q1–Q13) ---------- */
+
+/// 阅读导航动作槽位: 桌面栏与窄屏"更多"菜单用同一 helper 重复渲染动作组,
+/// 因此每个动作元素的 id 必须带槽位后缀 — 全页 id 唯一.
+const READING_DESKTOP: &str = "desktop";
+const READING_MOBILE: &str = "mobile";
+
+/// 槽位 → 断点类 (CSS: ≥60rem 显示 .cb-reading-desktop, 否则 .cb-reading-mobile).
+fn reading_slot_class(slot: &str) -> &'static str {
+    if slot == READING_MOBILE {
+        "cb-reading-mobile"
+    } else {
+        "cb-reading-desktop"
+    }
+}
+
+/// 槽位唯一的元素 id (`cb-reading-{kind}-{slot}`): 桌面/窄屏各一份的动作靠它
+/// 保持 id 唯一.
+fn reading_id(kind: &str, slot: &str) -> String {
+    format!("cb-reading-{kind}-{slot}")
+}
+
+/// canonical encoded segment 的显示 label: 共享 percent-encoding 解码
+/// (`decode_utf8` 严格解析, 无 `%` 转义时借用原片段, 不分配) + 显示 codec 由
+/// 调用方施加. 只服务 display: href/identity 恒用原始 encoded 字符串/切片 —
+/// 显示结果绝不回流成路径. 异常输入 (非法 UTF-8) 不猜编码, 原样借用 encoded
+/// 文本 (ASCII, 安全).
+fn decode_segment_display(segment: &str) -> Cow<'_, str> {
+    percent_decode_str(segment)
+        .decode_utf8()
+        .unwrap_or(Cow::Borrowed(segment))
+}
+
+/// 阅读页 identity 的显示视图: 全部内容借用调用方的 canonical encoded path
+/// (零复制前缀切片 + Cow 显示 label), 是 display 与 href 的唯一分界点 —
+/// href 只用 `prefix` 切片, 显示只用 `label`.
+struct ReadingPath<'a> {
+    /// 逐级祖先目录: (累计 encoded 前缀切片, 解码显示 label).
+    dirs: Vec<(&'a str, Cow<'a, str>)>,
+    /// 当前文件名的解码显示 label (纯显示, 不参与任何 href/identity).
+    file: Cow<'a, str>,
+}
+
+/// 阅读页 identity 分解: 逐段返回 (累计 encoded 前缀 = `encoded` 的切片, 解码
+/// 显示 label), 末段是当前文件名 (只作显示, 不产生链接).
+/// 非法 identity (空串/空段: 不是 canonical 文件路径) → None, 调用方 fail-closed.
+fn reading_path_view(encoded: &str) -> Option<ReadingPath<'_>> {
+    let (dirs_part, file) = encoded.rsplit_once('/').unwrap_or(("", encoded));
+    if file.is_empty() {
+        return None;
+    }
+    // 祖先级数 = 分隔符数 + 1 (root 下的文件是 0 级祖先): 一次算准, 不重分配
+    let depth = if dirs_part.is_empty() {
+        0
+    } else {
+        dirs_part.matches('/').count() + 1
+    };
+    let mut dirs = Vec::with_capacity(depth);
+    if !dirs_part.is_empty() {
+        let mut end = 0;
+        for segment in dirs_part.split('/') {
+            if segment.is_empty() {
+                return None; // 空段不是 canonical identity (绝不当成目录显示)
+            }
+            end += segment.len();
+            dirs.push((&dirs_part[..end], decode_segment_display(segment)));
+            end += 1; // 跳过 '/' (ASCII, 因此 end 恒在 char 边界上)
+        }
+    }
+    Some(ReadingPath {
+        dirs,
+        file: decode_segment_display(file),
+    })
+}
+
+/// 阅读页"所在目录" (Q4/Q11/Q12): 固定进入当前文件的父目录 (顶层文件即服务根),
+/// 真实 anchor — 无 JS 可用; href 用 canonical encoded identity + 有效显示规则.
+fn reading_parent_link(encoded: &str, options: ListingOptions) -> Markup {
+    html! {
+        a class="cb-reading-action cb-reading-parent" data-cb-reading-parent
+            href=(parent_dir_href(encoded, options))
+            aria-label="所在目录" data-cb-tip="所在目录" {
+            (icon_parent())
+            span.cb-reading-label { "所在目录" }
+        }
+    }
+}
+
+/// 阅读页 root 入口: 显示名是明确的 "根目录" (不是无名可猜的 "/"), href 仍是
+/// root-relative canonical encoded 入口 (`/` + 有效显示规则).
+fn reading_root_link(options: ListingOptions) -> Markup {
+    html! {
+        a class="cb-reading-root" href=(path_href("", options)) { "根目录" }
+    }
+}
+
+/// 逐段路径行 (根目录 + 祖先目录 + 当前文件名): 弹层与窄屏"更多"共用.
+/// 每段的 href 只由自身 encoded 前缀切片构造, 显示只经 display codec (bdi 隔离);
+/// 当前文件名是纯文本 (不是链接, 也不是 action identity 的来源).
+/// 分隔符: 根目录之后每段之前恰好一个 "/".
+fn reading_path_line(view: &ReadingPath<'_>, options: ListingOptions) -> Markup {
+    html! {
+        div class="cb-reading-path-line" {
+            (reading_root_link(options))
+            @for (prefix, label) in &view.dirs {
+                span.cb-crumb-sep { "/" }
+                a href=(path_href(prefix, options)) { (display_segment(OsStr::new(&**label))) }
+            }
+            span.cb-crumb-sep { "/" }
+            span class="cb-current cb-reading-current" {
+                (display_segment(OsStr::new(&*view.file)))
+            }
+        }
+    }
+}
+
+/// 完整路径弹层 (原生 details: 键盘/触控可达, 不依赖 hover): summary "…" +
+/// aria-label, 内容 = 完整可点击路径 (全部祖先 + 完整文件名).
+fn reading_path_more(label: &str, view: &ReadingPath<'_>, options: ListingOptions) -> Markup {
+    html! {
+        details class="cb-reading-path-more" {
+            summary aria-label=(label) { "…" }
+            div class="cb-reading-popover cb-reading-path-panel" {
+                (reading_path_line(view, options))
+            }
+        }
+    }
+}
+
+/// 阅读页面包屑 (Q5/Q10): "根目录" 链接 + 逐级祖先目录链接 + 实际文件名
+/// (纯文本, 与正文标题无关). 长路径 (≥4 级祖先) 折叠中间祖先段: 折叠入口与
+/// 完整路径入口是同一个原生 details "…" (键盘/触控可达, 不依赖 hover) —
+/// 折叠时位于行内中间段处, 否则紧跟当前文件名; 弹层内容都是完整可点击路径.
+/// 根目录之后每段之前恰好一个 "/" 分隔符 (`根目录 / a / b / file.md`);
+/// href 只用 encoded 前缀切片, 显示只用解码 label.
+fn reading_crumbs(view: &ReadingPath<'_>, options: ListingOptions) -> Markup {
+    let dirs = &view.dirs;
+    let collapse = dirs.len() > 3;
+    let last = dirs.len().saturating_sub(1); // 仅折叠分支使用 (那时 len > 3)
+    html! {
+        nav class="cb-breadcrumb cb-reading-crumbs" aria-label="面包屑" {
+            (reading_root_link(options))
+            @if let Some((prefix, label)) = dirs.first() {
+                span.cb-crumb-sep { "/" }
+                a href=(path_href(prefix, options)) { (display_segment(OsStr::new(&**label))) }
+                @if collapse {
+                    span.cb-crumb-sep { "/" }
+                    (reading_path_more("展开中间目录", view, options))
+                    span.cb-crumb-sep { "/" }
+                    a href=(path_href(dirs[last].0, options)) {
+                        (display_segment(OsStr::new(&*dirs[last].1)))
+                    }
+                } @else {
+                    @for (prefix, label) in &dirs[1..] {
+                        span.cb-crumb-sep { "/" }
+                        a href=(path_href(prefix, options)) { (display_segment(OsStr::new(&**label))) }
+                    }
+                }
+            }
+            span.cb-crumb-sep { "/" }
+            span class="cb-current cb-reading-current" {
+                (display_segment(OsStr::new(&*view.file)))
+            }
+            @if !collapse {
+                (reading_path_more("显示完整路径", view, options))
+            }
+        }
+    }
+}
+
+/// 阅读页文件搜索入口 (Q8, 次级): 原生 details/summary + 原生 form 提交到既有
+/// `/__/search` (无 JS 可展开/提交, 不边输入边替换正文); 桌面与窄屏各一份,
+/// input id 唯一 (绝不复用 `#cb-search-q`, 与浏览工具区表单互不干扰).
+fn reading_search(slot: &str, options: ListingOptions) -> Markup {
+    html! {
+        details class=(format!("cb-reading-search {}", reading_slot_class(slot))) {
+            summary class="cb-reading-action" aria-label="搜索文件" data-cb-tip="搜索文件" {
+                (icon_search())
+                span.cb-reading-label { "搜索" }
+            }
+            div class="cb-reading-popover cb-reading-search-panel" {
+                form class="cb-search" action="/__/search" method="get" role="search" {
+                    input type="search" name="q" id=(reading_id("search", slot))
+                        placeholder="搜索文件" aria-label="搜索文件" autocomplete="off";
+                    input type="hidden" name="sort" value=(sort_value(options));
+                    input type="hidden" name="hidden" value=(hidden_value(options));
+                }
+            }
+        }
+    }
+}
+
+/// 阅读页"在文件树中浏览" (Q6/Q13): 服务端 `hidden` — 无 JS 不出现假树入口,
+/// 客户端就绪后解除. 不是浏览视图控件 (无 `data-cb-view`): 点击是真实导航.
+fn reading_tree_button(slot: &str) -> Markup {
+    html! {
+        button type="button" class=(format!("cb-reading-action {}", reading_slot_class(slot)))
+            data-cb-reading-tree id=(reading_id("tree", slot)) hidden
+            aria-label="在文件树中浏览" data-cb-tip="在文件树中浏览" {
+            (icon_tree())
+            span.cb-reading-label { "文件树" }
+        }
+    }
+}
+
+/// 阅读页"下载原文件" (Q7): 真实链接, 原始字节 (`?download=1`) + 当前有效显示
+/// 规则 (与其它导航链接同一延续语义), 无 JS 可用.
+fn reading_download_link(slot: &str, encoded: &str, options: ListingOptions) -> Markup {
+    let href = format!("/{encoded}?download=1&{}", listing_query(options));
+    html! {
+        a class=(format!("cb-reading-action {}", reading_slot_class(slot)))
+            data-cb-reading-download href=(href)
+            aria-label="下载原文件" data-cb-tip="下载原文件" {
+            (icon_download())
+            span.cb-reading-label { "下载" }
+        }
+    }
+}
+
+/// 阅读页"复制链接" (Q7): 服务端 `hidden` — 剪贴板就绪前不出现假操作; 失败反馈
+/// 走 `[data-cb-reading-copy-fallback]` 的手动选择, 绝不显示虚假成功.
+fn reading_copy_button(slot: &str) -> Markup {
+    html! {
+        button type="button" class=(format!("cb-reading-action {}", reading_slot_class(slot)))
+            data-cb-reading-copy id=(reading_id("copy", slot)) hidden
+            aria-label="复制链接" data-cb-tip="复制链接" {
+            (icon_copy())
+            span.cb-reading-label { "复制链接" }
+        }
+    }
+}
+
+/// 阅读页次级动作组 (桌面栏与窄屏"更多"菜单同一顺序): 文件树 / 搜索 / 下载 /
+/// 复制链接. 下载与搜索无 JS 可用; 树与复制保持 hidden 直到客户端就绪.
+fn reading_actions(slot: &str, encoded: &str, options: ListingOptions) -> Markup {
+    html! {
+        (reading_tree_button(slot))
+        (reading_search(slot, options))
+        (reading_download_link(slot, encoded, options))
+        (reading_copy_button(slot))
+    }
+}
+
+/// 窄屏"更多" (Q10): 完整可点击路径 + 完整文件名 + 全部次级动作 — 打开即看全,
+/// 不依赖 hover; 原生 details 键盘/触控可达. identity 缺失时只留搜索入口.
+fn reading_more(
+    view: Option<&ReadingPath<'_>>,
+    encoded: Option<&str>,
+    options: ListingOptions,
+) -> Markup {
+    html! {
+        details class="cb-reading-more cb-reading-mobile" {
+            summary class="cb-reading-action" aria-label="更多操作" data-cb-tip="更多" {
+                (icon_more())
+                span.cb-reading-label { "更多" }
+            }
+            div class="cb-reading-popover cb-reading-more-panel" {
+                @if let Some(view) = view {
+                    nav class="cb-reading-more-path" aria-label="当前文件路径" {
+                        (reading_path_line(view, options))
+                    }
+                }
+                div class="cb-reading-more-actions" role="group" aria-label="文件操作" {
+                    @if let Some(encoded) = encoded {
+                        (reading_actions(READING_MOBILE, encoded, options))
+                    } @else {
+                        (reading_search(READING_MOBILE, options))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 复制反馈区 (Q7): role=status 文案 + 剪贴板失败后可手动选择的完整链接
+/// (客户端填真实 location.href, 只在失败时显示; 无 JS 恒 `hidden`).
+fn reading_feedback() -> Markup {
+    html! {
+        div class="cb-reading-feedback" {
+            span class="cb-reading-status" data-cb-reading-status role="status" aria-live="polite" {}
+            div class="cb-reading-copy-fallback" data-cb-reading-copy-fallback hidden {
+                input class="cb-reading-copy-input" id="cb-reading-copy-fallback-input"
+                    data-cb-reading-copy-fallback-input type="text" readonly value=""
+                    aria-label="文件链接" autocomplete="off" spellcheck="false";
+            }
+        }
+    }
+}
+
+/// 独立阅读页导航 (Q1–Q13): 一条 sticky 紧凑栏 — 左"所在目录", 中部面包屑 +
+/// 实际文件名, 右次级动作 (文件树/搜索/下载/复制链接); 窄屏只留 所在目录 +
+/// 文件名 + 更多. 所有 href 只用 canonical encoded identity, 显示只用其逐段
+/// 解码 + 显示 codec; identity 缺失或非法时 fail-closed — 只留身份无关的搜索
+/// 入口, 不生成任何路径/下载/树/复制控件 (绝不从标题重建路径).
+fn reading_nav(encoded_path: Option<&str>, options: ListingOptions) -> Markup {
+    let view = encoded_path.and_then(reading_path_view);
+    let bar = match encoded_path.zip(view.as_ref()) {
+        Some((encoded, view)) => html! {
+            (reading_parent_link(encoded, options))
+            (reading_crumbs(view, options))
+            div class="cb-reading-actions cb-reading-desktop" role="group" aria-label="文件操作" {
+                (reading_actions(READING_DESKTOP, encoded, options))
+            }
+            (reading_more(Some(view), Some(encoded), options))
+        },
+        None => html! {
+            div class="cb-reading-actions cb-reading-desktop" role="group" aria-label="文件操作" {
+                (reading_search(READING_DESKTOP, options))
+            }
+            (reading_more(None, None, options))
+        },
+    };
+    html! {
+        header class="cb-reading-nav" data-cb-reading-nav {
+            div class="cb-reading-bar" { (bar) }
+            (reading_feedback())
+        }
+    }
+}
+
 /// 文档/代码页面骨架 (独立阅读表面): 自组 `<!DOCTYPE>` / head / title / body.
 /// body 已由调用方转义, 以 PreEscaped 原样嵌入, 并经 `doc_fragment` 包装
-/// (恰好一次). 工具区随 body 输出统一 surface/选项 metadata: 三个视图图标
-/// 均无选中态, 隐藏/排序禁用; 列表入口指向父目录 (identity 由 routes 提供,
-/// 绝不从显示标题重建). no native token.
+/// (恰好一次). 阅读表面不复用浏览工具区: [`reading_nav`] 只输出定位与文件动作,
+/// 浏览工具区仅作为惰性 `<template id="cb-browse-topbar">` 存在 (客户端进入树
+/// 视图前克隆). identity 由 routes 提供 (绝不从显示标题重建), 为 None 时
+/// fail-closed. no native token.
 pub fn doc_page(
     title: &str,
     body: &str,
     encoded_path: Option<&str>,
     options: ListingOptions,
 ) -> String {
-    let list_href = encoded_path.map(|encoded| parent_dir_href(encoded, options));
     html! {
         (DOCTYPE)
         html lang="zh-CN" {
@@ -899,7 +1245,13 @@ pub fn doc_page(
                 data-cb-hidden=(hidden_value(options))
                 data-native-path-encoded=[encoded_path]
                 data-kind="file" {
-                (topbar("reading", None, options, list_href.as_deref()))
+                (reading_nav(encoded_path, options))
+                // 浏览工具区 (仅目录/搜索完整页常驻): 惰性 template, 内容与目录页
+                // 同一 [`topbar`] helper 输出. 客户端进树前克隆为真实工具区 —
+                // 初始阅读 DOM 里没有任何活的浏览控件 (树/网格/隐藏项/排序).
+                template id="cb-browse-topbar" {
+                    (topbar(None, options, &browse_href(None, options)))
+                }
                 (maud::PreEscaped(doc_fragment(body)))
             }
         }
@@ -907,8 +1259,8 @@ pub fn doc_page(
     .into_string()
 }
 
-/// 阅读页列表入口目标: encoded 文件 identity 去掉最后一段的父目录 + 有效显示规则;
-/// 顶层文件指向 root (`/`).
+/// 阅读页"所在目录"目标: encoded 文件 identity 去掉最后一段的父目录 + 有效显示
+/// 规则; 顶层文件指向 root (`/`). 只取 encoded 切片, 不涉及显示文本.
 fn parent_dir_href(encoded: &str, options: ListingOptions) -> String {
     let parent = encoded
         .rsplit_once('/')
@@ -1223,6 +1575,53 @@ mod tests {
         assert!(
             frag.contains(r#"data-native-path-encoded="""#),
             "frag: {frag}"
+        );
+    }
+
+    /// identity 缺失/非法时 fail-closed: 不生成任何路径/动作控件, 只留身份无关
+    /// 的搜索入口 (绝不从正文标题或显示文本重建路径).
+    #[test]
+    fn reading_page_without_identity_fails_closed() {
+        let options = ListingOptions::default();
+        for identity in [None, Some("")] {
+            let page = doc_page("bad", "<p>x</p>", identity, options);
+            assert!(!page.contains("data-cb-reading-parent"), "{page}");
+            assert!(!page.contains("cb-reading-crumbs"), "{page}");
+            assert!(!page.contains("根目录"), "{page}");
+            assert!(!page.contains("?download=1"), "{page}");
+            assert!(!page.contains("data-cb-reading-tree"), "{page}");
+        }
+    }
+
+    /// 顶层文件: "所在目录"指向服务根; 面包屑是 root + 实际文件名.
+    #[test]
+    fn reading_page_root_level_file_parent_is_root() {
+        let options = ListingOptions::default();
+        let page = doc_page("t", "<p>x</p>", Some("file.md"), options);
+        let parent = r#"data-cb-reading-parent href="/?sort=Name:Asc&amp;hidden=0""#;
+        assert!(page.contains(parent), "{page}");
+        assert!(page.contains("<bdi dir=\"auto\">file.md</bdi>"), "{page}");
+    }
+
+    /// 显示解码只影响显示: 逐段 `%XX` 解码后经显示 codec; href 与其累计前缀
+    /// 始终是 canonical encoded 字符串 (literal `%`/`+`/Unicode 都不被误解码).
+    #[test]
+    fn reading_page_display_decodes_but_hrefs_stay_encoded() {
+        let options = ListingOptions::default();
+        let encoded = Some("a%25b/c%2Bd/%E6%8A%A5%E5%91%8A.md");
+        let page = doc_page("t", "<p>x</p>", encoded, options);
+        assert!(page.contains("<bdi dir=\"auto\">a%b</bdi>"), "{page}");
+        assert!(page.contains("<bdi dir=\"auto\">c+d</bdi>"), "{page}");
+        assert!(page.contains("<bdi dir=\"auto\">报告.md</bdi>"), "{page}");
+        let first = r#"href="/a%25b?sort=Name:Asc&amp;hidden=0""#;
+        let nested = r#"href="/a%25b/c%2Bd?sort=Name:Asc&amp;hidden=0""#;
+        let download = r#"href="/a%25b/c%2Bd/%E6%8A%A5%E5%91%8A.md?download=1&amp;"#;
+        assert!(page.contains(first), "{page}");
+        assert!(page.contains(nested), "{page}");
+        assert!(page.contains(download), "{page}");
+        assert!(
+            page.contains("download=1&amp;sort=Name:Asc&amp;hidden=0"),
+            "{page}"
         );
     }
 

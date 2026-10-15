@@ -1267,8 +1267,6 @@ await runScenario('11 BFCache: back to /a.md restores reading snapshot with zero
     after.cb === before.cb &&
     after.panelHidden === before.panelHidden &&
     JSON.stringify(after.hiddenToggle) === JSON.stringify(before.hiddenToggle) &&
-    after.views.length === 3 &&
-    after.views.every((v) => v.pressed === 'false') &&
     typeof after.text === 'string' &&
     after.text.includes('page a') &&
     sameStateExceptHistoryLength(after, before) &&

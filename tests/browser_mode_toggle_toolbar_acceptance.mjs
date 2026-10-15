@@ -20,7 +20,7 @@
 //       零 fragment 重取
 //   T5 排序入口: Size:Desc 同历史项内生效 (URL/history/偏好/顺序/当前项一致)
 //   T5b 已打开文档 × 列表/网格 × 排序/隐藏: 列表原地更新, 活动文档不重转换
-//   T6 独立阅读页: 无选中视图; 隐藏/排序禁用并说明; 列表入口回父目录; 无 token
+//   T6 独立阅读导航: 按保存视图回所在目录仅定位; 隐藏过滤不变; 进树可后退恢复阅读位置
 //   T7 搜索页: 树视图右侧安全搜索片段; 换视图/补能力保留 q/sort/hidden 与历史
 //   T8 无 JS: 隐藏/排序链接与真实表单提交跨导航保留必要字段
 //
@@ -285,6 +285,13 @@ function makeFixture() {
   writeFileSync(join(root, '.hiddendir', 'secret.md'), '# Secret\n\nhidden dir page.\n');
   mkdirSync(join(root, 'adir', 'grand'), { recursive: true });
   writeFileSync(join(root, 'adir', 'child.md'), '# Child\n\nchild page.\n');
+  writeFileSync(
+    join(root, 'adir', 'reading.md'),
+    '---\ntitle: An alternate document title\n---\n\n' +
+      Array.from({ length: 60 }, (_, i) =>
+        `## Section ${i + 1}\n\n${'Reading navigation preserves this paragraph. '.repeat(16)}\n\n`
+      ).join('')
+  );
   writeFileSync(join(root, 'adir', 'grand', 'leaf.md'), '# Leaf\n\nleaf page.\n');
   mkdirSync(join(root, 'emptydir'));
   symlinkSync('..', join(root, 'adir', 'grand', 'loop'));
@@ -1135,57 +1142,179 @@ await runScenario('T5b opened document: sort and hidden changes update listing i
 });
 
 /* =====================================================================
- * T6 独立阅读页: 三图标无选中态; 隐藏/排序入口禁用并说明作用范围;
- *    列表入口回父目录; 无 token; 禁用控件点击不导航.
+ * T6 阅读导航: 返回所在目录只定位, 沿用保存视图与当前规则;
+ *    隐藏目标不强行显示; 阅读 -> 树新增历史并恢复原阅读位置.
  * ===================================================================== */
-await runScenario('T6 reading page: no selected view, hidden/sort disabled with scope, parent-dir list entry, no token', async () => {
+for (const view of ['list', 'grid', 'tree']) {
+  await runScenario(`T6 reading parent: ${view} preference, locate without opening or changing preferences`, async () => {
+    const { page, pageErrors } = await fresh();
+    await page.evaluate(`(() => {
+      localStorage.setItem('cb-browse-view', ${JSON.stringify(view)});
+      localStorage.setItem('cb-sort', 'Name:Asc');
+      localStorage.setItem('cb-hidden', '1');
+    })()`);
+    await page.goto(BASE + '/adir/reading.md?sort=Size:Desc&hidden=0');
+    await waitFor(() => page.evaluate(
+      "!!document.querySelector('[data-cb-reading-tree]:not([hidden])')"
+    ), 'reading navigation ready');
+    const reading = await page.evaluate(`(() => {
+      const nav = document.querySelector('.cb-reading-nav');
+      return {
+        filename: nav.textContent.includes('reading.md'),
+        titleInNavigation: nav.textContent.includes('An alternate document title'),
+        nativeToken: !!document.querySelector('meta[name="cb-native-open-token"]')
+      };
+    })()`);
+    const loaded = waitForLoad(page);
+    await page.click('[data-cb-reading-parent]');
+    await loaded;
+    await waitFor(() => page.evaluate(`(() => {
+      const selected = document.querySelector('[data-native-path-encoded="adir/reading.md"].cb-selected');
+      return location.pathname === '/adir' && !!selected && selected.getClientRects().length > 0;
+    })()`), 'file located in parent');
+    const destination = await page.evaluate(`(() => {
+      const preview = document.getElementById('cb-preview');
+      const pane = document.querySelector('.cb-pane');
+      return {
+        view: history.state.cb.view,
+        sort: new URL(location.href).searchParams.get('sort'),
+        hidden: new URL(location.href).searchParams.get('hidden'),
+        previewOpen: !!preview && !preview.hidden,
+        directoryPane: !pane || !!pane.querySelector('.cb-dir-fragment'),
+        opened: history.state.cb.opened,
+        viewPref: localStorage.getItem('cb-browse-view'),
+        sortPref: localStorage.getItem('cb-sort'),
+        hiddenPref: localStorage.getItem('cb-hidden')
+      };
+    })()`);
+    rec(`T6 reading parent: ${view} preference, locate without opening or changing preferences`,
+      reading.filename && !reading.titleInNavigation && !reading.nativeToken &&
+      destination.view === view && destination.sort === 'Size:Desc' && destination.hidden === '0' &&
+      !destination.previewOpen && destination.directoryPane && destination.opened === null &&
+      destination.viewPref === view && destination.sortPref === 'Name:Asc' && destination.hiddenPref === '1' &&
+      pageErrors.length === 0,
+      JSON.stringify({ reading, destination, errors: pageErrors }));
+  });
+}
+
+for (const entry of [
+  { path: '.hidden.txt', parent: '/', view: 'list' },
+  { path: '.hiddendir/secret.md', parent: '/.hiddendir', view: 'tree' },
+]) {
+  await runScenario(`T6 hidden reading target: ${entry.path} does not reveal filtered entries`, async () => {
+    const { page, pageErrors } = await fresh();
+    await page.evaluate(`localStorage.setItem('cb-browse-view', ${JSON.stringify(entry.view)})`);
+    await page.goto(BASE + '/' + entry.path + '?sort=Name:Asc&hidden=0');
+    await waitFor(() => page.evaluate(
+      "!!document.querySelector('[data-cb-reading-tree]:not([hidden])')"
+    ), 'hidden file reading ready');
+    const loaded = waitForLoad(page);
+    await page.click('[data-cb-reading-parent]');
+    await loaded;
+    await waitFor(() => page.evaluate(
+      `location.pathname === ${JSON.stringify(entry.parent)} && !!document.querySelector('[data-cb-view][aria-pressed="true"]')`
+    ), 'hidden file parent ready');
+    if (entry.view === 'tree') {
+      await waitFor(() => page.evaluate("!!document.querySelector('.cb-pane .cb-dir-fragment')"), 'hidden parent directory pane');
+    }
+    const result = await page.evaluate(`(() => ({
+      hidden: new URL(location.href).searchParams.get('hidden'),
+      hiddenPref: localStorage.getItem('cb-hidden'),
+      opened: history.state.cb.opened,
+      previewOpen: !!document.querySelector('#cb-preview:not([hidden])'),
+      exposed: !!document.querySelector(
+        '#cb-view-list [data-native-path-encoded=".hidden.txt"], #cb-tree-root [data-native-path-encoded=".hiddendir"]'
+      )
+    }))()`);
+    rec(`T6 hidden reading target: ${entry.path} does not reveal filtered entries`,
+      result.hidden === '0' && result.hiddenPref === null && result.opened === null &&
+      !result.previewOpen && !result.exposed && pageErrors.length === 0,
+      JSON.stringify({ result, errors: pageErrors }));
+  });
+}
+
+await runScenario('T6 reading to tree: one new history entry, back restores actual reading position, forward restores tree', async () => {
   const { page, pageErrors } = await fresh();
-  await page.goto(BASE + '/a.md');
-  const s = await uiState(page);
-  const detail = await page.evaluate(
-    '(() => { const list = document.querySelector("[data-cb-view=list]"); const token = document.querySelector("meta[name=cb-native-open-token]"); const summary = document.querySelector("[data-cb-sort-summary]"); const toggle = document.querySelector("[data-cb-hidden-toggle]"); return { listHref: list ? list.getAttribute("href") : null, listTag: list ? list.tagName : null, pathEnc: document.body.dataset.nativePathEncoded, kind: document.body.dataset.kind, token: !!token, summaryTip: summary ? summary.getAttribute("data-cb-tip") : null, hiddenTip: toggle ? toggle.getAttribute("data-cb-tip") : null, sortHrefs: [...document.querySelectorAll("a[data-cb-sort]")].map((el) => el.getAttribute("href")) }; })()'
-  );
-  const beforeClick = { path: s.path, search: s.search };
-  await page.click('[data-cb-hidden-toggle]');
-  await sleep(250);
-  const afterDisabledClick = await uiState(page);
-  // 列表入口回父目录
+  await page.goto(BASE + '/adir/reading.md?sort=Name:Asc&hidden=0#section-20');
+  await waitFor(() => page.evaluate(
+    "!!document.querySelector('[data-cb-reading-tree]:not([hidden])')"
+  ), 'long reading page ready');
+  await page.waitLoad();
+  // 浏览器可能在首帧调整滚动锚定；记录布局落定后的实际位置，而非指令坐标。
+  const before = await page.evaluate(`new Promise((resolve) => {
+    window.scrollTo({ top: 2400, behavior: 'instant' });
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      resolve({ length: history.length, y: scrollY, hash: location.hash });
+    }));
+  })`);
+  await page.click('.cb-reading-desktop [data-cb-reading-tree]');
+  await waitFor(() => page.evaluate(
+    "document.body.classList.contains('cb-tree-mode') && !!document.querySelector('.cb-pane #section-20')"
+  ), 'current document in tree');
+  const tree = await page.evaluate(`(() => ({
+    length: history.length,
+    hash: location.hash,
+    viewPref: localStorage.getItem('cb-browse-view'),
+    readingNavVisible: document.querySelector('.cb-reading-nav').getClientRects().length > 0
+  }))()`);
+  await page.evaluate('history.back()');
+  await waitFor(() => page.evaluate(`(() => {
+    const nav = document.querySelector('.cb-reading-nav');
+    return !document.body.classList.contains('cb-tree-mode') && !!nav && nav.getClientRects().length > 0 &&
+      Math.abs(scrollY - ${before.y}) < 3;
+  })()`), 'back to saved reading position');
+  const back = await page.evaluate(`({
+    length: history.length, y: scrollY, hash: location.hash,
+    viewPref: localStorage.getItem('cb-browse-view'),
+    sortPref: localStorage.getItem('cb-sort'), hiddenPref: localStorage.getItem('cb-hidden')
+  })`);
+  await page.evaluate('history.forward()');
+  await waitFor(() => page.evaluate(
+    "document.body.classList.contains('cb-tree-mode') && !!document.querySelector('.cb-pane #section-20')"
+  ), 'forward to tree');
+  const forward = await page.evaluate('({ length: history.length, hash: location.hash })');
+  rec('T6 reading to tree: one new history entry, back restores actual reading position, forward restores tree',
+    tree.length === before.length + 1 && !tree.readingNavVisible && tree.viewPref === 'tree' &&
+    back.length === tree.length && back.viewPref === 'tree' && back.sortPref === null && back.hiddenPref === null &&
+    forward.length === tree.length && tree.hash === before.hash && back.hash === before.hash && forward.hash === before.hash &&
+    pageErrors.length === 0,
+    JSON.stringify({ before, tree, back, forward, errors: pageErrors }));
+});
+
+await runScenario('T6 mobile search: slash opens its containing menu, Escape returns focus, submit preserves rules', async () => {
+  const { page, pageErrors } = await fresh(390, 844);
+  await page.goto(BASE + '/a.md?sort=Size:Desc&hidden=1');
+  await waitFor(() => page.evaluate(
+    "!!document.querySelector('[data-cb-reading-tree]:not([hidden])')"
+  ), 'mobile reader ready');
+  await pressKey(page, '/', 'Slash', 191, '/');
+  await waitFor(() => page.evaluate(`(() => {
+    const active = document.activeElement;
+    return active.matches('input[type="search"]') && active.checkVisibility();
+  })()`), 'visible mobile search focused');
+  await pressKey(page, 'Escape', 'Escape', 27);
+  await waitFor(() => page.evaluate(`(() => {
+    const active = document.activeElement;
+    return active.matches('.cb-reading-search > summary') &&
+      !active.parentElement.open && active.checkVisibility();
+  })()`), 'search focus returned to visible summary');
+  await pressKey(page, '/', 'Slash', 191, '/');
+  await page.send('Input.insertText', { text: 'leaf' });
   const loaded = waitForLoad(page);
-  await page.click('[data-cb-view="list"]');
+  await pressKey(page, 'Enter', 'Enter', 13, '\r');
   await loaded;
-  await sleep(300);
-  const dir = await uiState(page);
-  const listPath = detail.listHref ? detail.listHref.split('?')[0] : null;
-  const ok =
-    s.surface === 'reading' &&
-    detail.kind === 'file' &&
-    detail.pathEnc === 'a.md' &&
-    s.views.tree.pressed === 'false' &&
-    s.views.list.pressed === 'false' &&
-    s.views.grid.pressed === 'false' &&
-    detail.listTag === 'A' &&
-    listPath === '/' &&
-    s.hidden &&
-    s.hidden.disabled === 'true' &&
-    typeof detail.hiddenTip === 'string' &&
-    detail.hiddenTip.length > 0 &&
-    s.sortDisabled === 'true' &&
-    s.sortCount >= 12 &&
-    detail.sortHrefs.every((h) => h === null) &&
-    typeof detail.summaryTip === 'string' &&
-    detail.summaryTip.length > 0 &&
-    !detail.token &&
-    afterDisabledClick.path === beforeClick.path &&
-    afterDisabledClick.search === beforeClick.search &&
-    dir.path === '/' &&
-    dir.surface === 'directory' &&
-    dir.views.list.pressed === 'true' &&
-    pageErrors.length === 0;
-  rec(
-    'T6 reading page: no selected view, hidden/sort disabled with scope, parent-dir list entry, no token',
-    ok,
-    JSON.stringify({ s, detail, afterDisabledClick, dir, errors: pageErrors })
-  );
+  const result = await page.evaluate(`(() => {
+    const url = new URL(location.href);
+    return {
+      path: url.pathname, q: url.searchParams.get('q'),
+      sort: url.searchParams.get('sort'), hidden: url.searchParams.get('hidden'),
+      leaf: !!document.querySelector('[data-browser-entry][data-native-path-encoded="leaf.md"]')
+    };
+  })()`);
+  rec('T6 mobile search: slash opens its containing menu, Escape returns focus, submit preserves rules',
+    result.path === '/__/search' && result.q === 'leaf' && result.sort === 'Size:Desc' &&
+    result.hidden === '1' && result.leaf && pageErrors.length === 0,
+    JSON.stringify({ result, errors: pageErrors }));
 });
 
 /* =====================================================================

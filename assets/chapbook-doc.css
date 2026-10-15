@@ -9,6 +9,9 @@
   --cb-border: #d1d9e0;
   --cb-soft-bg: #f6f8fa;
   --cb-hover: rgba(9, 105, 218, 0.08);
+  /* 阅读导航栏高 (sticky / 锚点落点 / TOC 偏移共用): 无 JS 时的稳妥回退值,
+   * 客户端 ResizeObserver 在 documentElement 上按实际高度覆盖 (inline style 优先) */
+  --cb-reading-nav-height: 2.8rem;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -27,15 +30,21 @@ html:has(> body.cb-doc-page) {
   scroll-behavior: smooth;
   scroll-padding-top: 1.5rem;
 }
+/* 阅读导航 sticky 在视口顶部: 锚点落点避开栏高 (无阅读导航的文档页宿主持 1.5rem).
+ * 变量在 :root 回退, 客户端按实际高度覆盖 */
+html:has(> body.cb-doc-page > .cb-reading-nav) {
+  scroll-padding-top: calc(var(--cb-reading-nav-height) + 0.75rem);
+}
 /* 页面级布局: 只挂在完整文档页的 body (.cb-doc-page), 内容片段不携带固定页布局.
- * border-box 使 max-width 含内边距, 整页栏宽不再被 1.5rem 水平内边距撑宽 */
+ * border-box 使 max-width 含内边距, 整页栏宽不再被 1.5rem 水平内边距撑宽.
+ * 顶部内边距为 0: 阅读导航贴住视口上缘 (sticky top: 0 不跳位), 自身承担下间距 */
 .cb-doc-page {
   box-sizing: border-box;
   background-color: var(--cb-bg);
   /* 字号 ~80%, 栏宽与字号等比 (84rem@67% -> 100rem@80%), 保持每行字数 */
   max-width: 100rem;
   margin: 0 auto;
-  padding: 1.2rem 1.5rem 5rem;
+  padding: 0 1.5rem 5rem;
 }
 /* 文档基础排版挂在 .cb-doc: 整页与片段共用; 页面布局 (背景/栏宽/边距) 留在 .cb-doc-page */
 .cb-doc {
@@ -198,14 +207,21 @@ html:has(> body.cb-doc-page) {
     max-height: calc(100vh - 2rem);
     overflow-y: auto;
   }
+  /* 阅读页: TOC sticky 于阅读导航之下 (树 pane 内的 TOC 仍 top: 0 — 树模式下
+   * pane 自身滚动, 顶栏不属于 pane). 变量回退值在 :root, 客户端按实际高度覆盖 */
+  body.cb-doc-page:has(> .cb-reading-nav):not(.cb-tree-mode) .cb-doc-toc {
+    top: calc(var(--cb-reading-nav-height) + 1rem);
+    max-height: calc(100vh - var(--cb-reading-nav-height) - 2rem);
+  }
 }
 
-/* ---------- 统一顶部工具区 (目录/搜索/独立阅读共用) ----------
+/* ---------- 统一顶部工具区 (目录/搜索完整页; 阅读页经惰性 template 克隆) ----------
  * 唯一 toolbar: 左搜索表单, 右树/列表/网格图标组 + 隐藏项开关 + 排序入口.
- * 样式只放本文件: 浏览器页 link 本文件, 文档/阅读页随 DOC_STYLE 内嵌 —
- * 三种表面同源, 不复制第二套图标组/提示样式. 图标是自包含 SVG (无外部字体/
- * CDN), 颜色继承主题变量与 currentColor; hover 与键盘焦点提示由 data-cb-tip +
- * ::after 呈现 (title 不会在焦点时出现). 窄屏整组换行, 视图图标组自身永不拆行. */
+ * 样式只放本文件: 浏览器页 link 本文件, 阅读页随 DOC_STYLE 内嵌 — 不复制第二套
+ * 图标组/提示样式 (独立阅读页的导航见下方"独立阅读页导航"节: 控件集与语义不同).
+ * 图标是自包含 SVG (无外部字体/CDN), 颜色继承主题变量与 currentColor;
+ * hover 与键盘焦点提示由 data-cb-tip + ::after 呈现 (title 不会在焦点时出现).
+ * 窄屏整组换行, 视图图标组自身永不拆行. */
 .cb-topbar {
   position: relative;
   z-index: 50; /* 排序菜单与提示盖过预览/抽屉, 工具区仍处于正常文档流 */
@@ -267,7 +283,7 @@ html:has(> body.cb-doc-page) {
   color: var(--cb-accent);
   text-decoration: none;
 }
-/* 选中态 (视图/隐藏项当前生效) 与禁用态 (无 JS 的树/网格; 阅读页隐藏/排序) */
+/* 选中态 (视图/隐藏项当前生效) 与禁用态 (无 JS 不可用的树/网格) */
 .cb-icon-btn[aria-pressed="true"] {
   background-color: var(--cb-hover);
   border-color: var(--cb-accent);
@@ -360,11 +376,13 @@ html:has(> body.cb-doc-page) {
   color: var(--cb-accent);
   font-weight: 600;
 }
-/* hover/键盘焦点含义提示: data-cb-tip 由 CSS 呈现, 焦点也能看到 */
-.cb-topbar [data-cb-tip] {
+/* hover/键盘焦点含义提示: data-cb-tip 由 CSS 呈现, 焦点也能看到 (阅读导航同源) */
+.cb-topbar [data-cb-tip],
+.cb-reading-nav [data-cb-tip] {
   position: relative;
 }
-.cb-topbar [data-cb-tip]::after {
+.cb-topbar [data-cb-tip]::after,
+.cb-reading-nav [data-cb-tip]::after {
   content: attr(data-cb-tip);
   position: absolute;
   top: calc(100% + 6px);
@@ -383,18 +401,26 @@ html:has(> body.cb-doc-page) {
   pointer-events: none;
 }
 .cb-topbar [data-cb-tip]:hover::after,
-.cb-topbar [data-cb-tip]:focus-visible::after {
+.cb-topbar [data-cb-tip]:focus-visible::after,
+.cb-reading-nav [data-cb-tip]:hover::after,
+.cb-reading-nav [data-cb-tip]:focus-visible::after {
   opacity: 1;
   visibility: visible;
 }
 /* 排序面板展开时不再显示 summary 的提示 (两者同一位次, 提示会盖住菜单顶部) */
-.cb-sort[open] > summary[data-cb-tip]::after {
+.cb-sort[open] > summary[data-cb-tip]::after,
+.cb-reading-search[open] > summary[data-cb-tip]::after,
+.cb-reading-more[open] > summary[data-cb-tip]::after {
   display: none;
 }
 /* 键盘焦点: 与树壳控件同一高对比 outline 体系 (输入框用 :focus, 输入即焦点) */
 .cb-topbar .cb-icon-btn:focus-visible,
 .cb-topbar .cb-sort > summary:focus-visible,
-.cb-topbar .cb-sort-menu a:focus-visible {
+.cb-topbar .cb-sort-menu a:focus-visible,
+.cb-reading-nav .cb-reading-action:focus-visible,
+.cb-reading-nav .cb-reading-crumbs > a:focus-visible,
+.cb-reading-nav .cb-reading-path-more > summary:focus-visible,
+.cb-reading-nav .cb-reading-copy-input:focus-visible {
   outline: 2px solid var(--cb-accent);
   outline-offset: 2px;
 }
@@ -413,6 +439,297 @@ html:has(> body.cb-doc-page) {
   .cb-topbar .cb-sort-menu,
   .cb-topbar [data-cb-tip]::after {
     right: 8px;
+  }
+}
+
+/* ---------- 独立阅读页导航 (阅读表面专用, Q1–Q13) ----------
+ * 阅读页不再复用浏览工具区 (浏览控件只作为惰性 template 存在, 客户端进树前克隆):
+ * 一条 sticky 紧凑栏回答"当前文件在哪 / 怎么回到浏览 / 能对当前文件做什么".
+ * 结构: 左"所在目录" → 中部面包屑 + 实际文件名 → 右次级动作 (文件树/搜索/下载/
+ * 复制链接); <60rem 只留 所在目录 + 文件名 + "更多", 完整路径与全部动作收进原生
+ * details 弹层 — 打开即看全, 不依赖 hover, 键盘/触控可达.
+ * 栏体用与 body 水平内边距等量的负外边距取全宽; 颜色只来自 --cb-* 变量;
+ * --cb-reading-nav-height (JS ResizeObserver 更新, :root 有回退) 支撑锚点落点与
+ * TOC 偏移; 长路径/长文件名只在自己的行内截断, 绝不撑出横向滚动. */
+.cb-reading-nav {
+  position: sticky;
+  top: 0;
+  z-index: 30; /* 盖过正文与锚点目标; 树壳工具区(50)/抽屉(40) 在树模式下另设 */
+  box-sizing: border-box;
+  margin: 0 -1.5rem 1.25rem;
+  padding: 0 1.5rem;
+  border-bottom: 1px solid var(--cb-border);
+  background-color: var(--cb-bg);
+  color: var(--cb-text);
+  font-size: 12.8px;
+  line-height: 1.5;
+}
+/* [hidden] 优先于本节的 display 声明: 树/复制动作在客户端就绪前必须真的不可见
+ * (JS 也会给树模式下的整条导航加 hidden) */
+.cb-reading-nav[hidden],
+.cb-reading-nav [hidden] {
+  display: none !important;
+}
+.cb-reading-bar {
+  box-sizing: border-box;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.5em;
+  min-height: 2.75rem;
+  padding: 0.35rem 0;
+}
+/* 阅读动作 (所在目录/文件树/搜索/下载/复制链接/更多): 图标 + 文字标签 — 动作
+ * 含义不依赖 hover 提示; 与工具区图标按钮同一视觉体系 (方角边框 + 主题色) */
+.cb-reading-action {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 0.35em;
+  box-sizing: border-box;
+  height: 2em;
+  padding: 0 0.6em;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.45em;
+  background-color: var(--cb-bg);
+  color: var(--cb-text);
+  font: inherit;
+  white-space: nowrap;
+  text-decoration: none;
+  cursor: pointer;
+}
+.cb-reading-action:hover {
+  border-color: var(--cb-accent);
+  color: var(--cb-accent);
+  text-decoration: none;
+}
+.cb-reading-action .cb-icon {
+  width: 1.1em;
+  height: 1.1em;
+}
+/* 中部面包屑: 单行; 行本身不设 overflow (会裁掉弹层), 逐段各自截断 */
+.cb-reading-crumbs {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 0.25em;
+  min-width: 0;
+  margin: 0;
+  font-size: 1em;
+  white-space: nowrap;
+}
+.cb-reading-crumbs > a,
+.cb-reading-crumbs > .cb-current {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* "根目录" 入口恒不收缩 (路径起点的可访问定位锚点); 当前文件名保底 3em —
+ * 更长的名字由行内截断承担, 完整路径 (含完整文件名) 由本行的 "…" 弹层给出
+ * (绝不被压缩成不可读的碎屑) */
+.cb-reading-crumbs .cb-reading-root {
+  flex: none;
+}
+.cb-reading-crumbs > .cb-reading-current {
+  min-width: 3em;
+}
+.cb-reading-crumbs a {
+  color: var(--cb-accent);
+  text-decoration: none;
+}
+.cb-reading-crumbs a:hover {
+  text-decoration: underline;
+}
+.cb-reading-crumbs .cb-crumb-sep,
+.cb-reading-path-line .cb-crumb-sep {
+  flex: none;
+  color: var(--cb-muted);
+}
+.cb-reading-crumbs .cb-current {
+  color: var(--cb-muted);
+  font-weight: 600;
+}
+/* 展开控件 (原生 details): 折叠 "…" 与完整路径入口共用一套弹层按钮样式 */
+.cb-reading-path-more,
+.cb-reading-search,
+.cb-reading-more {
+  flex: none;
+}
+.cb-reading-path-more > summary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 1.7em;
+  height: 1.8em;
+  padding: 0 0.4em;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.35em;
+  background-color: var(--cb-bg);
+  color: var(--cb-muted);
+  font-size: 1em;
+  line-height: 1;
+  list-style: none;
+  cursor: pointer;
+}
+.cb-reading-path-more > summary::-webkit-details-marker,
+.cb-reading-search > summary::-webkit-details-marker,
+.cb-reading-more > summary::-webkit-details-marker {
+  display: none;
+}
+.cb-reading-path-more > summary:hover,
+.cb-reading-search[open] > summary,
+.cb-reading-more[open] > summary {
+  border-color: var(--cb-accent);
+  color: var(--cb-accent);
+}
+/* 弹层: 绝对定位于阅读导航 (sticky 即定位祖先) 之下 — 与入口同列的相对位置
+ * 无关, 因此长路径/窄屏都不会把弹层推到视口外 */
+.cb-reading-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  z-index: 40;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: min(26rem, calc(100vw - 2rem));
+  max-height: min(70vh, 24rem);
+  overflow: auto;
+  padding: 0.5rem;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.45em;
+  background-color: var(--cb-bg);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+  white-space: normal;
+}
+/* 折叠/完整路径弹层: 与正文左缘对齐 */
+.cb-reading-path-more > .cb-reading-popover {
+  left: 1.5rem;
+}
+/* 桌面搜索入口: 与右缘对齐 (输入框宽固定, 窄屏收进可视宽度) */
+.cb-reading-search > .cb-reading-popover {
+  right: 1.5rem;
+}
+.cb-reading-search-panel input[type="search"] {
+  box-sizing: border-box;
+  width: 22em;
+  max-width: 100%;
+  padding: 0.4em 0.55em;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.45em;
+  background-color: var(--cb-bg);
+  color: var(--cb-text);
+  font: inherit;
+}
+.cb-reading-search-panel input[type="search"]:focus {
+  outline: 2px solid var(--cb-accent);
+  outline-offset: 0;
+  border-color: transparent;
+}
+/* 桌面动作组: 推到行尾; 窄屏整组让位给"更多" */
+.cb-reading-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 0.35em;
+  margin-left: auto;
+}
+/* 完整路径行 (弹层与窄屏"更多"共用): 可折行, 不截断 — 完整信息不依赖 hover */
+.cb-reading-path-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.2em;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.cb-reading-path-line a {
+  color: var(--cb-accent);
+  text-decoration: none;
+}
+.cb-reading-path-line a:hover {
+  text-decoration: underline;
+}
+.cb-reading-path-line .cb-current {
+  color: var(--cb-muted);
+  font-weight: 600;
+}
+/* 窄屏"更多": 完整可点击路径 + 完整文件名 + 全部动作, 与正文同宽的下拉面板 */
+.cb-reading-more > .cb-reading-popover {
+  left: 1.5rem;
+  right: 1.5rem;
+  width: auto;
+  max-width: none;
+}
+.cb-reading-more-panel {
+  display: grid;
+  gap: 0.5rem;
+}
+.cb-reading-more-path {
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--cb-border);
+}
+.cb-reading-more-actions {
+  display: grid;
+  gap: 0.35rem;
+}
+.cb-reading-more-actions .cb-reading-action {
+  width: 100%;
+  justify-content: flex-start;
+}
+/* 面板内的搜索是就地展开 (不叠一层弹层盖住面板): 收起时只有入口行 */
+.cb-reading-more-actions .cb-reading-search > .cb-reading-popover {
+  position: static;
+  width: auto;
+  max-width: none;
+  max-height: none;
+  overflow: visible;
+  padding: 0.4rem 0 0;
+  border: none;
+  background-color: transparent;
+  box-shadow: none;
+}
+/* 复制反馈: 文案 + 剪贴板失败时的手动选择字段 (空/hidden 时零高度) */
+.cb-reading-feedback {
+  display: block;
+}
+.cb-reading-status {
+  display: block;
+  margin: 0 0 0.4rem;
+  color: var(--cb-muted);
+  font-size: 0.95em;
+}
+.cb-reading-status:empty {
+  display: none;
+}
+.cb-reading-copy-fallback {
+  margin: 0 0 0.4rem;
+}
+.cb-reading-copy-input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 0.35em 0.5em;
+  border: 1px solid var(--cb-border);
+  border-radius: 0.45em;
+  background-color: var(--cb-soft-bg);
+  color: var(--cb-text);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.95em;
+}
+/* 断点 60rem: 单行桌面栏 (所在目录 + 面包屑 + 动作组) 放不下时切到窄屏收纳.
+ * 窄屏 = 所在目录 + 文件名 + 更多; "根目录"、祖先段与完整路径进"更多"弹层
+ * (仍可键盘/触控访问), 因此行内除当前文件名外全部隐藏 */
+@media (width >= 60rem) {
+  .cb-reading-mobile {
+    display: none;
+  }
+}
+@media (width < 60rem) {
+  .cb-reading-desktop {
+    display: none;
+  }
+  .cb-reading-crumbs > :not(.cb-reading-current) {
+    display: none;
   }
 }
 
@@ -546,9 +863,11 @@ body.cb-tree-resizing {
   cursor: col-resize;
   user-select: none;
 }
-/* 树模式下仅面包屑/预览面板让位 (树自身提供导航与预览); 共享工具区保持可见 */
+/* 树模式下仅面包屑/预览面板让位 (树自身提供导航与预览); 共享工具区保持可见.
+ * 独立阅读导航整体让位给克隆出来的浏览工具区 (JS 另设 hidden, 本规则兜底) */
 body.cb-tree-mode .cb-breadcrumb,
-body.cb-tree-mode #cb-preview {
+body.cb-tree-mode #cb-preview,
+body.cb-tree-mode .cb-reading-nav {
   display: none;
 }
 /* 内容区 (SPA 导航容器): 树模式下唯一滚动容器 (原 main/.cb-doc 独立滚动让位) */

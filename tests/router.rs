@@ -608,6 +608,59 @@ async fn markdown_front_matter_title() {
     assert!(!body.contains("title: \"我的文档\""), "body: {body}");
 }
 
+/// 阅读导航必须沿用访问路径 identity，不能把字面的 %2F 再解码成目录分隔符，
+/// 也不能用 front matter 标题替换文件名或下载目标。
+#[tokio::test]
+async fn reading_navigation_preserves_encoded_identity_and_original_download() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("docs %2F + 中");
+    std::fs::create_dir(&parent).unwrap();
+    let source = "---\ntitle: Different document title\n---\n\n# Original content\n";
+    std::fs::write(parent.join("literal%2F & note.md"), source).unwrap();
+    let app = app(dir.path());
+    let uri =
+        "/docs%20%252F%20%2B%20%E4%B8%AD/literal%252F%20%26%20note.md?sort=Size:Desc&hidden=1";
+    let response = get(app.clone(), uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains(r#"<bdi dir="auto">literal%2F &amp; note.md</bdi>"#));
+
+    let parent_tag = tags_containing(&body, "data-cb-reading-parent")
+        .into_iter()
+        .find(|tag| tag.starts_with("<a "))
+        .expect("working parent directory link");
+    let parent_href = href_in_tag(parent_tag).unwrap().replace("&amp;", "&");
+    assert_eq!(
+        parent_href,
+        "/docs%20%252F%20%2B%20%E4%B8%AD?sort=Size:Desc&hidden=1"
+    );
+    let parent_response = get(app.clone(), &parent_href).await;
+    assert_eq!(parent_response.status(), StatusCode::OK);
+    let parent_body = body_string(parent_response).await;
+    assert!(has_href_path(
+        &parent_body,
+        "/docs%20%252F%20%2B%20%E4%B8%AD/literal%252F%20%26%20note.md"
+    ));
+
+    let download_href = attr_values(&body, "href")
+        .into_iter()
+        .find(|href| href.contains("download=1"))
+        .expect("original file download")
+        .replace("&amp;", "&");
+    let downloaded = get(app, &download_href).await;
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert!(
+        downloaded
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;")
+    );
+    assert_eq!(body_string(downloaded).await, source);
+}
+
 /// .org 经 orgize 纯 Rust 渲染 (无 pandoc/emacs 依赖, 恒跑):
 /// 完整页面 + 自建 TOC + 标题锚点 + src 块 + 同一 DOC_STYLE.
 #[tokio::test]

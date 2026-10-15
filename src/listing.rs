@@ -378,16 +378,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn name_order_uses_raw_bytes_not_visible_escapes() {
-        use std::os::unix::ffi::OsStringExt;
         let dir = tempfile::tempdir().unwrap();
-        let non_utf8 = OsString::from_vec(vec![0xff]);
-        std::fs::write(dir.path().join(&non_utf8), b"x").unwrap();
+        // 合法但显示时必须转义的名称，同样能区分 raw bytes 与 escape 排序；
+        // APFS 不允许创建含 0xFF 的文件名。
+        let escaped = OsStr::new("\u{200b}");
+        std::fs::write(dir.path().join(escaped), b"x").unwrap();
         std::fs::write(dir.path().join("z"), b"x").unwrap();
         let entries = list_dir(dir.path(), dir.path(), ListingOptions::default());
         assert_eq!(entries[0].raw_name(), OsStr::new("z"));
-        assert_eq!(entries[1].raw_name(), &non_utf8);
-        assert_eq!(entries[1].display_name, "\\xFF");
-        assert!(entries[1].browser_path_encoded().is_none());
+        assert_eq!(entries[1].raw_name(), escaped);
+        assert_eq!(entries[1].display_name, "\\u{200B}");
     }
 
     #[cfg(unix)]

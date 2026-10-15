@@ -554,7 +554,7 @@ async function waitClientReady(page) {
   await waitFor(
     () =>
       page.evaluate(
-        "(() => { const b = document.querySelector('[data-cb-view=\"tree\"]'); return !!b && b.getAttribute('aria-disabled') === null; })()"
+        "(() => { const reading = document.querySelector('[data-cb-reading-tree]'); if (!document.body.classList.contains('cb-tree-mode') && reading) return !reading.hidden; const b = document.querySelector('[data-cb-view=\"tree\"]'); return !!b && b.getAttribute('aria-disabled') === null; })()"
       ),
     'client ready',
     10000
@@ -2070,11 +2070,12 @@ await runScenario('reload and cross-full-page back/forward restore snapshot (vie
   await waitClientReady(page);
   await sleep(300);
   const fwd = await page.evaluate(
-    '(() => ({ anyPressed: Array.from(document.querySelectorAll("[data-cb-view]")).some((b) => b.getAttribute("aria-pressed") === "true"), hiddenDisabled: document.querySelector("[data-cb-hidden-toggle]").getAttribute("aria-disabled") }))()'
+    '(() => { const nav = document.querySelector(".cb-reading-nav"); const parent = document.querySelector("[data-cb-reading-parent]"); return { reading: !!nav && nav.getClientRects().length > 0 && !document.body.classList.contains("cb-tree-mode"), parent: parent ? new URL(parent.href).pathname : null }; })()'
   );
   // 搜索: 跨视图保留 q/sort/hidden; tree -> list 同位置 replace + reload 不增历史
+  await page.click('.cb-reading-desktop .cb-reading-search > summary');
   await page.evaluate(
-    '(() => { const input = document.getElementById("cb-search-q"); input.value = "leaf"; input.form.requestSubmit(); return true; })()'
+    '(() => { const input = document.querySelector(".cb-reading-desktop .cb-reading-search input[name=q]"); input.value = "leaf"; input.form.requestSubmit(); return true; })()'
   );
   await waitFor(
     () => page.evaluate("location.pathname === '/__/search' && document.body.dataset.cbQuery === 'leaf' && !!document.querySelector('#cb-view-list')"),
@@ -2105,7 +2106,7 @@ await runScenario('reload and cross-full-page back/forward restore snapshot (vie
   await waitClientReady(page);
   await sleep(300);
   const backA = await page.evaluate(
-    '(() => ({ anyPressed: Array.from(document.querySelectorAll("[data-cb-view]")).some((b) => b.getAttribute("aria-pressed") === "true") }))()'
+    '(() => { const nav = document.querySelector(".cb-reading-nav"); return { reading: !!nav && nav.getClientRects().length > 0 && !document.body.classList.contains("cb-tree-mode") }; })()'
   );
   await page.evaluate('history.forward()');
   await waitFor(
@@ -2138,11 +2139,11 @@ await runScenario('reload and cross-full-page back/forward restore snapshot (vie
       back.state.pressed.list === 'true' && back.state.pressed.tree === 'false' && back.state.treeMode === false &&
       back.rules.pathname === '/adir' && back.rules.sort === 'Size:Desc' && back.rules.hidden === '1' &&
       back.prefs.view === other2.view && back.prefs.sort === other2.sort && back.prefs.hidden === other2.hidden &&
-      fwd.anyPressed === false && fwd.hiddenDisabled === 'true' &&
+      fwd.reading && fwd.parent === '/adir' &&
       searchTree.pathname === '/__/search' && searchTree.q === 'leaf' && searchList.pathname === '/__/search' && searchList.q === 'leaf' &&
       searchList.sort === searchTree.sort && searchList.hidden === searchTree.hidden &&
       lenSearch1 === lenSearch0 &&
-      backA.anyPressed === false &&
+      backA.reading &&
       fwdSearch.state.pressed.list === 'true' && fwdSearch.state.pressed.grid === 'false' && fwdSearch.state.treeMode === false &&
       fwdSearch.state.query === 'leaf' && fwdSearch.rules.pathname === '/__/search' && fwdSearch.rules.q === 'leaf' &&
       fwdSearch.rules.sort === searchList.sort && fwdSearch.rules.hidden === searchList.hidden &&
