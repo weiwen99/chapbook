@@ -1,0 +1,3 @@
+# Vendored minified JavaScript must keep the upstream bytes on every platform.
+assets/*.min.js -text
+assets/**/*.min.js -text

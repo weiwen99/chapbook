@@ -15,6 +15,9 @@ When naming a domain concept in an issue title, refactor proposal, hypothesis, o
 
 If a concept isn't in the glossary, reconsider whether the language belongs to this project or note a real gap for `/domain-modeling`.
 
+The optional Windows 图形启动器 and its 状态窗口 use the root glossary.
+The 状态窗口 controls a local service instance; it is not a 浏览视图 and does not change the client-shell ADR.
+
 ## Flag ADR conflicts
 
 If your output contradicts an existing ADR, surface the conflict explicitly: identify the ADR and explain why its decision is worth reopening.

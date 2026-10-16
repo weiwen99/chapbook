@@ -987,7 +987,7 @@ async fn path_traversal_is_forbidden() {
     }
 }
 
-/// Windows 的盘符、反斜杠与 NTFS ADS 不是合法 URL segment.
+/// Windows 的盘符、反斜杠、UNC/设备前缀与 NTFS ADS 按 fail-closed 策略拒绝.
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_filesystem_syntax_is_forbidden() {
@@ -1000,6 +1000,15 @@ async fn windows_filesystem_syntax_is_forbidden() {
         "/%5C%5Cserver%5Cshare%5Cfile",
         "/%5C%5C%3F%5CC%3A%5Coutside.txt",
         "/subdir%5C..%5C..%5Coutside.txt",
+        // wildcard 去掉首个 `/` 后仍有 `//` 前缀; 忽略前缀会别名到已有文件/目录.
+        "///server/share/1.txt",
+        "/%2F%2Fserver%2Fshare%2F1.txt",
+        "///./device/1.txt",
+        "/%2F%2F.%2Fdevice%2F1.txt",
+        "///server/share/subdir",
+        "/%2F%2Fserver%2Fshare%2Fsubdir",
+        "///./device/subdir",
+        "/%2F%2F.%2Fdevice%2Fsubdir",
     ] {
         for uri in [
             path.to_string(),
@@ -1521,42 +1530,64 @@ async fn markdown_org_raw_and_download_return_source() {
     }
 }
 
-/// RFC 8187: 中文/空格/括号/单引号 basename 的 attachment header 可解析且逐字节精确.
+/// RFC 8187: 跨平台单引号及 Unix 星号 basename 的 attachment header 与原始字节.
 #[tokio::test]
 async fn download_uses_rfc8187_content_disposition() {
     let dir = tempfile::tempdir().unwrap();
     let source = "# 标题\n\n正文\n";
-    std::fs::write(dir.path().join("报告 (final)'.md"), source).unwrap();
-    let uri = "/%E6%8A%A5%E5%91%8A%20(final)%27.md?download=1";
+    let cases = [
+        (
+            "报告 (final)'.md",
+            "/%E6%8A%A5%E5%91%8A%20(final)%27.md?download=1",
+            "attachment; filename=\"____final__.md\"; \
+             filename*=UTF-8''%E6%8A%A5%E5%91%8A%20%28final%29%27.md",
+        ),
+        #[cfg(unix)]
+        (
+            "报告 (final)*.md",
+            "/%E6%8A%A5%E5%91%8A%20(final)%2A.md?download=1",
+            "attachment; filename=\"____final__.md\"; \
+             filename*=UTF-8''%E6%8A%A5%E5%91%8A%20%28final%29%2A.md",
+        ),
+    ];
+    for (name, uri, disposition) in cases {
+        std::fs::write(dir.path().join(name), source).unwrap();
+        let res = get_with_accept(app(dir.path()), uri, "text/html").await;
+        assert_eq!(res.status(), StatusCode::OK, "{name}");
+        assert_eq!(
+            res.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            disposition,
+            "{name}"
+        );
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), source.as_bytes(), "{name}");
 
-    let res = get_with_accept(app(dir.path()), uri, "text/html").await;
-    assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(
-        res.headers().get(header::CONTENT_DISPOSITION).unwrap(),
-        "attachment; filename=\"____final__.md\"; \
-         filename*=UTF-8''%E6%8A%A5%E5%91%8A%20%28final%29%27.md"
-    );
-    assert_eq!(body_string(res).await, source);
-
-    // Accept 不影响 download; Range 请求仍 206 且保留 attachment
-    let res = app(dir.path())
-        .oneshot(
-            Request::builder()
-                .uri(uri)
-                .header(header::ACCEPT, "text/html")
-                .header(header::RANGE, "bytes=0-1")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
-    assert_eq!(
-        res.headers().get(header::CONTENT_RANGE).unwrap(),
-        &format!("bytes 0-1/{}", source.len()).as_str()
-    );
-    assert!(res.headers().get(header::CONTENT_DISPOSITION).is_some());
-    assert_eq!(body_string(res).await, &source[..2]);
+        // Accept 不影响 download; Range 请求仍 206 且保留精确 attachment header.
+        let res = app(dir.path())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::ACCEPT, "text/html")
+                    .header(header::RANGE, "bytes=0-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT, "{name}");
+        assert_eq!(
+            res.headers().get(header::CONTENT_RANGE).unwrap(),
+            &format!("bytes 0-1/{}", source.len()).as_str(),
+            "{name}"
+        );
+        assert_eq!(
+            res.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            disposition,
+            "{name}"
+        );
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), &source.as_bytes()[..2], "{name}");
+    }
 }
 
 /// download 覆盖 md/org/代码/二进制/Office, 一律原始字节 + attachment, Accept 被忽略.

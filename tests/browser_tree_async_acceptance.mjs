@@ -1,5 +1,5 @@
 // 浏览状态契约 (版本化显示规则 + 分支状态 + 跨文档交接 + 历史/生命周期恢复)
-// 确定性 CDP 浏览器验收 (A/A2/1/2/3/C/D/E/Q17T/Q17L/OH/V/H/L/R/R2/R3).
+// 确定性 CDP 浏览器验收 (A/A2/1/2/3/C/D/E/Q17T/Q17L/OH/V/H/L/R/R2/R3/M).
 //
 // 手动调用 (非 cargo test), 自包含: 仅 Node 内置模块 + 系统 Chrome 的 CDP
 // WebSocket (无任何 npm 包); 自建临时 fixture (目录/文件/隐藏项/仅含隐藏孩子
@@ -10,6 +10,7 @@
 // 运行:
 //   cargo build --release && node tests/browser_tree_async_acceptance.mjs
 //   CB_SCENARIO='R explicit collapse survives reload' node tests/browser_tree_async_acceptance.mjs
+//   CB_SCENARIO='M Mermaid lazy HTTP asset renders labeled SVG edges' node tests/browser_tree_async_acceptance.mjs
 //
 // Chrome 定位: $CHROME_BIN 优先, 其次 ms-playwright / Chrome-for-Testing 已知
 // 路径 (macOS 与 Linux, 完整浏览器优先、同类型取最新版本) 与系统常见位置.
@@ -41,6 +42,8 @@
 //   R    展开子树后折叠父目录再刷新: 保持折叠/选中, 重新打开父目录恢复子树
 //   R2   打开目录内文档后折叠祖先再刷新: 保留文档/URL/选中, 祖先保持折叠
 //   R3   恢复子树不自动重试错误分支; 明确激活失败分支才允许重试
+//   M    无图页面不请求 Mermaid; Markdown fragment 与 Org 整页按需请求真实 JS,
+//        HTTP 200 + application/javascript + 传输完成, SVG 标签/有向边正确且无 JS 错误.
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -2157,6 +2160,113 @@ await runScenario('reload and cross-full-page back/forward restore snapshot (vie
       ' backA=' + JSON.stringify(backA) + ' fwdSearch=' + JSON.stringify(fwdSearch) + ' other3=' + JSON.stringify(other3) +
       ' persistedCount=' + persistedCount + ' bfcache=' + bfcacheNote + ' flight=' + JSON.stringify(flight0) + '->' + JSON.stringify(flight1) +
       ' errors=' + JSON.stringify(pageErrors));
+});
+
+/* =====================================================================
+ * M. 真实懒加载资源与图表输出: 缺失资源会使 HTTP/传输断言失败, 错误 MIME
+ *    会使 Content-Type 断言失败, 空壳/损坏 JS 或渲染失败会使 SVG 语义断言失败.
+ *    不注入库、不手动 fetch: 请求必须由实际阅读器发现文档内图表后发出.
+ * ===================================================================== */
+await runScenario('M Mermaid lazy HTTP asset renders labeled SVG edges', async () => {
+  // 此场景在树状态场景之后创建专用文档, 不改变先前场景的 fixture 行集合.
+  const graph = 'flowchart LR\n  Start[Alpha] -->|connects| Finish[Omega]\n';
+  writeFileSync(join(fixture, 'diagram.md'), '# Diagram\n\n```mermaid\n' + graph + '```\n');
+  writeFileSync(join(fixture, 'diagram.org'), '* Diagram\n\n#+begin_src mermaid\n' + graph + '#+end_src\n');
+  const { page, pageErrors } = await fresh('tree');
+  const assetPath = '/__/static/js/mermaid.min.js';
+  const eagerRequests = await page.evaluate(
+    `performance.getEntriesByType('resource').filter((entry) => new URL(entry.name).pathname === ${JSON.stringify(assetPath)}).length`
+  );
+  const requests = new Map();
+  const responses = [];
+  const failed = [];
+  const jsErrors = [];
+  page.on('Network.requestWillBeSent', (params, sid) => {
+    if (sid !== page.sessionId || params.request.url !== BASE + assetPath) return;
+    requests.set(params.requestId, { id: params.requestId, finished: false });
+  });
+  page.on('Network.responseReceived', (params, sid) => {
+    if (sid !== page.sessionId || !requests.has(params.requestId)) return;
+    const response = params.response;
+    const header = Object.entries(response.headers).find(([name]) => name.toLowerCase() === 'content-type');
+    const record = requests.get(params.requestId);
+    Object.assign(record, {
+      status: response.status,
+      contentType: header ? String(header[1]).split(';')[0].trim().toLowerCase() : null,
+      type: params.type,
+      fromCache: !!response.fromDiskCache || !!response.fromServiceWorker,
+    });
+    responses.push(record);
+  });
+  page.on('Network.loadingFinished', (params, sid) => {
+    if (sid === page.sessionId && requests.has(params.requestId)) {
+      requests.get(params.requestId).finished = true;
+    }
+  });
+  page.on('Network.loadingFailed', (params, sid) => {
+    if (sid === page.sessionId && requests.has(params.requestId)) failed.push(params.errorText);
+  });
+  page.on('Runtime.consoleAPICalled', (params, sid) => {
+    if (sid === page.sessionId && params.type === 'error') {
+      jsErrors.push(params.args.map((arg) => arg.description || arg.value || arg.type).join(' '));
+    }
+  });
+  page.on('Log.entryAdded', (params, sid) => {
+    if (sid === page.sessionId && params.entry.source === 'javascript' && params.entry.level === 'error') {
+      jsErrors.push(params.entry.text);
+    }
+  });
+  await page.send('Log.enable');
+  await page.send('Network.setCacheDisabled', { cacheDisabled: true });
+
+  const diagramState = (scope) => page.evaluate(`(() => {
+    const svg = document.querySelector(${JSON.stringify(scope + ' pre.mermaid svg')});
+    if (!svg) return null;
+    const nodes = [...svg.querySelectorAll('g.node')].map((node) => node.textContent.trim());
+    const edgeLabels = [...svg.querySelectorAll('.edgeLabel')].map((label) => label.textContent.trim()).filter(Boolean);
+    const edges = [...svg.querySelectorAll('.edgePaths path')].map((edge) => {
+      const marker = (edge.getAttribute('marker-end') || '').match(/#([^)'"]+)/);
+      const arrow = marker && svg.querySelector('[id="' + marker[1] + '"] path');
+      return { length: edge.getTotalLength(), arrow: !!arrow };
+    });
+    const bounds = svg.getBoundingClientRect();
+    return { nodes, edgeLabels, edges, visible: bounds.width > 0 && bounds.height > 0 };
+  })()`);
+  const validDiagram = (state) => state && state.visible &&
+    state.nodes.length === 2 && state.nodes.includes('Alpha') && state.nodes.includes('Omega') &&
+    state.edgeLabels.includes('connects') && state.edges.length === 1 &&
+    state.edges[0].length > 0 && state.edges[0].arrow;
+
+  await page.click('#cb-tree-root [data-native-path-encoded="diagram.md"] .cb-tree-row');
+  const fragment = await waitFor(async () => {
+    const state = await diagramState('.cb-pane');
+    return validDiagram(state) && state;
+  }, 'Markdown fragment labeled Mermaid SVG', 15000);
+  await waitFor(() => responses.some((response) => response.finished), 'Mermaid HTTP transfer');
+  const fragmentRequests = requests.size;
+  const fragmentFetches = fragCounts['/diagram.md'] || 0;
+
+  await page.goto(BASE + '/diagram.org');
+  await waitFor(
+    () => page.evaluate("location.pathname === '/diagram.org' && document.body.classList.contains('cb-doc-page')"),
+    'Org document committed'
+  );
+  const fullPage = await waitFor(async () => {
+    const state = await diagramState('.cb-doc');
+    return validDiagram(state) && state;
+  }, 'Org full-page labeled Mermaid SVG', 15000);
+  await waitFor(() => responses.length >= 2 && responses.every((response) => response.finished), 'Org Mermaid HTTP transfer');
+  rec('M Mermaid lazy HTTP asset renders labeled SVG edges',
+    eagerRequests === 0 && fragmentRequests === 1 && fragmentFetches === 1 &&
+      requests.size === 2 && responses.length === 2 &&
+      responses.every((response) => response.status === 200 && response.contentType === 'application/javascript' &&
+        response.type === 'Script' && response.finished && !response.fromCache) &&
+      failed.length === 0 && validDiagram(fragment) && validDiagram(fullPage) &&
+      pageErrors.length === 0 && jsErrors.length === 0,
+    'eager=' + eagerRequests + ' fragmentFetches=' + fragmentFetches +
+      ' responses=' + JSON.stringify(responses) + ' failed=' + JSON.stringify(failed) +
+      ' fragment=' + JSON.stringify(fragment) + ' fullPage=' + JSON.stringify(fullPage) +
+      ' errors=' + JSON.stringify(pageErrors.concat(jsErrors)));
 });
 
 /* ---------- 收尾: 汇总 + 清理 ---------- */

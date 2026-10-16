@@ -1106,7 +1106,7 @@ fn trusted_ui_response(markup: String) -> Response {
     response
 }
 
-/// 将 URL 路径解析为 root 内的文件系统路径. 溢出 root 时返回 None.
+/// 将 URL 路径解析为 root 内的文件系统路径. 溢出 root 或含平台前缀时返回 None.
 fn resolve_within_root(root: &Path, decoded: &str) -> Option<PathBuf> {
     // URL identity 使用 `/`; Windows 的盘符、UNC/设备路径与 ADS 不能作为 segment.
     #[cfg(windows)]
@@ -1116,7 +1116,8 @@ fn resolve_within_root(root: &Path, decoded: &str) -> Option<PathBuf> {
     let mut buf = root.to_path_buf();
     for comp in Path::new(decoded).components() {
         match comp {
-            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::Prefix(_) => return None,
+            Component::RootDir | Component::CurDir => {}
             Component::Normal(segment) => buf.push(segment),
             Component::ParentDir => {
                 if buf == *root {
@@ -2449,6 +2450,64 @@ mod tests {
             "[::1",
         ] {
             assert!(!host_is_loopback(host), "host 必须拒绝: {host:?}");
+        }
+    }
+
+    /// 真实 app 的系统随机 token 必须恰好嵌入一次, 并用于同一 Router 的授权链.
+    /// 只提交不存在的路径: 有效 token 到达 404, 无效 token 在此前被拒绝, 不调用系统 opener.
+    #[tokio::test]
+    async fn real_app_token_round_trips_through_native_open_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path().to_path_buf()).expect("app initialization");
+        let res = app
+            .clone()
+            .oneshot(page_request(Some(loopback_peer()), "localhost", "/"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_to_string(res).await;
+        let token_metas: Vec<_> = body
+            .split("<meta ")
+            .skip(1)
+            .map(|tag| tag.split('>').next().unwrap())
+            .filter(|tag| tag.contains(r#"name="cb-native-open-token""#))
+            .collect();
+        assert_eq!(token_metas.len(), 1, "exactly one token meta");
+        let token = token_metas[0]
+            .split(r#"content=""#)
+            .nth(1)
+            .and_then(|value| value.split('"').next())
+            .expect("token meta content");
+        assert_eq!(token.len(), 32);
+        assert!(
+            token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "token must be lowercase hex"
+        );
+        assert_eq!(
+            body.matches(token).count(),
+            1,
+            "token embedded exactly once"
+        );
+
+        let incorrect_first = if token.starts_with('0') { '1' } else { '0' };
+        let incorrect = format!("{incorrect_first}{}", &token[1..]);
+        for (provided, expected) in [
+            (token, StatusCode::NOT_FOUND),
+            (incorrect.as_str(), StatusCode::FORBIDDEN),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(native_request(
+                    &format!("path=missing.txt&token={provided}"),
+                    Some(loopback_peer()),
+                    "localhost",
+                    Some("http://localhost"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected);
         }
     }
 

@@ -1,20 +1,27 @@
 # 未发布
 
-## Windows 图形启动器
+## Windows 平台支持
 
-- 新增独立单文件 `chapbook-launcher.exe`，本地可双击文件名为 `打开文件夹浏览.exe`。
-- 双击弹出系统文件夹选择框，确认后同进程启动 HTTP 服务并打开默认浏览器；取消即退出。
-- 自动绑定本机随机空闲端口，无需用户输入路径或端口，多实例互不冲突。
-- 控制窗口显示文件夹与地址，提供重开浏览器和停止按钮；关闭窗口也停止服务，退出最多等待 2 秒。
-- 启动器无需配套 CLI、源码或资源文件；原有命令行入口与 `cargo run --` 用法保持不变。
-- Windows 默认应用接口提取为共用适配器；安全路径显示支持绝对盘符根路径并增加回归测试。
+- 启动令牌使用 `getrandom` 系统安全随机源，失败仍拒绝启动；真实应用令牌的格式与授权链有行为回归覆盖。
+- 默认应用打开使用 `ShellExecuteExW` 与 UTF-16 路径，不拼接 shell 命令。
+- Windows 路径除盘符、反斜杠与 NTFS ADS 外，还拒绝解析后的 UNC/设备前缀，包括正斜杠和 `%2F` 形式。
+- 恢复 Unix 星号文件名的 RFC 8187 下载覆盖，Windows 使用可创建的单引号 fixture。
+- 增加 Windows GNU/MinGW-w64 CI，执行 Windows 专属路由与可选启动器测试。
 
-## Windows 原生支持
+## Windows 可选图形启动器
 
-- 启动令牌改用 `getrandom` 系统安全随机源，修复 Windows 因 `/dev/urandom` 不存在而启动失败。
-- 本机打开新增 `ShellExecuteExW` 适配，保持中文、空格与特殊字符路径，不通过 shell 拼接命令。
-- Windows 文件请求拒绝盘符、反斜杠、UNC/设备路径与 NTFS ADS；增加对应路由安全回归测试。
-- 调整平台相关测试 fixture，README 补充 x64 GNU/MinGW-w64 构建与 `.exe` 启动说明。
+- 默认构建只生成 CLI；显式启用 `windows-launcher` 才构建独立的 `chapbook-launcher.exe`。
+- 选择文件夹后同进程启动 HTTP 服务，自动分配本机端口并打开浏览器；取消选择不启动服务。
+- 浏览器启动在独立工作线程执行，结果异步回传状态窗口；失败以内联提示展示，不阻塞停止操作。
+- 状态窗口关闭时在 GUI 线程使用独立于服务 worker 的超时等待；优雅关闭等待上限为 2 秒。
+- 控件布局使用具名 `ControlBounds`，状态窗口术语收录到 GLOSSARY。
+- 文件夹选择库升级到 rfd 0.17，与直接依赖统一使用 windows-sys 0.61，移除重复的 0.59 绑定。
+
+## 资源回归与文档
+
+- `.gitattributes` 禁止压缩 JavaScript 的 LF/CRLF 检出转换，保留官方 vendored 字节。
+- 新增真实浏览器 Mermaid 行为验收并纳入 Linux CI：检查实际懒加载 HTTP/MIME 与有标签、有向边的 SVG。
+- 文档改为中性的 Windows 平台与可选启动器说明，不包含 Fork 自指或本机分发命名。
 
 上一版本发布说明见 [chapbook v0.4.1](release-notes-v0.4.1.md)。
 

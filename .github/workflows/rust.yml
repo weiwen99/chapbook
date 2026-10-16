@@ -2,7 +2,7 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "windows-support" ]
   pull_request:
     branches: [ "main" ]
 
@@ -17,6 +17,40 @@ jobs:
     steps:
     - uses: actions/checkout@v5
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --locked --bins --verbose
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --locked --verbose
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+    - name: Verify Mermaid HTTP asset and rendered SVG
+      env:
+        CB_BIN: ${{ github.workspace }}/target/debug/chapbook
+        CB_SCENARIO: M Mermaid lazy HTTP asset renders labeled SVG edges
+      run: node tests/browser_tree_async_acceptance.mjs
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - uses: actions/checkout@v5
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable-x86_64-pc-windows-gnu
+        components: rustfmt, clippy
+    - uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        path-type: inherit
+        update: true
+        install: mingw-w64-x86_64-gcc
+    - name: Build default CLI without launcher
+      run: cargo build --locked --bins --target x86_64-pc-windows-gnu
+    - name: Test Windows routes and optional launcher
+      run: cargo test --locked --all-targets --features windows-launcher --target x86_64-pc-windows-gnu
+    - name: Check formatting
+      run: cargo fmt --check
+    - name: Lint Windows targets
+      run: cargo clippy --locked --all-targets --features windows-launcher --target x86_64-pc-windows-gnu -- -D warnings

@@ -1,11 +1,8 @@
 # chapbook
 
 chapbook（/ˈtʃæpbʊk/，小册子）—— 轻量高性能静态文件服务器：把一个目录变成一本可读的小册子。
-单文件可执行，前端资源全部内嵌，无外部文件依赖。
-
-本仓库是 [weiwen99/chapbook](https://github.com/weiwen99/chapbook) 的非官方 Windows 适配 Fork，
-保留上游提交历史与 Apache-2.0 许可证；原始许可证和第三方版权声明见
-[LICENSE](LICENSE) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+默认构建命令行程序 `chapbook`；Windows 另提供可选图形启动器。每个程序均可独立单文件运行，
+前端资源全部内嵌，无外部资源文件依赖。
 
 ## Features
 
@@ -22,20 +19,27 @@ chapbook（/ˈtʃæpbʊk/，小册子）—— 轻量高性能静态文件服务
 - **Security** — 逐分量路径解析，路径穿越返回 403；原始内容用 `sandbox allow-scripts` CSP 隔离（非下载的成功 PDF/音视频响应例外，强制 nosniff）；所有 CB 完整页带 `frame-ancestors 'none'; script-src 'self'` 与 `X-Frame-Options: DENY`；Org 危险链接拒绝；悬空符号链接不会拖垮目录列表
 - **单文件分发** — 前端资源与 syntect 语法集全部内嵌进二进制，无外部文件依赖
 
-## Windows 双击使用
+## Windows 可选图形启动器
 
-源码仓库不包含编译产物，请先按下方步骤构建。构建后的 **`chapbook-launcher.exe`**
-可直接双击，也可复制并重命名为 **`打开文件夹浏览.exe`**：
+默认构建仅包含 CLI，不引入图形启动器和文件夹选择库。需要图形界面时，
+按下方 Windows 工具链说明准备环境，再显式构建：
+
+```powershell
+cargo build --release --locked --features windows-launcher --bin chapbook-launcher
+```
+
+双击 `target\release\chapbook-launcher.exe`：
 
 1. 在系统选择框中选中要浏览的文件夹，点击“选择文件夹”。
 2. 程序自动启动本机服务，并在默认浏览器中打开该文件夹。
-3. 保留“chapbook — 本地阅读服务”小窗口；需要时点“重新打开浏览器”。
-4. 用完点击“停止并退出”，或关闭这个小窗口，服务即停止。仅关闭浏览器不会停止服务。
+3. 保留状态窗口；需要时点“重新打开浏览器”。
+4. 用完点击“停止并退出”，或关闭状态窗口。仅关闭浏览器不会停止服务。
 
-不需要命令行、手动填写路径或选择端口。中文、空格路径可直接选择；端口由系统分配，
-可同时打开多个文件夹，互不占用同一个端口。取消选择会直接退出，不启动服务。
-启动器是独立单文件，可复制到桌面或其他目录，不需要旁边有 `chapbook.exe`、源码或资源文件；
-运行不依赖 Rust、GCC、PowerShell 或 WSL。
+无需输入路径或选择端口；中文、空格路径可直接选择，多个实例使用各自的空闲端口。
+取消选择不启动服务。浏览器启动在独立工作线程执行，失败会在状态窗口内提示访问地址，
+不会阻塞停止操作；停止时的优雅关闭等待上限为 2 秒，不依赖服务 worker 的计时器。
+启动器与 CLI 各自独立，不需配套另一个二进制或源码；启动器可单独复制到其他目录使用。
+CLI 与图形启动器都无运行时工具依赖，不需要 Rust、GCC、PowerShell 或 WSL。
 
 ## Build
 
@@ -59,10 +63,10 @@ cargo build --release
 
 ### Windows x64（原生运行，无需 WSL）
 
-本分支已适配 Windows：启动令牌使用跨平台系统安全随机源，本机打开使用 Windows 文件关联 API，
+Windows 使用系统安全随机源和默认应用接口，
 中文与空格路径保持 UTF-16，不经 `cmd /c start` 或 PowerShell 拼接命令。
-Windows URL 路径拒绝盘符、反斜杠、UNC/设备路径及 NTFS alternate data streams（ADS）。
-上游 v0.4.1 Release 仍只有 Linux/macOS 产物，不能直接在 Windows 执行。
+Windows URL 路径拒绝盘符、反斜杠、UNC/设备路径（包括正斜杠编码形式）及 NTFS ADS。
+v0.4.1 已发布资产仅覆盖 Linux/macOS，Windows CLI 和可选图形启动器需自行构建。
 
 构建需要 Rust GNU 工具链与 MinGW-w64 GCC（x86_64、SEH、MSVCRT；例如
 [mingw-builds](https://github.com/niXman/mingw-builds-binaries/releases) 的 `x86_64-…-posix-seh-msvcrt-…` 包）。
@@ -79,8 +83,8 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:LOCALAPPDATA\chapbook-tools\mingw6
 rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
 cargo +stable-x86_64-pc-windows-gnu build --release --locked
 
-# 生成便于双击的中文名称启动器（与 CLI 二进制相互独立）
-Copy-Item .\target\release\chapbook-launcher.exe .\打开文件夹浏览.exe
+# 可选：构建图形启动器（默认构建不包含）
+cargo +stable-x86_64-pc-windows-gnu build --release --locked --features windows-launcher --bin chapbook-launcher
 
 # 服务当前目录；浏览器访问 http://127.0.0.1:8888/
 .\target\release\chapbook.exe .
@@ -88,8 +92,8 @@ Copy-Item .\target\release\chapbook-launcher.exe .\打开文件夹浏览.exe
 .\target\release\chapbook.exe --port 9000 "D:\文档"
 ```
 
-生成的 `chapbook-launcher.exe` 是图形启动器，`chapbook.exe` 保留原有命令行用法。
-两者均无需 Rust、GCC、Node 或 WSL 即可运行。CLI 按 `Ctrl+C` 停止，GUI 关闭控制窗口停止。
+默认产物 `chapbook.exe` 保留原有命令行用法；显式启用 `windows-launcher` 后可另构建图形启动器。
+每个二进制均可单独运行。CLI 按 `Ctrl+C` 停止，GUI 关闭状态窗口停止。
 默认只允许本机访问；除非确实需要局域网共享，不要改为 `--host 0.0.0.0`。
 
 ### Install

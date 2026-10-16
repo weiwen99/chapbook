@@ -17,14 +17,15 @@ cargo test                  # 全部测试（无外部依赖，恒跑）
 cargo fmt --check           # 格式检查（提交前必须过）
 cargo clippy --all-targets  # 静态检查（零警告基线，提交前必须过）
 ./target/release/chapbook /path/to/serve   # 运行；--help 查看参数
-cargo run --bin chapbook-launcher        # Windows 图形启动器（原生文件夹选择框）
+cargo run --features windows-launcher --bin chapbook-launcher # Windows 可选图形启动器
 ```
 
 无 Makefile / 脚本封装，全部走 cargo 标准命令。`default-run = "chapbook"` 保持既有 CLI 运行方式。
-Windows 的独立 `chapbook-launcher` 使用 GUI subsystem，不显示控制台；本地分发名为 `打开文件夹浏览.exe`。
-启动器内嵌同一 Router，同进程绑定 `127.0.0.1:0`，成功后打开默认浏览器；取消选择不启动服务。
-控制窗口显示安全路径与实际 URL，关闭/X/停止按钮统一发送 graceful shutdown，最多等待 2 秒后退出，
-不能遗留后台服务或依赖旁边另一个 CLI exe。默认浏览器失败时提示 URL，服务和重开按钮仍可用。
+默认构建仅包含 CLI；Windows 图形启动器通过 `windows-launcher` 特性显式启用，使用 GUI subsystem。
+启动器内嵌同一 Router，同进程绑定 `127.0.0.1:0`；取消选择不启动服务，浏览器在独立工作线程打开。
+状态窗口显示安全路径与实际 URL；浏览器忙时仍可停止，失败以内联状态提示并允许再次打开。
+关闭/X/停止统一发送 graceful shutdown，由 GUI 线程的 `std::sync::mpsc::recv_timeout` 最多等待 2 秒，
+之后不再等待服务 worker 或浏览器任务。不能依赖服务 worker 驱动退出计时器，也不能遗留后台服务。
 
 ## CLI
 
@@ -188,7 +189,7 @@ tests/
 - **路径穿越**：`routes::resolve_within_root` 逐分量解析 URL 路径，`..` 弹出到 root 时返回 403。
   任何重构不得退化为"字符串前缀比较"——词法比较不消除 `..` 分量，`/%2e%2e/...` 可读到根目录外文件，
   `tests/router.rs::path_traversal_is_forbidden` 锁定该行为。
-  Windows 另拒绝 URL 路径中的 `\` 与 `:`，防止盘符、UNC/设备路径与 NTFS ADS 绕过相对路径语义。
+  Windows 另拒绝 URL 路径中的 `\`、`:` 以及解析后的 `Component::Prefix`，包括正斜杠 UNC/设备前缀。
 - 符号链接**保持跟随**语义（允许把内容软链进服务根目录）；目录项元信息读取失败时
   回退 `symlink_metadata`，再失败则跳过该项，不允许单个坏文件导致列表 500。
 - href 编码使用 RFC 3986 percent-encoding（`meta::PATH_SEGMENT_ENCODE_SET`），空格为 `%20`；
@@ -233,7 +234,7 @@ tests/
 | tracing + tracing-subscriber | 日志 | `RUST_LOG` 环境变量控制级别 |
 | getrandom 0.4 | 启动令牌 | 系统安全随机源，Windows 不访问 `/dev/urandom`；失败仍拒绝启动 |
 | windows-sys 0.61 + dunce 1（仅 Windows） | 系统默认应用打开 | COM 初始化后 `ShellExecuteExW`，仅在无损时简化 canonicalize 的 verbatim 前缀，无 shell |
-| rfd 0.15（仅 Windows） | 原生文件夹选择框 | GUI 启动器使用系统选择框；状态窗口通过 windows-sys 创建，无脚本/外部 runtime |
+| rfd 0.17 + parking_lot 0.12（Windows 可选特性） | 原生文件夹选择框与跨线程通知 | 仅 `windows-launcher` 启用；与直接依赖共用 windows-sys 0.61，无脚本/外部 runtime |
 
 Materialize 前端资源来自 [materializecss/materialize](https://github.com/materializecss/materialize)
 社区维护分支（v2.3.3，MIT），升级时替换 `assets/` 下两个 materialize 文件即可，无构建步骤。
@@ -243,7 +244,7 @@ Materialize 前端资源来自 [materializecss/materialize](https://github.com/m
 `assets/mermaid.min.js` 是 [mermaid-js/mermaid](https://github.com/mermaid-js/mermaid) v11.17.2（MIT）
 官方 dist 的 IIFE 单文件自包含构建（`mermaid.esm.min.mjs` 有 38 个懒加载 chunk，不可单文件嵌入，
 不可用），升级时替换该文件并同步 THIRD_PARTY_NOTICES，在浏览器验收中确认图表实际渲染为 SVG；
-不锁定资产字节长度（Git 的 LF/CRLF 检出转换会改变长度）。二进制 +~3.5MB。
+`.gitattributes` 固定压缩 JavaScript 的检出字节；实际资源加载与 SVG 图表行为由浏览器验收锁定。二进制 +~3.5MB。
 
 ## 设计决策
 

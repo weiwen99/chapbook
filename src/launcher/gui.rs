@@ -2,6 +2,9 @@ use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use windows_sys::Win32::Foundation::{
     GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SetLastError, WPARAM,
@@ -10,12 +13,16 @@ use windows_sys::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, DEFAULT_GUI_FONT, GetStockObject, HGDIOBJ, UpdateWindow,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::core::{PCWSTR, w};
 
 const CLASS_NAME: PCWSTR = w!("ChapbookLauncherWindow");
-const WINDOW_TITLE: PCWSTR = w!("chapbook — 本地阅读服务");
+const WINDOW_TITLE: PCWSTR = w!("chapbook — 状态窗口");
 const SERVER_STOPPED: u32 = WM_APP + 1;
+const BROWSER_FINISHED: u32 = WM_APP + 2;
+const STATUS_ID: u16 = 1104;
+static NEXT_WINDOW_ID: Mutex<usize> = Mutex::new(1);
 const FOLDER_ID: u16 = 1001;
 const URL_ID: u16 = 1002;
 const OPEN_BROWSER_ID: u16 = 1003;
@@ -41,11 +48,21 @@ pub fn show_error(message: &str) {
     }
 }
 
-#[derive(Clone, Copy)]
+// Later variants take precedence if sent commands arrive while GetMessage is
+// retrieving a queued worker notification. In particular, Stop is never lost.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Event {
     OpenBrowser,
-    Stop,
+    BrowserFinished,
     ServerStopped,
+    Stop,
+}
+
+struct ControlBounds {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
 }
 
 struct WindowState {
@@ -53,6 +70,15 @@ struct WindowState {
     event: Cell<Option<Event>>,
     initialized: Cell<bool>,
     initialization_error: Cell<Option<u32>>,
+    notification: Arc<NotificationTarget>,
+}
+
+impl WindowState {
+    fn queue_event(&self, event: Event) {
+        self.event.set(Some(
+            self.event.get().map_or(event, |pending| pending.max(event)),
+        ));
+    }
 }
 
 pub struct StatusWindow {
@@ -61,23 +87,36 @@ pub struct StatusWindow {
     // callback reentrancy without creating overlapping mutable references.
     state: Box<WindowState>,
     _class: WindowClass,
+    font: HGDIOBJ,
 }
 
-#[derive(Clone, Copy)]
-pub struct ServerNotifier {
-    // No Rust pointer crosses threads or enters the message queue. An HWND is
-    // only an OS token; the notifier neither owns nor dereferences the window.
-    hwnd: usize,
+#[derive(Clone)]
+pub struct Notifier {
+    target: Arc<NotificationTarget>,
 }
 
-impl ServerNotifier {
-    pub fn notify(self) {
-        if self.hwnd != 0 {
-            // PostMessage is thread-safe and carries no borrowed data. A late
-            // notification after window destruction is harmless and may fail;
-            // the owning thread is already stopping in that case.
+struct NotificationTarget {
+    hwnd: Mutex<Option<usize>>,
+    id: usize,
+}
+
+impl Notifier {
+    pub fn server_stopped(&self) {
+        self.notify(SERVER_STOPPED);
+    }
+
+    pub fn browser_finished(&self) {
+        self.notify(BROWSER_FINISHED);
+    }
+
+    fn notify(&self, message: u32) {
+        let hwnd = self.target.hwnd.lock();
+        if let Some(hwnd) = *hwnd {
+            // Posting is nonblocking. Destruction invalidates the target under
+            // this same lock; a per-window ID also rejects already-queued
+            // messages if Windows later recycles the numeric HWND.
             unsafe {
-                PostMessageW(self.hwnd as HWND, SERVER_STOPPED, 0, 0);
+                PostMessageW(hwnd as HWND, message, self.target.id, 0);
             }
         }
     }
@@ -86,14 +125,32 @@ impl ServerNotifier {
 impl StatusWindow {
     pub fn new(root: &Path, url: &str) -> io::Result<Self> {
         let class = WindowClass::new()?;
+        let id = {
+            let mut next = NEXT_WINDOW_ID.lock();
+            let id = *next;
+            *next = id
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("status window identifier exhausted"))?;
+            id
+        };
+        // The stock font is borrowed for the process lifetime.
+        let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+        if font.is_null() {
+            return Err(win32_error("GetStockObject (default GUI font)"));
+        }
         let window = Self {
             state: Box::new(WindowState {
                 hwnd: Cell::new(null_mut()),
                 event: Cell::new(None),
                 initialized: Cell::new(false),
                 initialization_error: Cell::new(None),
+                notification: Arc::new(NotificationTarget {
+                    hwnd: Mutex::new(None),
+                    id,
+                }),
             }),
             _class: class,
+            font,
         };
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let ex_style = WS_EX_APPWINDOW | WS_EX_CONTROLPARENT;
@@ -101,7 +158,7 @@ impl StatusWindow {
             left: 0,
             top: 0,
             right: 700,
-            bottom: 290,
+            bottom: 380,
         };
         // All pointers below refer to live local buffers or to the stable state
         // allocation. CreateWindowExW sends WM_NCCREATE synchronously.
@@ -129,105 +186,113 @@ impl StatusWindow {
                 }
                 return Err(win32_error("CreateWindowExW (status window)"));
             }
-            let font = GetStockObject(DEFAULT_GUI_FONT);
-            if font.is_null() {
-                return Err(win32_error("GetStockObject (default GUI font)"));
-            }
             window.control(
                 w!("STATIC"),
                 "服务正在运行",
                 1101,
-                20,
-                20,
-                660,
-                24,
+                ControlBounds {
+                    x: 20,
+                    y: 20,
+                    width: 660,
+                    height: 24,
+                },
                 0,
                 0,
-                font,
             )?;
             window.control(
                 w!("STATIC"),
                 "文件夹(&F)：",
                 1102,
-                20,
-                56,
-                660,
-                22,
+                ControlBounds {
+                    x: 20,
+                    y: 56,
+                    width: 660,
+                    height: 22,
+                },
                 0,
                 0,
-                font,
             )?;
             window.control(
                 w!("EDIT"),
                 &chapbook::meta::display_path_text(dunce::simplified(root)),
                 FOLDER_ID,
-                20,
-                80,
-                660,
-                28,
+                ControlBounds {
+                    x: 20,
+                    y: 80,
+                    width: 660,
+                    height: 28,
+                },
                 WS_TABSTOP | ES_READONLY as u32 | ES_AUTOHSCROLL as u32,
                 WS_EX_CLIENTEDGE,
-                font,
             )?;
             window.control(
                 w!("STATIC"),
                 "访问地址(&U)：",
                 1103,
-                20,
-                122,
-                660,
-                22,
+                ControlBounds {
+                    x: 20,
+                    y: 122,
+                    width: 660,
+                    height: 22,
+                },
                 0,
                 0,
-                font,
             )?;
             window.control(
                 w!("EDIT"),
                 url,
                 URL_ID,
-                20,
-                146,
-                660,
-                28,
+                ControlBounds {
+                    x: 20,
+                    y: 146,
+                    width: 660,
+                    height: 28,
+                },
                 WS_TABSTOP | ES_READONLY as u32 | ES_AUTOHSCROLL as u32,
                 WS_EX_CLIENTEDGE,
-                font,
             )?;
             window.control(
-                w!("STATIC"),
-                "仅本机可访问。关闭此窗口将停止服务并退出。",
-                1104,
-                20,
-                190,
-                660,
-                24,
-                0,
-                0,
-                font,
+                w!("EDIT"),
+                "仅本机可访问。关闭状态窗口将停止服务并退出。",
+                STATUS_ID,
+                ControlBounds {
+                    x: 20,
+                    y: 190,
+                    width: 660,
+                    height: 116,
+                },
+                WS_TABSTOP
+                    | WS_VSCROLL
+                    | ES_READONLY as u32
+                    | ES_MULTILINE as u32
+                    | ES_AUTOVSCROLL as u32,
+                WS_EX_CLIENTEDGE,
             )?;
             window.control(
                 w!("BUTTON"),
                 "重新打开浏览器(&O)",
                 OPEN_BROWSER_ID,
-                304,
-                234,
-                190,
-                34,
+                ControlBounds {
+                    x: 304,
+                    y: 326,
+                    width: 190,
+                    height: 34,
+                },
                 WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
                 0,
-                font,
             )?;
             window.control(
                 w!("BUTTON"),
                 "停止并退出(&X)",
                 STOP_ID,
-                510,
-                234,
-                170,
-                34,
+                ControlBounds {
+                    x: 510,
+                    y: 326,
+                    width: 170,
+                    height: 34,
+                },
                 WS_TABSTOP | BS_PUSHBUTTON as u32,
                 0,
-                font,
             )?;
             window.state.initialized.set(true);
             // ShowWindow returns the *previous* visibility, not a success flag.
@@ -239,9 +304,42 @@ impl StatusWindow {
         Ok(window)
     }
 
-    pub fn notifier(&self) -> ServerNotifier {
-        ServerNotifier {
-            hwnd: self.state.hwnd.get() as usize,
+    pub fn notifier(&self) -> Notifier {
+        Notifier {
+            target: Arc::clone(&self.state.notification),
+        }
+    }
+
+    pub fn browser_pending(&self) {
+        self.set_browser_status(
+            false,
+            "正在打开默认浏览器。服务仍在运行，可复制上方地址访问。\r\n关闭状态窗口将停止服务并退出。",
+        );
+    }
+
+    pub fn browser_finished(&self, result: io::Result<()>) {
+        let message = match result {
+            Ok(()) => {
+                "已请求默认浏览器打开访问地址。\r\n仅本机可访问。关闭状态窗口将停止服务并退出。"
+                    .to_owned()
+            }
+            Err(error) => format!(
+                "无法打开默认浏览器：{error}\r\n\r\n服务仍在运行。请复制上方访问地址到浏览器，或配置 Windows 默认浏览器后，在状态窗口点击“重新打开浏览器”。"
+            ),
+        };
+        self.set_browser_status(true, &message);
+    }
+
+    fn set_browser_status(&self, enabled: bool, message: &str) {
+        let message = wide(message);
+        // Only the owning GUI thread touches controls. Windows copies the
+        // status text synchronously; the read-only edit remains selectable.
+        unsafe {
+            let hwnd = self.state.hwnd.get();
+            if !hwnd.is_null() {
+                EnableWindow(GetDlgItem(hwnd, OPEN_BROWSER_ID as i32), i32::from(enabled));
+                SetWindowTextW(GetDlgItem(hwnd, STATUS_ID as i32), message.as_ptr());
+            }
         }
     }
 
@@ -275,19 +373,14 @@ impl StatusWindow {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn control(
         &self,
         class: PCWSTR,
         text: &str,
         id: u16,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
+        bounds: ControlBounds,
         style: u32,
         ex_style: u32,
-        font: HGDIOBJ,
     ) -> io::Result<()> {
         let text = wide(text);
         // The parent owns all child HWNDs, including on a later initialization
@@ -299,10 +392,10 @@ impl StatusWindow {
                 class,
                 text.as_ptr(),
                 WS_CHILD | WS_VISIBLE | style,
-                x,
-                y,
-                width,
-                height,
+                bounds.x,
+                bounds.y,
+                bounds.width,
+                bounds.height,
                 self.state.hwnd.get(),
                 id as usize as HMENU,
                 self._class.instance,
@@ -311,7 +404,7 @@ impl StatusWindow {
             if child.is_null() {
                 return Err(win32_error("CreateWindowExW (control)"));
             }
-            SendMessageW(child, WM_SETFONT, font as usize, 1);
+            SendMessageW(child, WM_SETFONT, self.font as usize, 1);
         }
         Ok(())
     }
@@ -402,6 +495,7 @@ unsafe extern "system" fn window_proc(
                 }
             }
             state.hwnd.set(hwnd);
+            *state.notification.hwnd.lock() = Some(hwnd as usize);
             // Default non-client initialization stores the window caption.
             return DefWindowProcW(hwnd, message, wparam, lparam);
         }
@@ -416,7 +510,7 @@ unsafe extern "system" fn window_proc(
                         _ => None,
                     };
                     if let Some(event) = event {
-                        state.event.set(Some(event));
+                        state.queue_event(event);
                         // BM_CLICK/WM_COMMAND can arrive as synchronous sent
                         // messages while GetMessage is blocked. A posted wakeup
                         // makes it return so next_event observes the Cell too.
@@ -424,8 +518,12 @@ unsafe extern "system" fn window_proc(
                         return 0;
                     }
                 }
-                SERVER_STOPPED => {
-                    state.event.set(Some(Event::ServerStopped));
+                SERVER_STOPPED | BROWSER_FINISHED if wparam == state.notification.id => {
+                    state.queue_event(if message == SERVER_STOPPED {
+                        Event::ServerStopped
+                    } else {
+                        Event::BrowserFinished
+                    });
                     return 0;
                 }
                 WM_CLOSE => {
@@ -433,7 +531,7 @@ unsafe extern "system" fn window_proc(
                     return 0;
                 }
                 WM_DESTROY => {
-                    state.event.set(Some(Event::Stop));
+                    state.queue_event(Event::Stop);
                     // Do not leave WM_QUIT behind if initialization failed and
                     // its partially created window is being unwound.
                     if state.initialized.get() {
@@ -442,6 +540,7 @@ unsafe extern "system" fn window_proc(
                     return 0;
                 }
                 WM_NCDESTROY => {
+                    *state.notification.hwnd.lock() = None;
                     state.hwnd.set(null_mut());
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 }
@@ -462,5 +561,147 @@ fn win32_error(operation: &str) -> io::Error {
         io::Error::other(format!("{operation} failed"))
     } else {
         io::Error::new(error.kind(), format!("{operation}: {error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queued_worker_completion_cannot_replace_stop() {
+        let state = WindowState {
+            hwnd: Cell::new(null_mut()),
+            event: Cell::new(None),
+            initialized: Cell::new(false),
+            initialization_error: Cell::new(None),
+            notification: Arc::new(NotificationTarget {
+                hwnd: Mutex::new(None),
+                id: 1,
+            }),
+        };
+        for events in [
+            [Event::Stop, Event::BrowserFinished],
+            [Event::BrowserFinished, Event::Stop],
+            [Event::Stop, Event::ServerStopped],
+            [Event::ServerStopped, Event::Stop],
+        ] {
+            state.event.set(None);
+            for event in events {
+                state.queue_event(event);
+            }
+            assert_eq!(state.event.take(), Some(Event::Stop));
+        }
+    }
+}
+
+#[cfg(test)]
+mod browser_behavior_tests {
+    use super::*;
+    use crate::BrowserActivation;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+
+    // The process-wide native class is deliberately registered only once at a
+    // time. Each case owns a fresh GUI thread, including its WM_QUIT queue.
+    static GUI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn control_text(window: &StatusWindow, id: u16) -> String {
+        unsafe {
+            let control = GetDlgItem(window.state.hwnd.get(), id as i32);
+            let mut text = vec![0; GetWindowTextLengthW(control) as usize + 1];
+            let length = GetWindowTextW(control, text.as_mut_ptr(), text.len() as i32);
+            String::from_utf16(&text[..length as usize]).unwrap()
+        }
+    }
+
+    #[test]
+    fn browser_failure_arrives_on_gui_thread_and_retry_updates_inline_status() {
+        let _guard = GUI_TEST_LOCK.lock();
+        std::thread::spawn(|| {
+            let url = "http://127.0.0.1:12345/";
+            let window = StatusWindow::new(&std::env::temp_dir(), url).unwrap();
+            let mut browser = BrowserActivation::new();
+            browser.start_with(url, &window, move |_| {
+                Err(io::Error::other("browser failure from worker"))
+            });
+            assert_eq!(window.next_event().unwrap(), Event::BrowserFinished);
+            browser.finish(&window);
+            assert!(control_text(&window, STATUS_ID).contains("browser failure from worker"));
+            assert_eq!(control_text(&window, URL_ID), url);
+            assert_ne!(
+                unsafe {
+                    IsWindowEnabled(GetDlgItem(window.state.hwnd.get(), OPEN_BROWSER_ID as i32))
+                },
+                0
+            );
+
+            browser.start_with(url, &window, |_| Ok(()));
+            assert_eq!(window.next_event().unwrap(), Event::BrowserFinished);
+            browser.finish(&window);
+            let status = control_text(&window, STATUS_ID);
+            assert!(!status.contains("browser failure from worker"));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn stop_button_and_close_remain_responsive_during_blocked_browser_activation() {
+        let _guard = GUI_TEST_LOCK.lock();
+        for close in [false, true] {
+            std::thread::spawn(move || {
+                let url = "http://127.0.0.1:12345/";
+                let window = StatusWindow::new(&std::env::temp_dir(), url).unwrap();
+                let mut browser = BrowserActivation::new();
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let started = Instant::now();
+                browser.start_with(url, &window, move |_| {
+                    entered_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                    Err(io::Error::other("blocked browser eventually returned"))
+                });
+                assert!(started.elapsed() < Duration::from_secs(1));
+                entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert_eq!(
+                    unsafe {
+                        IsWindowEnabled(GetDlgItem(window.state.hwnd.get(), OPEN_BROWSER_ID as i32))
+                    },
+                    0
+                );
+                let (unexpected_tx, unexpected_rx) = mpsc::channel();
+                browser.start_with(url, &window, move |_| {
+                    let _ = unexpected_tx.send(());
+                    Ok(())
+                });
+                assert!(matches!(
+                    unexpected_rx.try_recv(),
+                    Err(mpsc::TryRecvError::Disconnected)
+                ));
+                unsafe {
+                    let hwnd = window.state.hwnd.get();
+                    let posted = if close {
+                        PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                    } else {
+                        PostMessageW(hwnd, WM_COMMAND, STOP_ID as usize, 0)
+                    };
+                    assert_ne!(posted, 0);
+                }
+                let started = Instant::now();
+                assert_eq!(window.next_event().unwrap(), Event::Stop);
+                assert!(matches!(
+                    browser.result_rx.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                drop(browser);
+                drop(window);
+                assert!(started.elapsed() < Duration::from_secs(1));
+                let _ = release_tx.send(());
+            })
+            .join()
+            .unwrap();
+        }
     }
 }
