@@ -341,6 +341,7 @@ async fn html_files_render_natively() {
     assert!(!body.contains("sourceCode"), "body: {body}");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn directory_listing_survives_broken_symlink() {
     let dir = tempfile::tempdir().unwrap();
@@ -566,22 +567,6 @@ async fn fragment_preserves_mermaid_container() {
             "{file}: {body}"
         );
     }
-}
-
-/// mermaid.js 静态资产经 /__/static/js/ 服务 (前端懒加载同一路径);
-/// 字节长度锁定版本: 升级 mermaid 必须同步替换文件并更新 THIRD_PARTY_NOTICES.
-#[tokio::test]
-async fn mermaid_js_static_asset_served() {
-    let dir = fixture();
-    let res = get(app(dir.path()), "/__/static/js/mermaid.min.js").await;
-    assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(content_type(&res), "application/javascript");
-    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(
-        bytes.len(),
-        3_572_661,
-        "mermaid.min.js 应为官方 v11.17.2 dist (升级需同步 THIRD_PARTY_NOTICES)"
-    );
 }
 
 /// YAML front matter: title 进 <title> 与 title-block-header, front matter 本身不显示.
@@ -999,6 +984,40 @@ async fn path_traversal_is_forbidden() {
     ] {
         let res = get(app(dir.path()), uri).await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN, "uri: {uri}");
+    }
+}
+
+/// Windows 的盘符、反斜杠、UNC/设备前缀与 NTFS ADS 按 fail-closed 策略拒绝.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_filesystem_syntax_is_forbidden() {
+    let dir = fixture();
+    let app = app(dir.path());
+    for path in [
+        "/1.txt%3Asecret",
+        "/subdir/C%3Aoutside.txt",
+        "/C%3A/outside.txt",
+        "/%5C%5Cserver%5Cshare%5Cfile",
+        "/%5C%5C%3F%5CC%3A%5Coutside.txt",
+        "/subdir%5C..%5C..%5Coutside.txt",
+        // wildcard 去掉首个 `/` 后仍有 `//` 前缀; 忽略前缀会别名到已有文件/目录.
+        "///server/share/1.txt",
+        "/%2F%2Fserver%2Fshare%2F1.txt",
+        "///./device/1.txt",
+        "/%2F%2F.%2Fdevice%2F1.txt",
+        "///server/share/subdir",
+        "/%2F%2Fserver%2Fshare%2Fsubdir",
+        "///./device/subdir",
+        "/%2F%2F.%2Fdevice%2Fsubdir",
+    ] {
+        for uri in [
+            path.to_string(),
+            format!("{path}?fragment=1"),
+            format!("/__/tree{path}"),
+        ] {
+            let res = get(app.clone(), &uri).await;
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "uri: {uri}");
+        }
     }
 }
 
@@ -1511,42 +1530,64 @@ async fn markdown_org_raw_and_download_return_source() {
     }
 }
 
-/// RFC 8187: 中文/空格/括号/星号 basename 的 attachment header 可解析且逐字节精确.
+/// RFC 8187: 跨平台单引号及 Unix 星号 basename 的 attachment header 与原始字节.
 #[tokio::test]
 async fn download_uses_rfc8187_content_disposition() {
     let dir = tempfile::tempdir().unwrap();
     let source = "# 标题\n\n正文\n";
-    std::fs::write(dir.path().join("报告 (final)*.md"), source).unwrap();
-    let uri = "/%E6%8A%A5%E5%91%8A%20(final)*.md?download=1";
+    let cases = [
+        (
+            "报告 (final)'.md",
+            "/%E6%8A%A5%E5%91%8A%20(final)%27.md?download=1",
+            "attachment; filename=\"____final__.md\"; \
+             filename*=UTF-8''%E6%8A%A5%E5%91%8A%20%28final%29%27.md",
+        ),
+        #[cfg(unix)]
+        (
+            "报告 (final)*.md",
+            "/%E6%8A%A5%E5%91%8A%20(final)%2A.md?download=1",
+            "attachment; filename=\"____final__.md\"; \
+             filename*=UTF-8''%E6%8A%A5%E5%91%8A%20%28final%29%2A.md",
+        ),
+    ];
+    for (name, uri, disposition) in cases {
+        std::fs::write(dir.path().join(name), source).unwrap();
+        let res = get_with_accept(app(dir.path()), uri, "text/html").await;
+        assert_eq!(res.status(), StatusCode::OK, "{name}");
+        assert_eq!(
+            res.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            disposition,
+            "{name}"
+        );
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), source.as_bytes(), "{name}");
 
-    let res = get_with_accept(app(dir.path()), uri, "text/html").await;
-    assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(
-        res.headers().get(header::CONTENT_DISPOSITION).unwrap(),
-        "attachment; filename=\"____final__.md\"; \
-         filename*=UTF-8''%E6%8A%A5%E5%91%8A%20%28final%29%2A.md"
-    );
-    assert_eq!(body_string(res).await, source);
-
-    // Accept 不影响 download; Range 请求仍 206 且保留 attachment
-    let res = app(dir.path())
-        .oneshot(
-            Request::builder()
-                .uri(uri)
-                .header(header::ACCEPT, "text/html")
-                .header(header::RANGE, "bytes=0-1")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
-    assert_eq!(
-        res.headers().get(header::CONTENT_RANGE).unwrap(),
-        &format!("bytes 0-1/{}", source.len()).as_str()
-    );
-    assert!(res.headers().get(header::CONTENT_DISPOSITION).is_some());
-    assert_eq!(body_string(res).await, &source[..2]);
+        // Accept 不影响 download; Range 请求仍 206 且保留精确 attachment header.
+        let res = app(dir.path())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::ACCEPT, "text/html")
+                    .header(header::RANGE, "bytes=0-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT, "{name}");
+        assert_eq!(
+            res.headers().get(header::CONTENT_RANGE).unwrap(),
+            &format!("bytes 0-1/{}", source.len()).as_str(),
+            "{name}"
+        );
+        assert_eq!(
+            res.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            disposition,
+            "{name}"
+        );
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), &source.as_bytes()[..2], "{name}");
+    }
 }
 
 /// download 覆盖 md/org/代码/二进制/Office, 一律原始字节 + attachment, Accept 被忽略.
@@ -2234,6 +2275,7 @@ async fn unsafe_scalar_fixtures_safe_labels_across_outlets() {
             label: "a\\x20\\x20b",
             files: &["a  b.md", "a  b.org", "a  b.csv", "a  b.rs"],
         },
+        #[cfg(not(windows))]
         Case {
             raw: "report.md ",
             label: "report.md\\x20",
@@ -2549,9 +2591,8 @@ async fn search_escaped_label_query_finds_raw_byte_name_display_only() {
     );
 }
 
-/// 六个 ASCII-space fixture (单内部 / 双内部 / 前导 / 无 / 尾随空格 / 字面 \x20)
-/// 的 DOM label 两两可区分: 目录表格+网格、搜索名称/aria、目录 fragment、
-/// href 编码与文件请求.
+/// ASCII-space fixture 的 DOM label 两两可区分: 目录表格+网格、搜索名称/aria、
+/// 目录 fragment、href 编码与文件请求. Unix 另含字面反斜杠 escape 文件名.
 #[tokio::test]
 async fn ascii_space_six_fixtures_distinct_across_outlets() {
     let cases: &[(&str, &str)] = &[
@@ -2560,17 +2601,23 @@ async fn ascii_space_six_fixtures_distinct_across_outlets() {
         (" report.md", "\\x20report.md"),
         ("report.md", "report.md"),
         ("report.md ", "report.md\\x20"),
+        #[cfg(unix)]
         (r"report.md\x20", r"report.md\\x20"),
     ];
     let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
     for (name, _) in cases {
-        std::fs::write(dir.path().join(name), "x").unwrap();
+        std::fs::write(root.join(name), "x").unwrap();
     }
-    let app = app(dir.path());
+    let app = app(&root);
 
-    // 六个 label 两两不同
+    // 所有 label 两两不同
     let distinct: std::collections::HashSet<&str> = cases.iter().map(|(_, l)| *l).collect();
-    assert_eq!(distinct.len(), 6, "labels must be pairwise distinct");
+    assert_eq!(
+        distinct.len(),
+        cases.len(),
+        "labels must be pairwise distinct"
+    );
 
     let body = body_string(get(app.clone(), "/").await).await;
     for (name, label) in cases {

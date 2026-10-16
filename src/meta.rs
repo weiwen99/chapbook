@@ -2,7 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
@@ -183,15 +183,19 @@ pub(crate) fn escape_os_name(name: &OsStr) -> String {
     escape_bytes(name.as_encoded_bytes())
 }
 
-/// 多 segment 路径的纯文本显示: 每个 segment 经 `escape_os_name` 后以 `/` join.
-/// root (空路径) 返回空串, 由调用方决定显示形式.
-pub(crate) fn display_path_text(path: &Path) -> String {
+/// 安全路径显示: 每个名称 segment 经 `escape_os_name` 后以 `/` join.
+/// 空路径返回空串; 绝对路径保留盘符与根分隔符, 不把 Windows 根 `\\` 当文件名转义.
+pub fn display_path_text(path: &Path) -> String {
     let mut out = String::new();
-    for (i, seg) in path.iter().enumerate() {
-        if i > 0 {
+    for component in path.components() {
+        if component == Component::RootDir {
             out.push('/');
+        } else {
+            if !out.is_empty() && !out.ends_with('/') {
+                out.push('/');
+            }
+            out.push_str(&escape_os_name(component.as_os_str()));
         }
-        out.push_str(&escape_os_name(seg));
     }
     out
 }
@@ -772,6 +776,16 @@ mod tests {
         assert_eq!(display_path_text(Path::new("a b/c")), "a b/c");
         assert_eq!(display_path_text(Path::new("dir/sub")), "dir/sub");
         assert_eq!(display_path_text(Path::new("")), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_absolute_windows_path_preserves_root_and_escapes_names() {
+        assert_eq!(display_path_text(Path::new("C:\\")), "C:/");
+        assert_eq!(
+            display_path_text(Path::new("C:\\中文 项目\\a\u{200b}.md")),
+            "C:/中文 项目/a\\u{200B}.md"
+        );
     }
 
     #[cfg(unix)]
