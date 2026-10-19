@@ -57,10 +57,11 @@ jobs:
           target: ${{ matrix.target }}
           runner: none
       # 构建 release 二进制, 打包 chapbook-<target>.tar.gz (内含 LICENSE, README.md),
-      # 上传到该 tag 的 release; 未设 checksum 输入, 不生成 .sha256 等校验和产物
+      # 上传到该 tag 的 release; 同时生成并上传 <archive>.sha256 校验和.
       - name: Build and upload
         uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: chapbook
           target: ${{ matrix.target }}
           include: LICENSE,README.md
+          checksum: sha256
