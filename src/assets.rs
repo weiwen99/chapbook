@@ -463,6 +463,64 @@ mod tests {
         assert_eq!(BROWSER_JS.matches("decodeURIComponent(").count(), 1);
         assert!(BROWSER_JS.contains("isPdfFile: isPdfFile"));
     }
+
+    /// 可执行行为矩阵: HTML 源码切换只在 kind=file 且后缀 .html/.htm
+    /// (大小写不敏感) 时启用; 目录名 folder.html、.xhtml、.htmlx 都不命中.
+    #[test]
+    fn browser_js_is_html_file_matrix() {
+        let ctx = quick_js::Context::new().expect("quick-js context");
+        ctx.eval("globalThis.module = { exports: {} };")
+            .expect("CommonJS module shim");
+        ctx.eval(BROWSER_JS).expect("eval BROWSER_JS");
+        for (path, kind, expected) in [
+            ("doc.html", "file", true),
+            ("a/b/DOC.HTML", "file", true),
+            ("doc.htm", "file", true),
+            ("DOC.HTM", "file", true),
+            ("folder.html", "dir", false),
+            ("doc.html", "dir", false),
+            ("doc.xhtml", "file", false),
+            ("doc.htmlx", "file", false),
+            ("doc.md", "file", false),
+            ("", "file", false),
+        ] {
+            let expr = format!(
+                "module.exports.isHtmlFile({}, {})",
+                serde_json::to_string(path).unwrap(),
+                serde_json::to_string(kind).unwrap()
+            );
+            let got = ctx.eval(&expr).expect("isHtmlFile must not throw");
+            assert!(
+                matches!(got, quick_js::JsValue::Bool(b) if b == expected),
+                "{expr}: expected {expected}"
+            );
+        }
+    }
+
+    /// 可执行行为矩阵: 树行新 tab 语义与列表/网格文件名 anchor 对齐 —
+    /// ⌘/Ctrl/Shift 参与, Alt 不参与, 普通点击仍走 content 导航.
+    #[test]
+    fn browser_js_tree_row_new_tab_modifiers() {
+        let ctx = quick_js::Context::new().expect("quick-js context");
+        ctx.eval("globalThis.module = { exports: {} };")
+            .expect("CommonJS module shim");
+        ctx.eval(BROWSER_JS).expect("eval BROWSER_JS");
+        for (event, expected) in [
+            ("{}", false),
+            ("{metaKey:true}", true),
+            ("{ctrlKey:true}", true),
+            ("{shiftKey:true}", true),
+            ("{altKey:true}", false),
+            ("{metaKey:false,ctrlKey:false,shiftKey:false}", false),
+        ] {
+            let expr = format!("module.exports.treeRowOpensNewTab({event})");
+            let got = ctx.eval(&expr).expect("treeRowOpensNewTab must not throw");
+            assert!(
+                matches!(got, quick_js::JsValue::Bool(b) if b == expected),
+                "{expr}: expected {expected}"
+            );
+        }
+    }
     /// 可执行行为矩阵: 新版浏览状态纯 seam (QuickJS 真实执行真实导出) —
     /// 版本化提交裁决 (treeLoadDecision)、视图循环 (nextBrowseView)、
     /// 隐藏焦点回退 (nearestVisibleIndex)、父编码路径 (parentEncodedPath)、

@@ -20,7 +20,8 @@ use syntect::util::LinesWithEndings;
 pub const MAX_RENDER_BYTES: u64 = 1024 * 1024;
 
 /// 扩展名 -> 高亮 token. 未识别的扩展名维持裸文本现状.
-/// 注意: html/htm 不在此映射 — 网页文件应直接交给浏览器渲染, 而不是显示源码.
+/// 注意: html/htm 不在此映射 — 网页文件默认直接交给浏览器渲染, 而不是显示源码;
+/// 预览面板的 HTML 源码视图显式使用 "html" token (见 routes::serve_path 的 source=1).
 pub fn language_for_path(path: &Path) -> Option<&'static str> {
     // 无扩展名文件按文件名匹配 (常见构建/容器文件)
     let file_name = path.file_name()?.to_str()?;

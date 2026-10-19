@@ -8,14 +8,14 @@ chapbook（/ˈtʃæpbʊk/，小册子）—— 轻量高性能静态文件服务
 - **Browser Views** — 树、列表、网格为三个同级视图，共用顶部图标工具区；hover/键盘焦点显示含义，隐藏项开关与六键双向排序适用于目录、树、搜索和目录预览
 - **Recursive Search** — `/__/search?q=` 服务端递归文件名搜索（过滤后确定性 BFS 取前 500 个候选，再按当前规则排序，不建索引）
 - **Keyboard Navigation** — `j/k/↑/↓` 移动选中行，`Enter`/`o` 打开，`p` 预览，`v` 按列表→网格→树→列表循环，`/` 聚焦搜索框，`Backspace` 上级目录；输入框和修饰键不触发视图切换
-- **Preview Panel** — 侧边面板以 fragment 渲染 .md/.org/Office/代码/图片/音视频，不离开列表即可查看
+- **Preview Panel** — 侧边面板以 fragment 渲染 .md/.org/Office/代码/图片/音视频，并以 sandboxed iframe 显示 .html/.htm 浏览器原生页面；HTML 预览可在页面与高亮源码（带行号）之间切换，不离开列表即可查看。树内容区打开 HTML 时提供同一 页面/源码 工具栏
 - **Markdown Rendering** — `.md` 文件经 comrak 纯 Rust 渲染为自适应亮/暗色的 HTML：自建 TOC 侧栏、标题锚点、syntect 语法高亮、YAML front matter 标题、KaTeX 数学公式；无外部 CDN 依赖
 - **Org-mode Rendering** — `.org` 文件经 orgize 纯 Rust 渲染为自适应亮/暗色的 HTML：自建 TOC 侧栏、标题锚点、4 级标题完整保留、代码块语法高亮、KaTeX 数学公式；无子进程、无外部依赖
 - **Office / CSV Rendering** — `.doc/.docx/.ppt/.pptx/.xls/.xlsx/.odt/.ods/.odp/.rtf/.epub/.csv` 经 anydoc 纯 Rust 转为 GFM Markdown 后复用 comrak 渲染文档页（TOC/锚点/高亮与 `.md` 一致）；转换失败自动回退原文件下载；PDF 除外——浏览器原生打开
 - **Code Highlighting** — 源代码文件（含 `.txt`/`.log`）按 Accept 协商返回 syntect 高亮 HTML（带行号）或原文；`?raw=1` / `?view=1` 显式覆盖。覆盖 60+ 语言（内置 + 内嵌补充 TypeScript/TOML/Kotlin/Swift/Dockerfile/GraphQL 等）
 - **Range Requests & Media** — 支持断点续传（tower-http `ServeFile` 内置）；音视频浏览器内播放与 seek
 - **Open Locally & Download** — `?download=1` 显式下载（RFC 8187 编码文件名）；本机访问时可用系统默认应用打开文件（xdg-open / open，仅 loopback + token 校验通过时）
-- **Security** — 逐分量路径解析，路径穿越返回 403；原始内容用 `sandbox allow-scripts` CSP 隔离（非下载的成功 PDF/音视频响应例外，强制 nosniff）；所有 CB 完整页带 `frame-ancestors 'none'; script-src 'self'` 与 `X-Frame-Options: DENY`；Org 危险链接拒绝；悬空符号链接不会拖垮目录列表
+- **Security** — 逐分量路径解析，路径穿越返回 403；原始内容用 `sandbox allow-scripts` CSP 隔离（非下载的成功 PDF/音视频响应例外，强制 nosniff）；HTML 预览的 iframe 同样只允许 scripts，不含 `allow-same-origin`；所有 CB 完整页带 `frame-ancestors 'none'; script-src 'self'` 与 `X-Frame-Options: DENY`；Org 危险链接拒绝；悬空符号链接不会拖垮目录列表
 - **单文件分发** — 前端资源与 syntect 语法集全部内嵌进二进制，无外部文件依赖
 
 ## Build
@@ -44,8 +44,8 @@ cp target/release/chapbook /usr/local/bin/
 ```
 
 预编译二进制与中文发布说明见 [GitHub Releases](https://github.com/weiwen99/chapbook/releases)。
-v0.4.1 支持 Linux x86_64（musl）和 macOS Apple Silicon，版本说明见
-[v0.4.1 发布 notes](docs/release-notes-v0.4.1.md)。更新后需重启原有 chapbook 进程。
+v0.4.2 支持 Linux x86_64（musl）和 macOS Apple Silicon，版本说明见
+[v0.4.2 发布 notes](docs/release-notes-v0.4.2.md)。更新后需重启原有 chapbook 进程。
 
 ## Run
 

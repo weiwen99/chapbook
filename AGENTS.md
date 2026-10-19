@@ -138,6 +138,13 @@ tests/
     `text/html; charset=utf-8` + `nosniff` 片段；非 UTF-8、超限、Office 转换失败和不支持类型
     返回占位片段，**禁止**回退原始字节。文档/代码正文统一包在 `.cb-doc`，完整页 body 为
     `.cb-doc-page`；目录页同时加载 `chapbook-doc.css` 供预览使用。
+    `.html`/`.htm`（ASCII 大小写不敏感）在 fragment 模式下输出
+    `.cb-doc.cb-html-preview` 内嵌 `<iframe sandbox="allow-scripts" src="exact raw URL">`，
+    fragment 本身不含原始文件字节；raw/完整页/下载仍是 ServeFile 原文，响应 CSP 不变。
+    同名文件加 `?fragment=1&source=1` 时改为复用代码 fragment 管线（syntect/行号/
+    1 MiB/严格 UTF-8）；`source` 只是 fragment 修饰符，单独出现或用于非 HTML 时忽略，
+    不改变 raw/完整页/下载与 iframe 预览。预览面板与树内容区共用该 fragment：
+    两处都有 HTML 文件专用的 页面/源码 切换，树内容区切换不写 URL/历史快照。
     最终 ResponseMode 为 fragment 时，参数/缺失路径 404、路径提取 400、穿越 403、搜索忙 429
     等错误也使用安全 HTML + nosniff，保留状态与 Retry-After；download/raw 仍优先。
 11. `GET /__/search?q=...` 递归搜索文件名（目录也参与），大小写不敏感、上限 500。
@@ -161,7 +168,9 @@ tests/
     不受影响）的预览、树导航与迷你列表点击一律 `window.open` 新 tab 交给浏览器原生查看器，
     不 SPA、不进预览面板；服务端对 PDF 的 200/206 响应省略 sandbox 保证查看器可渲染。
 15. 树/列表/网格为同级互斥浏览视图，顶部一组 SVG 图标与 hover/focus 提示；共用隐藏开关
-    和六键排序。独立阅读页不是第四视图，使用独立吸顶导航，不显示浏览视图／隐藏／排序控件。
+    和六键排序。树节点 ⌘/Ctrl/Shift+点击与中键在新 tab 打开完整页，普通点击仍走内容区导航。
+    树内容区打开 HTML 文件时显示 页面/源码 工具栏（仅 HTML；目录与非 HTML 文档隐藏）。
+    独立阅读页不是第四视图，使用独立吸顶导航，不显示浏览视图／隐藏／排序控件。
     “所在目录”沿用保存视图（默认列表）与当前规则，仅定位可见文件，不打开预览、不改偏好。
     阅读页进入文件树新增一个历史项，后退恢复阅读页及原阅读位置；完整约定见
     [.scratch/reading-navigation/spec.md](.scratch/reading-navigation/spec.md)。

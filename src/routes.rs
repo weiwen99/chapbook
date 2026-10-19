@@ -468,6 +468,10 @@ async fn serve_path(
         Err(status) => return early_error(status, fragment, "无效的请求参数"),
     };
 
+    // HTML 源码视图: 只作为 fragment 的正交修饰符, 不参与 ResponseMode 优先级;
+    // 单独 source=1 或 raw/full/download 模式下忽略, 默认出口仍由 ServeFile 原文.
+    let source_view = query.get("source").is_some_and(|value| value == "1");
+
     // 仅 loopback peer + 字面 loopback Host 才嵌入 native token; 其余 fail closed
     let native_token = native_controls_allowed(&connect, headers.get(header::HOST))
         .then_some(state.token.as_str());
@@ -518,14 +522,14 @@ async fn serve_path(
             Some(ResponseMode::Download) => serve_file(&fs_path, headers, true).await,
             Some(ResponseMode::Raw) => serve_file(&fs_path, headers, false).await,
             Some(ResponseMode::Fragment) => {
-                serve_fragment(
-                    &state,
-                    &fs_path,
-                    &metadata,
-                    classify_fragment(&fs_path),
-                    options,
-                )
-                .await
+                // HTML 源码视图复用代码 fragment 管线 (同一 1 MiB/UTF-8/行号语义);
+                // 只有显式 source=1 才走这里, 默认 fragment 仍是 iframe 原生页面.
+                let kind = if source_view && is_html_path(&fs_path) {
+                    FragmentKind::Code("html")
+                } else {
+                    classify_fragment(&fs_path)
+                };
+                serve_fragment(&state, &fs_path, &metadata, kind, options).await
             }
             // Full (?view=1 强制渲染) 与默认 (无模式键): 类型分派;
             // 仅 Office/代码在默认且 Accept 不含 text/html 时按 Raw 返回原文
@@ -818,6 +822,7 @@ enum FragmentKind {
     Dir,
     Markdown,
     Org,
+    Html,
     Office(office::Format),
     Code(&'static str),
     Media(MediaKind),
@@ -836,6 +841,8 @@ fn classify_fragment(path: &Path) -> FragmentKind {
         FragmentKind::Markdown
     } else if path.to_string_lossy().ends_with(".org") {
         FragmentKind::Org
+    } else if is_html_path(path) {
+        FragmentKind::Html
     } else if let Some(format) = office::format_for_path(path) {
         FragmentKind::Office(format)
     } else if let Some(lang) = highlight::language_for_path(path) {
@@ -845,6 +852,14 @@ fn classify_fragment(path: &Path) -> FragmentKind {
     } else {
         FragmentKind::Unsupported
     }
+}
+
+/// HTML 文件判定: `.html` / `.htm`, ASCII 大小写不敏感.
+/// 只看末尾扩展名, 目录名 `folder.html` 由调用方在 dir 分支排除.
+fn is_html_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm"))
 }
 
 /// 媒体扩展名: 图片 / 视频 / 音频 (大小写不敏感).
@@ -904,6 +919,13 @@ async fn serve_fragment(
                     render::doc_fragment(&body)
                 }
                 Err(reason) => no_preview(&reason),
+            };
+            fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
+        }
+        FragmentKind::Html => {
+            let inner = match encoded.as_deref() {
+                Some(enc) => html_fragment(enc, &title),
+                None => no_preview("路径无法编码"),
             };
             fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
         }
@@ -1046,6 +1068,20 @@ fn no_preview(reason: &str) -> String {
     html! {
         div class="cb-doc" data-cb-content-state="placeholder" {
             p class="cb-no-preview" { "无法预览：" (reason) }
+        }
+    }
+    .into_string()
+}
+
+/// HTML fragment 内容: `<iframe>` 指向该文件的 exact raw URL (无 fragment query),
+/// 页面由浏览器原生渲染. iframe 元素自身再带 `sandbox="allow-scripts"`:
+/// 与 raw 响应的 `CSP: sandbox allow-scripts` 同值, 但作为跨导航持续的元素级
+/// 保证; 两层都绝不包含 `allow-same-origin`. fragment 本身不含原始文件字节.
+fn html_fragment(encoded: &str, title: &str) -> String {
+    html! {
+        div class="cb-doc cb-html-preview" {
+            iframe class="cb-html-frame" src=(format!("/{encoded}"))
+                title=(title) sandbox="allow-scripts" {}
         }
     }
     .into_string()

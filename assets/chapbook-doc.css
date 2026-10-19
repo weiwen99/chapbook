@@ -872,6 +872,8 @@ body.cb-tree-mode .cb-reading-nav {
 }
 /* 内容区 (SPA 导航容器): 树模式下唯一滚动容器 (原 main/.cb-doc 独立滚动让位) */
 body.cb-tree-mode .cb-pane {
+  display: flex;
+  flex-direction: column;
   overflow-y: auto;
   min-width: 0;
   min-height: 0;
@@ -1121,4 +1123,70 @@ body.cb-tree-mode .cb-tree {
 body.cb-tree-mode {
   margin: 0;
   padding: 0;
+}
+
+/* ---------- HTML 预览 (服务端 fragment + sandboxed iframe) ----------
+ * 原生页面由浏览器渲染, iframe 填满预览面板或树内容区, 内部自行滚动.
+ * sandbox 只由服务端 raw CSP 与 iframe 属性提供 (均仅 allow-scripts),
+ * 这里的布局规则不参与任何安全判定. */
+.cb-html-preview {
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+}
+.cb-html-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background-color: var(--cb-bg);
+}
+/* 去掉面板内边距, 让页面占满可用区域 (仅 HTML 预览) */
+.cb-preview-content:has(> .cb-fragment > .cb-html-preview) {
+  padding: 0;
+}
+/* 高度链路: 面板 flex 项 / 树 grid 项 -> fragment wrapper -> .cb-doc -> iframe */
+.cb-preview-content > .cb-fragment:has(> .cb-html-preview),
+.cb-pane > .cb-fragment:has(> .cb-html-preview) {
+  height: 100%;
+}
+
+/* 树内容区工具栏: 只承载 HTML 文件的 页面/源码 切换; 其余内容保持 hidden.
+ * 工具栏与内容同为 .cb-pane 的 flex 子项, HTML wrapper 占满剩余高度, 非 HTML
+ * wrapper 保持自然高度并由 .cb-pane 滚动. */
+.cb-pane-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex: none;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.75rem;
+  border-bottom: 1px solid var(--cb-border);
+  background-color: var(--cb-soft);
+}
+.cb-pane-toolbar[hidden] {
+  display: none;
+}
+.cb-pane-toolbar button {
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--cb-border);
+  border-radius: 4px;
+  background-color: var(--cb-bg);
+  color: var(--cb-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.cb-pane-toolbar button:hover {
+  background-color: var(--cb-hover);
+}
+body.cb-tree-mode .cb-pane > .cb-fragment {
+  flex: 0 0 auto;
+}
+body.cb-tree-mode .cb-pane > .cb-fragment:has(> .cb-html-preview) {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
 }
