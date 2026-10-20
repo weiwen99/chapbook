@@ -68,17 +68,19 @@ Windows 使用系统安全随机源和默认应用接口，
 Windows URL 路径拒绝盘符、反斜杠、UNC/设备路径（包括正斜杠编码形式）及 NTFS ADS。
 v0.4.3 已发布资产仅覆盖 Linux/macOS，Windows CLI 和可选图形启动器需自行构建。
 
-构建需要 Rust GNU 工具链与 MinGW-w64 GCC（x86_64、SEH、MSVCRT；例如
-[mingw-builds](https://github.com/niXman/mingw-builds-binaries/releases) 的 `x86_64-…-posix-seh-msvcrt-…` 包）。
-QuickJS 使用 GNU C 扩展，不能仅安装 Visual Studio/MSVC 后直接构建。
+构建需要 Rust GNU 工具链、MinGW-w64 GCC（x86_64、SEH、MSVCRT；例如
+[mingw-builds](https://github.com/niXman/mingw-builds-binaries/releases) 的 `x86_64-…-posix-seh-msvcrt-…` 包）
+与 GNU `patch`（可使用 Git for Windows 附带的 `usr\bin\patch.exe`，本机验证版本为 2.7.6）。
+QuickJS 在构建期调用 `patch` 应用补丁，并使用 GNU C 扩展；不能仅安装 Visual Studio/MSVC 后直接构建。
+CI 显式安装 MSYS2 的 `patch`，避免误用 runner 中会崩溃的 Strawberry Perl 版本；这些工具都不是运行时依赖。
 
 先安装 Rust GNU 工具链，并将上述 MinGW-w64 包解压到自选位置。
 下面以 `%LOCALAPPDATA%\chapbook-tools\mingw64` 为示例安装目录；请按实际位置调整路径。
 在项目目录打开 PowerShell：
 
 ```powershell
-# 仅设置当前 PowerShell 会话；其他安装位置请相应调整 MinGW 路径
-$env:Path = "$env:USERPROFILE\.cargo\bin;$env:LOCALAPPDATA\chapbook-tools\mingw64\bin;$env:Path"
+# 仅设置当前 PowerShell 会话；其他安装位置请相应调整 MinGW/Git 路径
+$env:Path = "$env:USERPROFILE\.cargo\bin;$env:LOCALAPPDATA\chapbook-tools\mingw64\bin;$env:ProgramFiles\Git\usr\bin;$env:Path"
 # 首次安装 GNU 工具链
 rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
 cargo +stable-x86_64-pc-windows-gnu build --release --locked

@@ -45,7 +45,13 @@ jobs:
         msystem: MINGW64
         path-type: inherit
         update: true
-        install: mingw-w64-x86_64-gcc
+        install: >-
+          mingw-w64-x86_64-gcc
+          patch
+    - name: Verify QuickJS patch tool
+      run: |
+        where.exe patch
+        patch --version
     - name: Build default CLI without launcher
       run: cargo build --locked --bins --target x86_64-pc-windows-gnu
     - name: Test Windows routes and optional launcher

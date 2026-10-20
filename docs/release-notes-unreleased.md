@@ -7,6 +7,7 @@
 - Windows 路径除盘符、反斜杠与 NTFS ADS 外，还拒绝解析后的 UNC/设备前缀，包括正斜杠和 `%2F` 形式。
 - 恢复 Unix 星号文件名的 RFC 8187 下载覆盖，Windows 使用可创建的单引号 fixture。
 - 增加 Windows GNU/MinGW-w64 CI，执行 Windows 专属路由与可选启动器测试。
+- Windows CI 显式安装 MSYS2 GNU `patch`，避免误用 runner 的 Strawberry Perl 版本导致 QuickJS 构建崩溃；构建前记录实际使用的路径与版本，Windows 构建说明同步补齐该依赖。
 
 ## Windows 可选图形启动器
 
