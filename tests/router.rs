@@ -312,33 +312,351 @@ async fn oversized_code_file_not_rendered() {
     assert_eq!(body_string(res).await, big);
 }
 
-/// 未知扩展名维持裸文本现状.
+/// 未知扩展名的严格 UTF-8 文本: fragment 与完整页都按纯文本阅读视图渲染.
 #[tokio::test]
-async fn unknown_extension_stays_raw() {
+async fn unknown_extension_text_previews_as_plain_text() {
     let dir = fixture();
-    std::fs::write(dir.path().join("data.xyz123"), "hello").unwrap();
-    let res = get_with_accept(app(dir.path()), "/data.xyz123", "text/html").await;
+    std::fs::write(dir.path().join("LICENSE"), "line one\nline two\n").unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
+    std::fs::write(dir.path().join("data.xyz123"), "hello\n").unwrap();
+
+    for file in ["LICENSE", ".gitignore", "data.xyz123"] {
+        let res =
+            get_with_accept(app(dir.path()), &format!("/{file}?fragment=1"), "text/html").await;
+        assert_eq!(res.status(), StatusCode::OK, "{file}");
+        assert!(is_strict_html_fragment(&res), "{file}");
+        let body = body_string(res).await;
+        assert!(
+            body.contains(r#"<pre class="sourceCode"><code>"#),
+            "{file}: {body}"
+        );
+        assert!(
+            body.contains(r#"<span class="ln">1</span>"#),
+            "{file}: {body}"
+        );
+        assert!(!body.contains("不支持预览"), "{file}: {body}");
+    }
+
+    // 完整页: 浏览器 Accept -> 纯文本阅读页; 脚本 Accept -> 原文.
+    let res = get_with_accept(app(dir.path()), "/LICENSE", "text/html").await;
     assert_eq!(res.status(), StatusCode::OK);
-    assert_ne!(content_type(&res), "text/html; charset=utf-8");
-    assert_eq!(body_string(res).await, "hello");
+    assert_eq!(content_type(&res), "text/html; charset=utf-8");
+    assert_eq!(res.headers().get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+    let body = body_string(res).await;
+    assert!(body.contains("<title>LICENSE</title>"), "{body}");
+    assert!(body.contains("line one"), "{body}");
+
+    let res = get_with_accept(app(dir.path()), "/LICENSE", "*/*").await;
+    assert_eq!(content_type(&res), "application/octet-stream");
+    assert_eq!(body_string(res).await, "line one\nline two\n");
+
+    // ?view=1 强制渲染; ?raw=1 即使浏览器 Accept 也返回原文.
+    let res = get_with_accept(app(dir.path()), "/LICENSE?view=1", "*/*").await;
+    assert_eq!(content_type(&res), "text/html; charset=utf-8");
+    let res = get_with_accept(app(dir.path()), "/LICENSE?raw=1", "text/html").await;
+    assert_eq!(content_type(&res), "application/octet-stream");
+    assert_eq!(body_string(res).await, "line one\nline two\n");
+
+    // download: attachment + 原字节.
+    let res = get_with_accept(app(dir.path()), "/LICENSE?download=1", "text/html").await;
+    assert!(res.headers().get(header::CONTENT_DISPOSITION).is_some());
+    assert_eq!(body_string(res).await, "line one\nline two\n");
 }
 
-/// .html 是网页不是代码: 即使浏览器 Accept 也直接透传原文 (text/html), 让浏览器渲染网页.
+/// 非 UTF-8 / 含 NUL / 超限 / .pdf: 维持占位与原字节, PDF 不落入文本兜底.
+#[tokio::test]
+async fn unknown_extension_non_text_stays_placeholder_and_raw() {
+    let dir = fixture();
+    let invalid: &[u8] = b"\xff\xfe\x00";
+    std::fs::write(dir.path().join("legacy.xyz"), invalid).unwrap();
+    std::fs::write(dir.path().join("nul.dat"), b"abc\0def").unwrap();
+    std::fs::write(dir.path().join("ascii.pdf"), "plain ascii pdf").unwrap();
+    let big = "x".repeat(1024 * 1024 + 1);
+    std::fs::write(dir.path().join("big.dat"), &big).unwrap();
+
+    for file in ["legacy.xyz", "nul.dat", "ascii.pdf", "big.dat"] {
+        let res =
+            get_with_accept(app(dir.path()), &format!("/{file}?fragment=1"), "text/html").await;
+        assert_eq!(res.status(), StatusCode::OK, "{file}");
+        assert!(is_strict_html_fragment(&res), "{file}");
+        let body = body_string(res).await;
+        assert!(
+            body.contains("无法预览：不支持预览此文件类型"),
+            "{file}: {body}"
+        );
+        assert!(!body.contains("sourceCode"), "{file}: {body}");
+    }
+
+    // 完整页 PDF 仍按原 MIME 透传, 不渲染 HTML.
+    let res = get_with_accept(app(dir.path()), "/ascii.pdf", "text/html").await;
+    assert_eq!(content_type(&res), "application/pdf");
+    assert_eq!(body_string(res).await, "plain ascii pdf");
+
+    // 非 UTF-8 未知文件: 不渲染, 原字节逐字节不变 (MIME 由 mime_guess 决定).
+    let res = get_with_accept(app(dir.path()), "/legacy.xyz", "text/html").await;
+    assert_ne!(content_type(&res), "text/html; charset=utf-8");
+    assert_eq!(
+        to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        invalid
+    );
+}
+
+/// 纯文本兜底必须转义内容: 未知扩展名里的标签/实体不成为可执行标记.
+#[tokio::test]
+async fn unknown_extension_text_is_escaped() {
+    let dir = fixture();
+    let payload = "<script>alert(1)</script> & <b>bold</b>";
+    std::fs::write(dir.path().join("evil.xyz"), payload).unwrap();
+
+    for uri in ["/evil.xyz?fragment=1", "/evil.xyz?view=1"] {
+        let res = get_with_accept(app(dir.path()), uri, "text/html").await;
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        let body = body_string(res).await;
+        assert!(!body.contains("<script>alert(1)</script>"), "{uri}: {body}");
+        assert!(
+            body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{uri}: {body}"
+        );
+        assert!(body.contains("&amp;"), "{uri}: {body}");
+    }
+}
+
+/// HEAD 与 GET 同样协商: 未知文本 HEAD 的 Content-Type 是 text/html, body 为空.
+#[tokio::test]
+async fn unknown_extension_head_matches_get_content_type() {
+    let dir = fixture();
+    std::fs::write(dir.path().join("LICENSE"), "hello\n").unwrap();
+
+    let head = app(dir.path())
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/LICENSE")
+                .header(header::ACCEPT, "text/html")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(content_type(&head), "text/html; charset=utf-8");
+    assert_eq!(
+        to_bytes(head.into_body(), usize::MAX).await.unwrap().len(),
+        0
+    );
+}
+
+/// .html 是网页不是代码: 默认 / ?view=1 / ?raw=1 都直接透传原文 (text/html),
+/// 让浏览器渲染网页, 且 raw 出口的 sandbox 不因预览功能改变.
 #[tokio::test]
 async fn html_files_render_natively() {
     let dir = fixture();
     let page = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><h1>网页</h1></body></html>";
     std::fs::write(dir.path().join("page.html"), page).unwrap();
 
-    let res = get_with_accept(app(dir.path()), "/page.html", "text/html").await;
+    for uri in ["/page.html", "/page.html?view=1", "/page.html?raw=1"] {
+        let res = get_with_accept(app(dir.path()), uri, "text/html").await;
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        assert_eq!(content_type(&res), "text/html; charset=utf-8", "{uri}");
+        assert_eq!(
+            res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "sandbox allow-scripts",
+            "{uri}"
+        );
+        let body = body_string(res).await;
+        assert_eq!(
+            body, page,
+            "{uri}: html file must be served verbatim, not highlighted"
+        );
+        assert!(!body.contains("sourceCode"), "{uri}: body: {body}");
+    }
+
+    // download 仍是原文 + attachment; sandbox 不因附件语义移除.
+    let res = get_with_accept(app(dir.path()), "/page.html?download=1", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers().contains_key(header::CONTENT_DISPOSITION));
+    assert_eq!(
+        res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+        "sandbox allow-scripts"
+    );
+    assert_eq!(body_string(res).await, page);
+}
+
+/// HTML 预览 fragment: 不含原始文件字节, 只输出 CB 生成的 `.cb-doc` +
+/// iframe; src 指向 exact raw URL, iframe 与服务端 CSP 两层 sandbox 均只允许
+/// scripts (绝不 allow-same-origin). `.html` / `.htm` 扩展名 ASCII 大小写不敏感.
+#[tokio::test]
+async fn html_fragment_embeds_sandboxed_iframe() {
+    let dir = fixture();
+    let page = "<!DOCTYPE html><html><body><h1>网页</h1><script>window.x=1</script></body></html>";
+    std::fs::write(dir.path().join("page.html"), page).unwrap();
+    std::fs::write(dir.path().join("legacy.HTM"), page).unwrap();
+
+    for (uri, src) in [
+        ("/page.html?fragment=1", "page.html"),
+        ("/legacy.HTM?fragment=1", "legacy.HTM"),
+    ] {
+        let res = get_with_accept(app(dir.path()), uri, "text/html").await;
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        assert!(
+            is_strict_html_fragment(&res),
+            "{uri}: {}",
+            content_type(&res)
+        );
+        let body = body_string(res).await;
+        assert!(
+            body.contains(r#"class="cb-doc cb-html-preview""#),
+            "{uri}: {body}"
+        );
+        assert!(body.contains(&format!(r#"src="/{src}""#)), "{uri}: {body}");
+        assert!(body.contains(r#"sandbox="allow-scripts""#), "{uri}: {body}");
+        assert!(!body.contains("allow-same-origin"), "{uri}: {body}");
+        assert!(!body.contains("<!DOCTYPE"), "{uri}: {body}");
+        assert!(!body.contains("<h1>网页</h1>"), "{uri}: raw bytes leaked");
+        assert!(
+            body.contains(r#"data-cb-surface="reading""#),
+            "{uri}: {body}"
+        );
+        assert!(
+            body.contains(&format!(r#"data-native-path-encoded="{src}""#)),
+            "{uri}: {body}"
+        );
+    }
+}
+
+/// 目录名 `folder.html` 不是 HTML 文件: 目录 fragment 仍是目录迷你列表,
+/// 不能因末尾扩展名误判成 iframe 预览 (source=1 同样忽略).
+#[tokio::test]
+async fn html_suffixed_directory_is_not_html_fragment() {
+    let dir = fixture();
+    std::fs::create_dir(dir.path().join("folder.html")).unwrap();
+    std::fs::write(dir.path().join("folder.html/inner.txt"), "x").unwrap();
+
+    for uri in [
+        "/folder.html?fragment=1",
+        "/folder.html?fragment=1&source=1",
+    ] {
+        let res = get(app(dir.path()), uri).await;
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        assert!(is_strict_html_fragment(&res), "{}", content_type(&res));
+        let body = body_string(res).await;
+        assert!(body.contains("cb-dir-fragment"), "{uri}: {body}");
+        assert!(!body.contains("cb-html-preview"), "{uri}: {body}");
+    }
+}
+
+/// HTML 源码视图: 显式 source=1 的 fragment 复用代码管线 (syntect + 行号),
+/// 输出转义源码而不是 iframe; 大小写不敏感.
+#[tokio::test]
+async fn html_source_fragment_highlights_code() {
+    let dir = fixture();
+    let page = "<!DOCTYPE html>\n<html>\n<body><h1>网页</h1></body>\n</html>\n";
+    std::fs::write(dir.path().join("page.html"), page).unwrap();
+    std::fs::write(dir.path().join("legacy.HTM"), page).unwrap();
+
+    for (uri, src) in [
+        ("/page.html?fragment=1&source=1", "page.html"),
+        ("/legacy.HTM?fragment=1&source=1", "legacy.HTM"),
+    ] {
+        let res = get_with_accept(app(dir.path()), uri, "text/html").await;
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        assert!(
+            is_strict_html_fragment(&res),
+            "{uri}: {}",
+            content_type(&res)
+        );
+        let body = body_string(res).await;
+        assert!(
+            body.contains(r#"<pre class="sourceCode"><code>"#),
+            "{uri}: {body}"
+        );
+        assert!(
+            body.contains(r#"<span class="ln">1</span>"#),
+            "{uri}: {body}"
+        );
+        assert!(body.contains("entity name tag"), "{uri}: {body}");
+        assert!(body.contains("&lt;"), "{uri}: {body}");
+        assert!(!body.contains("<h1>"), "{uri}: raw html leaked");
+        assert!(!body.contains("cb-html-frame"), "{uri}: {body}");
+        assert!(
+            body.contains(&format!(r#"data-native-path-encoded="{src}""#)),
+            "{uri}: {body}"
+        );
+    }
+}
+
+/// source 只是 fragment 修饰符, 且只对 .html/.htm 生效:
+/// 单独 source=1 仍返回原页面; .md 的 fragment 仍是 Markdown 渲染.
+#[tokio::test]
+async fn html_source_flag_is_fragment_only_and_html_only() {
+    let dir = fixture();
+    let page = "<!DOCTYPE html><html><body><h1>网页</h1></body></html>";
+    std::fs::write(dir.path().join("page.html"), page).unwrap();
+    std::fs::write(dir.path().join("doc.md"), "# Title\n\n**bold**\n").unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/page.html?source=1", "text/html").await;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(content_type(&res), "text/html; charset=utf-8");
+    assert_eq!(body_string(res).await, page);
+
+    let res = get_with_accept(app(dir.path()), "/doc.md?fragment=1&source=1", "text/html").await;
+    assert_eq!(res.status(), StatusCode::OK);
     let body = body_string(res).await;
-    assert_eq!(
-        body, page,
-        "html file must be served verbatim, not highlighted"
-    );
-    assert!(!body.contains("sourceCode"), "body: {body}");
+    assert!(body.contains("<strong>bold</strong>"), "{body}");
+    assert!(!body.contains("sourceCode"), "{body}");
+}
+
+/// 源码视图与代码文件同一大小/编码上限: 页面预览仍走 iframe (不读取内容),
+/// 源码超限或非 UTF-8 时返回占位 fragment, 绝不回退裸字节.
+#[tokio::test]
+async fn html_source_uses_code_limits_and_strict_utf8() {
+    let dir = fixture();
+    let mut big = String::from("<!DOCTYPE html><html><body>");
+    big.push_str(&"x".repeat(1024 * 1024 + 1));
+    big.push_str("</body></html>");
+    std::fs::write(dir.path().join("big.html"), big).unwrap();
+    std::fs::write(dir.path().join("gbk.html"), [b'<', 0xff, b'>']).unwrap();
+
+    let res = get_with_accept(app(dir.path()), "/big.html?fragment=1", "text/html").await;
+    let body = body_string(res).await;
+    assert!(body.contains("cb-html-frame"), "{body}");
+
+    let res = get_with_accept(
+        app(dir.path()),
+        "/big.html?fragment=1&source=1",
+        "text/html",
+    )
+    .await;
+    let body = body_string(res).await;
+    assert!(body.contains("文件过大"), "{body}");
+    assert!(!body.contains("cb-html-frame"), "{body}");
+    assert!(!body.contains(&"x".repeat(1000)), "{body}");
+
+    let res = get_with_accept(
+        app(dir.path()),
+        "/gbk.html?fragment=1&source=1",
+        "text/html",
+    )
+    .await;
+    let body = body_string(res).await;
+    assert!(body.contains("不是有效的 UTF-8"), "{body}");
+    assert!(!body.contains("cb-html-frame"), "{body}");
+}
+
+/// 预览工具栏的源码切换按钮由服务端渲染为 hidden, 只由 JS 对 HTML 文件启用.
+#[tokio::test]
+async fn panel_renders_hidden_html_source_toggle() {
+    let dir = fixture();
+    let res = get(app(dir.path()), "/").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    let tags = tags_containing(&body, r#"data-cb-action="source""#);
+    assert_eq!(tags.len(), 1, "{body}");
+    assert!(tags[0].contains("hidden"), "{}", tags[0]);
+    assert!(tags[0].contains(r#"aria-pressed="false""#), "{}", tags[0]);
 }
 
 #[cfg(unix)]
@@ -1938,7 +2256,8 @@ async fn fragment_failures_are_placeholders_without_raw_bytes() {
     std::fs::write(dir.path().join("legacy.md"), b"# \xd6\xd0\xce\xc4\n").unwrap();
     let garbage = b"this is not a docx at all, just some bytes that look like a word file";
     std::fs::write(dir.path().join("broken.docx"), garbage).unwrap();
-    std::fs::write(dir.path().join("data.xyz123"), "hello").unwrap();
+    // 含 NUL 的未知扩展名仍是不可预览类型 (未知文本由纯文本兜底渲染).
+    std::fs::write(dir.path().join("data.xyz123"), b"hello\0world").unwrap();
 
     for uri in [
         "/big.rs?fragment=1",
@@ -3471,7 +3790,7 @@ async fn search_form_submits_effective_fields() {
 #[tokio::test]
 async fn non_previewable_fragment_marks_placeholder_state() {
     let dir = fixture();
-    std::fs::write(dir.path().join("data.xyz123"), "hello").unwrap();
+    std::fs::write(dir.path().join("data.xyz123"), b"hello\0world").unwrap();
     std::fs::write(dir.path().join("big.rs"), "x".repeat(1024 * 1024 + 1)).unwrap();
     let router = app(dir.path());
 

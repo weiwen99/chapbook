@@ -518,6 +518,10 @@ fn page_shell(shell: PageShell) -> Markup {
                     div.cb-preview-toolbar {
                         span.cb-preview-title id="cb-preview-title" { bdi dir="auto" {} }
                         span.cb-preview-actions {
+                            // HTML 文件专用: JS 在 target 确认为 .html/.htm 时显示,
+                            // 文案在 页面/源码 之间切换; 无 JS 时保持 hidden.
+                            button type="button" data-cb-action="source"
+                                title="查看源码" aria-pressed="false" hidden { "源码" }
                             button type="button" data-cb-action="full" title="当前 tab 打开" { "打开" }
                             button type="button" data-cb-action="new" title="新 tab 打开" { "新标签" }
                             button type="button" data-cb-action="download" title="下载" { "下载" }

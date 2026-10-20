@@ -20,7 +20,8 @@ use syntect::util::LinesWithEndings;
 pub const MAX_RENDER_BYTES: u64 = 1024 * 1024;
 
 /// 扩展名 -> 高亮 token. 未识别的扩展名维持裸文本现状.
-/// 注意: html/htm 不在此映射 — 网页文件应直接交给浏览器渲染, 而不是显示源码.
+/// 注意: html/htm 不在此映射 — 网页文件默认直接交给浏览器渲染, 而不是显示源码;
+/// 预览面板的 HTML 源码视图显式使用 "html" token (见 routes::serve_path 的 source=1).
 pub fn language_for_path(path: &Path) -> Option<&'static str> {
     // 无扩展名文件按文件名匹配 (常见构建/容器文件)
     let file_name = path.file_name()?.to_str()?;
@@ -28,6 +29,10 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
         "Dockerfile" | "Containerfile" => return Some("dockerfile"),
         "Makefile" | "GNUmakefile" | "makefile" => return Some("makefile"),
         _ => {}
+    }
+    // dotenv 配置: `.env` / `.env.local` / `.env.example` 等文件名没有可用扩展名
+    if file_name == ".env" || file_name.starts_with(".env.") {
+        return Some("Plain Text");
     }
     let ext = path.extension()?.to_str()?;
     Some(match ext.to_ascii_lowercase().as_str() {
@@ -70,9 +75,9 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
         "r" => "r",
         "tex" | "ltx" => "latex",
         "diff" | "patch" => "diff",
-        // txt/log 用 syntect 的 Plain Text 语法 (按名称匹配): 无 token 高亮,
+        // txt/log/env 用 syntect 的 Plain Text 语法 (按名称匹配): 无 token 高亮,
         // 内容转义显示, 行号照常输出 — 浏览器可读且保持代码页结构
-        "txt" | "log" => "Plain Text",
+        "txt" | "log" | "env" => "Plain Text",
         _ => return None,
     })
 }
@@ -250,6 +255,24 @@ mod tests {
             Some("Plain Text")
         );
         assert_eq!(language_for_path(Path::new("a.LOG")), Some("Plain Text"));
+    }
+
+    /// dotenv 配置按纯文本预览: 扩展名 `.env` 与 `.env` / `.env.*` 文件名.
+    #[test]
+    fn language_for_path_maps_dotenv_to_plain_text() {
+        assert_eq!(language_for_path(Path::new("xyz.env")), Some("Plain Text"));
+        assert_eq!(language_for_path(Path::new("xyz.ENV")), Some("Plain Text"));
+        assert_eq!(language_for_path(Path::new(".env")), Some("Plain Text"));
+        assert_eq!(
+            language_for_path(Path::new(".env.local")),
+            Some("Plain Text")
+        );
+        assert_eq!(
+            language_for_path(Path::new(".env.example")),
+            Some("Plain Text")
+        );
+        // 只是以 ".env" 开头的普通名字不受影响
+        assert_eq!(language_for_path(Path::new(".environment")), None);
     }
 
     /// 既有映射全部保留; 未知扩展名维持 None.

@@ -148,6 +148,19 @@
     return kind === 'file' && /\.pdf$/i.test(encodedPath);
   }
 
+  // HTML 文件判定: kind 必须为 'file' 且编码后缀为 .html/.htm
+  // (目录名 folder.html 不得显示源码切换; 后缀不匹配不误判).
+  function isHtmlFile(encodedPath, kind) {
+    return kind === 'file' && /\.html?$/i.test(encodedPath);
+  }
+
+  // 树行新 tab 裁决 (DOM 无关 seam): 与列表/网格文件名 anchor 的浏览器语义一致 —
+  // ⌘/Ctrl/Shift + 主键点击在树节点上打开新 tab; 普通点击仍是 content 导航.
+  // Alt 不参与 (浏览器 Alt+click 的下载语义不适用于树行).
+  function treeRowOpensNewTab(event) {
+    return !!(event && (event.metaKey || event.ctrlKey || event.shiftKey));
+  }
+
   // 选择后的 panel target 决策 (DOM 无关 seam): 选中非 actionable 条目
   // (selectedEncoded === null) 必须立即清空旧 target, 绝不复用 stale target;
   // actionable 选择保持现有 panel target (只有预览安装 target)。
@@ -1360,6 +1373,7 @@
   /* ---------- 预览面板 (list/grid) ---------- */
 
   let panelTarget = null; // 合法 encodedPath 或 null (fail-closed)
+  let panelSource = false; // 当前面板显示 HTML 源码 (false = 原生页面)
   let panelCommittedKey = null; // 最近成功安装的内容键 (含上下文与规则)
   const previewGuard = createGenerationGuard();
 
@@ -1404,6 +1418,7 @@
   function clearPanelTarget() {
     panelTarget = null;
     setActionsEnabled(false);
+    updatePanelSourceToggle();
   }
 
   function installPanelTarget(encodedPath) {
@@ -1413,6 +1428,31 @@
     }
     panelTarget = encodedPath;
     setActionsEnabled(true);
+    updatePanelSourceToggle();
+  }
+
+  // 源码切换按钮: 只对 HTML 文件目标显示; 目录名 *.html 由 openedKind 排除.
+  // 按钮默认由服务端 hidden, 无 JS 时永不出现.
+  function updatePanelSourceToggle() {
+    const btn = $(PANEL_SELECTOR + ' [data-cb-action="source"]');
+    if (!btn) return;
+    const visible =
+      panelTarget !== null &&
+      state.openedKind !== 'directory' &&
+      isHtmlFile(panelTarget, 'file');
+    btn.hidden = !visible;
+    if (!visible) return;
+    btn.textContent = panelSource ? '页面' : '源码';
+    btn.title = panelSource ? '查看页面' : '查看源码';
+    btn.setAttribute('aria-pressed', panelSource ? 'true' : 'false');
+  }
+
+  // 切换 HTML 页面/源码: 同一 target、同一 reading surface, 只换 fragment 内容.
+  // 强制重取 (内容键含 source), 不新增历史项; 关闭面板/换文件回到页面.
+  function togglePanelSource() {
+    if (panelTarget === null || state.openedKind === 'directory') return;
+    if (!isHtmlFile(panelTarget, 'file')) return;
+    openPreview(panelTarget, 'file', { force: true, source: !panelSource });
   }
 
   // 预览标题纯文本 (错误/清空): textContent, 绝不注入 HTML.
@@ -1450,6 +1490,7 @@
     const el = panel();
     if (el) el.hidden = true;
     document.body.classList.remove('cb-panel-open');
+    panelSource = false;
     clearPanelTarget();
     panelCommittedKey = null;
     setPanelTitleText('');
@@ -1530,6 +1571,8 @@
   function openPreview(encodedPath, kind, opts) {
     if (!isValidEncodedPath(encodedPath) || encodedPath === '') return; // fail-closed
     const silent = !!(opts && opts.silent);
+    const source = !!(opts && opts.source);
+    // panelSource 只在成功安装后更新: 请求失败时旧内容的页面/源码标签保持真实.
     // PDF: 面板承载不了原生查看器 — 用户操作时新 tab 打开并返回; 恢复不触发.
     if (isPdfFile(encodedPath, kind)) {
       if (!silent) {
@@ -1539,7 +1582,9 @@
     }
     // 预览内容键: 目录预览随显示规则失效, 文档正文与规则无关 (绝不重转换).
     const requestedKind = kind === 'file' ? 'reading' : 'directory';
-    const key = contentKey(requestedKind, encodedPath, null);
+    // 源码与页面是同一 reading identity 的两个内容键 (不互相复用缓存).
+    const key =
+      contentKey(requestedKind, encodedPath, null) + (source ? '|source' : '');
     const sort = state.rules.sort;
     const hidden = state.rules.hidden ? '1' : '0';
     const gen = previewGuard.begin(); // 新请求作废所有在途请求
@@ -1551,10 +1596,14 @@
       // 内容未变 (同 identity 同规则): 不重取, 仅恢复 target/打开条目.
       installPanelTarget(encodedPath);
       state.opened = encodedPath;
+      state.openedKind = requestedKind;
+      panelSource = source;
+      updatePanelSourceToggle();
       replaceCurrentEntry();
       return;
     }
     const url = browseActionUrl(encodedPath, 'fragment');
+    if (source) url.searchParams.set('source', '1');
     fetch(url, { headers: { Accept: 'text/html' } })
       .then(function (res) {
         if (!previewGuard.isCurrent(gen)) return null; // 过期响应: 丢弃
@@ -1586,6 +1635,8 @@
         // 打开条目 identity: 只接受与服务端 wrapper 一致的合法目标.
         state.opened = identity;
         state.openedKind = surface === 'directory' ? 'directory' : surface === 'reading' ? 'reading' : null;
+        panelSource = source;
+        updatePanelSourceToggle();
         replaceCurrentEntry();
         if (panelTarget !== null) {
           setDownloadEnabled(surface !== 'directory');
@@ -1655,6 +1706,8 @@
       location.href = browseActionUrl(target, 'full').href;
     } else if (action === 'new') {
       window.open(browseActionUrl(target, 'full').href, '_blank', 'noopener');
+    } else if (action === 'source') {
+      togglePanelSource();
     } else if (action === 'download') {
       location.href = browseActionUrl(target, 'download').href;
     } else if (action === 'native') {
@@ -2876,6 +2929,8 @@
   // fragment 替换为统一 fragment 视图 (目录/搜索/文档). 树内导航全部 SPA:
   // fragment 注入 + history 快照; URL 恒为含有效规则的浏览上下文 URL.
   let pane = null;
+  let paneToolbar = null; // 内容区工具栏 (仅 HTML 文件显示源码切换)
+  let paneSource = false; // 内容区当前显示 HTML 源码 (false = 原生页面)
   let paneAbort = null; // 在途 fragment fetch 的 AbortController
   let paneCommittedKey = null; // 最近一致且成功安装的内容键 (占位/失败不记)
   let paneCommittedTarget = null; // 最近提交的目标 {kind,path,query}
@@ -2920,13 +2975,26 @@
     if (pane) return pane;
     const host = paneHostForPage();
     if (!host) return null;
+    paneSource = false;
     const wrap = document.createElement('div');
     wrap.className = 'cb-pane';
     wrap.setAttribute('role', 'region');
     wrap.setAttribute('aria-label', '内容区');
     wrap.setAttribute('data-cb-pane-state', 'loading');
+    // 内容区工具栏: 默认 hidden; 只有当前内容为 HTML 文件时由
+    // updatePaneSourceToggle 显示 (目录/非 HTML 文档不出现).
+    paneToolbar = document.createElement('div');
+    paneToolbar.className = 'cb-pane-toolbar';
+    paneToolbar.hidden = true;
+    const sourceBtn = document.createElement('button');
+    sourceBtn.type = 'button';
+    sourceBtn.setAttribute('data-cb-pane-source', '');
+    sourceBtn.textContent = '源码';
+    sourceBtn.title = '查看源码';
+    sourceBtn.setAttribute('aria-pressed', 'false');
+    paneToolbar.append(sourceBtn);
     host.before(wrap);
-    wrap.append(host);
+    wrap.append(paneToolbar, host);
     pane = wrap;
     return wrap;
   }
@@ -2950,14 +3018,21 @@
       errEl = document.createElement('div');
       errEl.className = 'cb-pane-error';
       errEl.setAttribute('role', 'alert');
-      pane.prepend(errEl);
+      if (paneToolbar && paneToolbar.parentNode === pane) paneToolbar.after(errEl);
+      else pane.prepend(errEl);
     }
     errEl.textContent = message;
   }
 
-  // 当前版本的目标键 (目录/搜索含显示规则; 文档正文不含).
+  // 当前版本的目标键 (目录/搜索含显示规则; 文档正文不含; HTML 源码是
+  // 同一 reading identity 的第二个内容键, 不与页面预览互相复用缓存).
   function paneTargetKey(target) {
-    return contentKey(target.kind, target.kind === 'search' ? '' : target.path, target.query);
+    const key = contentKey(
+      target.kind,
+      target.kind === 'search' ? '' : target.path,
+      target.query
+    );
+    return target.kind === 'reading' && target.source === true ? key + '|source' : key;
   }
 
   function paneFragmentUrl(kind, target) {
@@ -2985,7 +3060,9 @@
         location.origin
       );
     }
-    return browseActionUrl(target.path, 'fragment');
+    const url = browseActionUrl(target.path, 'fragment');
+    if (target.source === true) url.searchParams.set('source', '1');
+    return url;
   }
 
   function paneTargetPathname() {
@@ -3016,7 +3093,12 @@
     // 目录/搜索: 合法 encoded path ('' = 服务根, 是合法浏览目标); 文档: 必须非空.
     if (!isValidEncodedPath(target.path)) return null;
     if (kind === 'reading' && target.path === '') return null;
-    const key = paneTargetKey({ kind: kind, path: target.path, query: target.query });
+    const key = paneTargetKey({
+      kind: kind,
+      path: target.path,
+      query: target.query,
+      source: target.source === true,
+    });
     const gen = paneNavGuard.begin(); // 新导航作废所有在途导航
     if (paneAbort) paneAbort.abort();
     const ac = new AbortController();
@@ -3025,7 +3107,8 @@
       paneCommittedKey === key &&
       paneCommittedTarget !== null &&
       paneCommittedTarget.kind === kind &&
-      paneCommittedTarget.path === target.path;
+      paneCommittedTarget.path === target.path &&
+      (paneCommittedTarget.source === true) === (target.source === true);
     if (sameCommitted) {
       // 一致且成功安装: 不重取; 真实导航只补写 URL/快照 (hash 导航等).
       paneClearError();
@@ -3103,7 +3186,9 @@
     }
     teardownPane(); // 旧 observer 拆除 + 媒体卸载
     paneClearError();
-    pane.replaceChildren(wrapper); // 移动解析出的 wrapper (替换全部旧内容)
+    // 工具栏是跨导航持久的壳控件; wrapper 是内容. 一起替换, 避免工具栏被移除.
+    if (paneToolbar) pane.replaceChildren(paneToolbar, wrapper);
+    else pane.replaceChildren(wrapper);
     const titleEl = wrapper.querySelector('.cb-frag-title');
     if (titleEl && titleEl.textContent) {
       document.title = titleEl.textContent.trim();
@@ -3117,17 +3202,52 @@
     renderMermaidIn(wrapper); // 内容区 fragment 内的 mermaid 容器
     // 请求目标与成功安装内容分开记录: 占位/忙内容不记为可跳过重取的成功.
     const placeholder = wrapperIsPlaceholder(wrapper);
-    paneCommittedTarget = { kind: kind, path: target.path, query: target.query };
+    paneCommittedTarget = {
+      kind: kind,
+      path: target.path,
+      query: target.query,
+      source: target.source === true,
+    };
     paneCommittedKey = placeholder ? null : paneTargetKey(paneCommittedTarget);
     paneSetState('ready');
     state.kind = kind;
     state.path = kind === 'search' ? '' : target.path;
     state.q = kind === 'search' ? target.query || '' : null;
+    paneSource = target.source === true;
+    updatePaneSourceToggle();
     // 同上下文刷新由树根恢复展开/选中; 不另开树代次抢走在途分支提交权.
     if (target.history === 'push') {
       pushPaneUrl();
       syncTreeToState(true); // 只有实际导航让选中跟随新的内容路径
     }
+  }
+
+  // 内容区源码切换: 只对树视图中的 HTML 文件显示. 与侧边预览面板互相独立,
+  // 是 transient 视图: 不写 URL/历史快照, 换文件或后退回到页面.
+  function updatePaneSourceToggle() {
+    if (!paneToolbar) return;
+    const btn = paneToolbar.querySelector('[data-cb-pane-source]');
+    if (!btn) return;
+    const visible =
+      treeShell !== null &&
+      state.kind === 'reading' &&
+      isHtmlFile(state.path, 'file');
+    paneToolbar.hidden = !visible;
+    if (!visible) return;
+    btn.textContent = paneSource ? '页面' : '源码';
+    btn.title = paneSource ? '查看页面' : '查看源码';
+    btn.setAttribute('aria-pressed', paneSource ? 'true' : 'false');
+  }
+
+  function togglePaneSource() {
+    if (treeShell === null || state.kind !== 'reading') return;
+    if (!isHtmlFile(state.path, 'file')) return;
+    paneNavigate({
+      kind: 'reading',
+      path: state.path,
+      history: 'none',
+      source: !paneSource,
+    });
   }
 
   // 按当前状态同步内容区 (进入树壳/恢复/规则变化后的重取入口).
@@ -3733,6 +3853,19 @@
 
   /* ---------- 指针/文档事件 ---------- */
 
+  // 树行中键: 与 ⌘/Ctrl/Shift+click 同一新 tab 语义 (中键只触发 auxclick).
+  function onDocumentAuxclick(event) {
+    if (event.button !== 1) return;
+    const treeRow = event.target.closest('.cb-tree-row');
+    if (!treeRow) return;
+    const li = treeRow.closest('li.cb-tree-node');
+    if (!li) return;
+    const href = nodeHref(li);
+    if (href === null) return;
+    event.preventDefault();
+    window.open(href.href, '_blank', 'noopener');
+  }
+
   function onDocumentClick(event) {
     const target = event.target;
     // 独立阅读导航: 文件树 / 复制链接 / 所在目录. 动作按钮在客户端启用前保持
@@ -3792,6 +3925,12 @@
       if (details) details.open = false;
       return;
     }
+    const paneSourceBtn = target.closest('[data-cb-pane-source]');
+    if (paneSourceBtn) {
+      event.preventDefault();
+      togglePaneSource();
+      return;
+    }
     const actionBtn = target.closest(ACTION_SELECTOR);
     if (actionBtn) {
       handleAction(event, actionBtn);
@@ -3804,6 +3943,13 @@
       if (event.detail > 1) return;
       const li = treeRow.closest('li.cb-tree-node');
       if (!li) return;
+      // 修饰键点击: 新 tab 打开完整页, 不改变当前 pane/选中/树展开状态.
+      if (treeRowOpensNewTab(event)) {
+        event.preventDefault();
+        const href = nodeHref(li);
+        if (href !== null) window.open(href.href, '_blank', 'noopener');
+        return;
+      }
       focusTreeRootUl(); // 先落焦点: active-descendant 公告 + 键盘可立即接管
       selectTreeNode(li);
       if (isDirNode(li)) toggleTreeNode(li); else navigateTreeNode(li);
@@ -3998,6 +4144,7 @@
 
   function installListeners() {
     document.addEventListener('click', onDocumentClick);
+    document.addEventListener('auxclick', onDocumentAuxclick);
     document.addEventListener('dblclick', onDocumentDblclick);
     document.addEventListener('keydown', onKeydown);
     window.addEventListener('popstate', onPopState);
@@ -4137,6 +4284,8 @@
       collapseFocusTarget: collapseFocusTarget,
       treeKeyScope: treeKeyScope,
       isPdfFile: isPdfFile,
+      isHtmlFile: isHtmlFile,
+      treeRowOpensNewTab: treeRowOpensNewTab,
       isValidSort: isValidSort,
       isValidHidden: isValidHidden,
       nextBrowseView: nextBrowseView,

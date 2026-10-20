@@ -23,6 +23,6 @@
 - 新增真实浏览器 Mermaid 行为验收并纳入 Linux CI：检查实际懒加载 HTTP/MIME 与有标签、有向边的 SVG。
 - 文档改为中性的 Windows 平台与可选启动器说明，不包含 Fork 自指或本机分发命名。
 
-上一版本发布说明见 [chapbook v0.4.1](release-notes-v0.4.1.md)。
+上一版本发布说明见 [chapbook v0.4.3](release-notes-v0.4.3.md)。
 
 构建与浏览器行为验收入口见 [README](../README.md#development)。
