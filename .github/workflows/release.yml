@@ -78,6 +78,7 @@ jobs:
       # 自带的 Strawberry Perl 版本, 否则 libquickjs-sys 的补丁步骤会崩溃.
       - name: Install MSYS2 toolchain (Windows)
         if: startsWith(matrix.os, 'windows')
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -86,6 +87,16 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
             patch
+      # setup-msys2 的 PATH 只保证 msys2 shell; JS action 与 pwsh 步骤需要显式前置
+      # MSYS2 的 patch/gcc, 否则会命中 runner 自带的 Strawberry patch.
+      - name: Add MSYS2 to PATH (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: pwsh
+        run: |
+          $msys2 = "${{ steps.msys2.outputs.msys2-location }}"
+          Write-Host "msys2=$msys2"
+          Add-Content -Path $env:GITHUB_PATH -Value "$msys2\usr\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value "$msys2\mingw64\bin"
       - name: Verify Windows toolchain
         if: startsWith(matrix.os, 'windows')
         shell: pwsh
