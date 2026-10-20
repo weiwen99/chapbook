@@ -1,6 +1,6 @@
 [package]
 name = "chapbook"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 default-run = "chapbook"
 # 实际 MSRV 由 anydoc (=0.1.8, MSRV 1.88) 决定; 显式声明让旧工具链报清晰错误

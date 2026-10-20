@@ -1,8 +1,8 @@
 name: Release
 
-# 打 v* tag 时自动构建 Linux/macOS 二进制并发布到 GitHub Releases.
+# 打 v* tag 时自动构建 Linux/macOS/Windows 二进制并发布到 GitHub Releases.
 # Release 正文 = docs/release-notes-<tag>.md 全文 (中文, 需包含在被打 tag 的提交里).
-# 用法: git tag v0.4.3 && git push origin v0.4.3
+# 用法: git tag v0.5.0 && git push origin v0.5.0
 on:
   push:
     tags: ['v*']
@@ -42,13 +42,31 @@ jobs:
           # 依赖树并非 "纯 Rust 无 C".
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            toolchain: stable
+            bin: chapbook
+            features: ""
+            archive: "chapbook-$target"
           # macOS Apple Silicon (macos-latest 自 2026-06 起为 macOS 26 arm64)
           - os: macos-latest
             target: aarch64-apple-darwin
+            toolchain: stable
+            bin: chapbook
+            features: ""
+            archive: "chapbook-$target"
+          # Windows x86_64 GNU: 与 CI 相同的 MinGW-w64 工具链; zip 内同时包含
+          # CLI 与可选图形启动器 (--features windows-launcher).
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+            toolchain: stable-x86_64-pc-windows-gnu
+            bin: chapbook,chapbook-launcher
+            features: windows-launcher
+            archive: "chapbook-$target"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
       # Linux 交叉工具链 (musl target + 链接器); macOS 原生构建不需要
       - name: Install cross toolchain
         if: startsWith(matrix.os, 'ubuntu')
@@ -56,12 +74,38 @@ jobs:
         with:
           target: ${{ matrix.target }}
           runner: none
-      # 构建 release 二进制, 打包 chapbook-<target>.tar.gz (内含 LICENSE, README.md),
+      # Windows: MinGW-w64 GCC + GNU patch. patch 必须在 PATH 中优先于 runner
+      # 自带的 Strawberry Perl 版本, 否则 libquickjs-sys 的补丁步骤会崩溃.
+      - name: Install MSYS2 toolchain (Windows)
+        if: startsWith(matrix.os, 'windows')
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            patch
+      - name: Verify Windows toolchain
+        if: startsWith(matrix.os, 'windows')
+        shell: pwsh
+        run: |
+          $patch = (Get-Command patch).Source
+          $gcc = (Get-Command gcc).Source
+          Write-Host "patch=$patch"
+          Write-Host "gcc=$gcc"
+          if ($patch -notlike "*\msys64\*") { throw "unexpected patch: $patch" }
+          if ($gcc -notlike "*\msys64\*") { throw "unexpected gcc: $gcc" }
+          rustc -vV
+      # 构建 release 二进制, 打包 chapbook-<target>.tar.gz / .zip (内含 LICENSE, README.md),
       # 上传到该 tag 的 release; 同时生成并上传 <archive>.sha256 校验和.
       - name: Build and upload
         uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: chapbook
+          bin: ${{ matrix.bin }}
           target: ${{ matrix.target }}
+          features: ${{ matrix.features }}
+          archive: ${{ matrix.archive }}
+          locked: true
           include: LICENSE,README.md
           checksum: sha256
