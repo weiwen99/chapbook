@@ -36,7 +36,7 @@ struct AppState {
     /// 32 MiB 上限), 排队只会让慢转换身后堆积更多慢转换; 与搜索门一致采取
     /// 忙即失败不排队 (fragment 占位 / 完整页 503 + Retry-After).
     office_gate: Arc<Semaphore>,
-    /// 本机打开 (native-open) 随机令牌: 启动时从 /dev/urandom 读取 16 字节的 hex.
+    /// 本机打开 (native-open) 随机令牌: 从系统安全随机源生成 16 字节的 hex.
     /// 绝不写入日志; 仅嵌入 loopback 可信页面, 且仅 POST 校验链通过时使用.
     token: String,
     /// 本机打开执行器 (生产 PlatformOpener; 测试注入 RecordingOpener/FailingOpener).
@@ -72,11 +72,10 @@ fn app_with(root: PathBuf, token: String, opener: Arc<dyn OpenWith>) -> Router {
         .with_state(state)
 }
 
-/// 从任意 `Read` 精确读取 16 字节并格式化为 32 位小写 hex (token reader seam).
-/// 短读/读错误原样返回 io::Error — 不 panic, 不生成弱 token.
-fn read_token(mut reader: impl io::Read) -> io::Result<String> {
+/// 启动时从系统安全随机源读取 16 字节; 失败则拒绝启动, 不降级为弱 token.
+fn generate_token() -> io::Result<String> {
     let mut bytes = [0u8; 16];
-    reader.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hex = String::with_capacity(32);
     for byte in bytes {
@@ -86,22 +85,17 @@ fn read_token(mut reader: impl io::Read) -> io::Result<String> {
     Ok(hex)
 }
 
-/// 启动 token: 打开 /dev/urandom 并精确读取 16 字节. open/read 错误原样返回
-/// (启动失败并记录清晰错误, 绝不降级为弱 token / panic).
-fn generate_token() -> io::Result<String> {
-    read_token(std::fs::File::open("/dev/urandom")?)
-}
-
 /// 本机打开执行器 seam (私有): 同步打开路径, spawn 失败返回 io::Error.
 trait OpenWith: Send + Sync {
     fn open(&self, path: &Path) -> io::Result<()>;
 }
 
-/// 生产 adapter: Linux `xdg-open` / macOS `open`; 其余平台返回 Unsupported.
-/// tokio::process::Command: stdin/stdout/stderr 全 null, kill_on_drop(true),
-/// 恰好一个 path argv, 无 shell. spawn 成功后 child 移入 reaper, 立即返回.
+/// 生产 adapter: Linux `xdg-open` / macOS `open` / Windows ShellExecuteExW.
+/// Unix opener 使用 null stdio、kill_on_drop 与异步 reaper; Windows 直接传
+/// UTF-16 文件路径给系统关联, 无 cmd/PowerShell、无命令字符串拼接.
 struct PlatformOpener;
 
+#[cfg(not(windows))]
 impl OpenWith for PlatformOpener {
     fn open(&self, path: &Path) -> io::Result<()> {
         let program = if cfg!(target_os = "linux") {
@@ -126,9 +120,17 @@ impl OpenWith for PlatformOpener {
     }
 }
 
+#[cfg(windows)]
+impl OpenWith for PlatformOpener {
+    fn open(&self, path: &Path) -> io::Result<()> {
+        crate::desktop::open(path.as_os_str())
+    }
+}
+
 /// 私有 reaper: 普通 tokio::spawn 异步 wait 子进程; wait 失败仅 warn.
 /// runtime shutdown 时 wait 任务随 runtime 丢弃, child drop 触发 kill-on-drop,
 /// 保证 Ctrl-C 不被挂起的 opener 阻塞.
+#[cfg(any(not(windows), test))]
 fn spawn_reaper(mut child: tokio::process::Child) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = child.wait().await {
@@ -1217,12 +1219,18 @@ fn trusted_ui_response(markup: String) -> Response {
     response
 }
 
-/// 将 URL 路径解析为 root 内的文件系统路径. 溢出 root 时返回 None.
+/// 将 URL 路径解析为 root 内的文件系统路径. 溢出 root 或含平台前缀时返回 None.
 fn resolve_within_root(root: &Path, decoded: &str) -> Option<PathBuf> {
+    // URL identity 使用 `/`; Windows 的盘符、UNC/设备路径与 ADS 不能作为 segment.
+    #[cfg(windows)]
+    if decoded.contains(['\\', ':']) {
+        return None;
+    }
     let mut buf = root.to_path_buf();
     for comp in Path::new(decoded).components() {
         match comp {
-            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::Prefix(_) => return None,
+            Component::RootDir | Component::CurDir => {}
             Component::Normal(segment) => buf.push(segment),
             Component::ParentDir => {
                 if buf == *root {
@@ -2539,6 +2547,13 @@ mod tests {
             "矩阵字符必须是 White_Space 且非 U+0020"
         );
         names.extend(whitespace.chars().map(|c| c.to_string()));
+        // Windows 文件系统不能创建控制字符及这些保留字符的文件名.
+        #[cfg(windows)]
+        names.retain(|name| {
+            !name.chars().any(|c| {
+                c < ' ' || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            })
+        });
         names
     }
 
@@ -2574,36 +2589,6 @@ mod tests {
         fn open(&self, _path: &Path) -> io::Result<()> {
             Err(io::Error::other("intentional spawn failure"))
         }
-    }
-
-    /// token reader: 精确 16 字节 -> 32 位小写 hex.
-    #[test]
-    fn token_reader_exact_hex() {
-        let bytes: Vec<u8> = (0u8..16).collect();
-        let token = read_token(bytes.as_slice()).expect("exact 16 bytes");
-        assert_eq!(token.len(), 32);
-        assert_eq!(token, "000102030405060708090a0b0c0d0e0f");
-        assert_eq!(token, token.to_ascii_lowercase(), "必须全小写");
-    }
-
-    /// token reader: 短读 (15 / 0 字节) -> io::Error, 不 panic.
-    #[test]
-    fn token_reader_short_read_is_error() {
-        assert!(read_token(&[1u8, 2, 3][..]).is_err());
-        assert!(read_token(&[][..]).is_err());
-    }
-
-    /// token reader: 读取失败原样返回错误 (failing reader seam).
-    #[test]
-    fn token_reader_failing_reader_is_error() {
-        struct Failing;
-        impl io::Read for Failing {
-            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-                Err(io::Error::other("boom"))
-            }
-        }
-        let err = read_token(Failing).expect_err("failing reader must error");
-        assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 
     /// Host 字面 loopback 判定表: localhost (大小写不敏感) / 127.0.0.1 / [::1],
@@ -2642,6 +2627,64 @@ mod tests {
             "[::1",
         ] {
             assert!(!host_is_loopback(host), "host 必须拒绝: {host:?}");
+        }
+    }
+
+    /// 真实 app 的系统随机 token 必须恰好嵌入一次, 并用于同一 Router 的授权链.
+    /// 只提交不存在的路径: 有效 token 到达 404, 无效 token 在此前被拒绝, 不调用系统 opener.
+    #[tokio::test]
+    async fn real_app_token_round_trips_through_native_open_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path().to_path_buf()).expect("app initialization");
+        let res = app
+            .clone()
+            .oneshot(page_request(Some(loopback_peer()), "localhost", "/"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_to_string(res).await;
+        let token_metas: Vec<_> = body
+            .split("<meta ")
+            .skip(1)
+            .map(|tag| tag.split('>').next().unwrap())
+            .filter(|tag| tag.contains(r#"name="cb-native-open-token""#))
+            .collect();
+        assert_eq!(token_metas.len(), 1, "exactly one token meta");
+        let token = token_metas[0]
+            .split(r#"content=""#)
+            .nth(1)
+            .and_then(|value| value.split('"').next())
+            .expect("token meta content");
+        assert_eq!(token.len(), 32);
+        assert!(
+            token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "token must be lowercase hex"
+        );
+        assert_eq!(
+            body.matches(token).count(),
+            1,
+            "token embedded exactly once"
+        );
+
+        let incorrect_first = if token.starts_with('0') { '1' } else { '0' };
+        let incorrect = format!("{incorrect_first}{}", &token[1..]);
+        for (provided, expected) in [
+            (token, StatusCode::NOT_FOUND),
+            (incorrect.as_str(), StatusCode::FORBIDDEN),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(native_request(
+                    &format!("path=missing.txt&token={provided}"),
+                    Some(loopback_peer()),
+                    "localhost",
+                    Some("http://localhost"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected);
         }
     }
 
