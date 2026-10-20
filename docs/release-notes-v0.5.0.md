@@ -12,6 +12,9 @@ Linux/macOS 行为不变；v0.4.3 的未知扩展名纯文本预览、HTML 预�
   解析后的 `Component::Prefix(_)` 一律 fail closed。新增 Windows 专属路由回归。
 - **发布资产** — `chapbook-x86_64-pc-windows-gnu.zip`，内含 `chapbook.exe`、
   `chapbook-launcher.exe`、LICENSE、README.md 与 sha256 校验和。
+- **运行要求** — Windows 10+ x64；exe 只导入系统 DLL（KERNEL32、msvcrt、ole32、shell32、
+  ws2_32 等），MinGW 运行时已静态链接，不需要 MinGW/MSYS2/GCC 或 VC++ 运行库。
+  GNU 工具链与 `patch` 只是构建期依赖。
 
 ## Windows 可选图形启动器
 
@@ -47,6 +50,7 @@ Linux/macOS 行为不变；v0.4.3 的未知扩展名纯文本预览、HTML 预�
 | `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`（macOS） | 通过 |
 | `cargo build --release --locked`（macOS） | 通过 |
 | 三平台 CI（Linux / macOS / Windows） | 全部通过 |
+| Windows zip 导入表 | 仅系统 DLL；无 `libgcc_s`/`libwinpthread`/`libstdc++` |
 | Tag 工作流 | 构建 Linux/macOS/Windows 资产并生成 sha256 |
 
 二进制 `--version` 应返回 `chapbook 0.5.0`。

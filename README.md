@@ -69,6 +69,9 @@ Windows URL 路径拒绝盘符、反斜杠、UNC/设备路径（包括正斜杠�
 v0.5.0 发布 `chapbook-x86_64-pc-windows-gnu.zip`（内含 `chapbook.exe` 与
 `chapbook-launcher.exe`）；也可按下文自行构建。
 
+发布 zip 内的 exe 只依赖 Windows 10+ x64 的系统 DLL（KERNEL32、msvcrt、ole32、shell32、
+ws2_32 等），不需要 MinGW/GCC/MSYS2 或额外运行库；下列 GNU 工具链与 `patch` 仅用于构建。
+
 构建需要 Rust GNU 工具链、MinGW-w64 GCC（x86_64、SEH、MSVCRT；例如
 [mingw-builds](https://github.com/niXman/mingw-builds-binaries/releases) 的 `x86_64-…-posix-seh-msvcrt-…` 包）
 与 GNU `patch`（可使用 Git for Windows 附带的 `usr\bin\patch.exe`，本机验证版本为 2.7.6）。
