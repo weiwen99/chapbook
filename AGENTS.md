@@ -119,6 +119,10 @@ tests/
 7. 源代码文件（`highlight.rs` 的扩展名映射表内）按 **Accept 协商**返回：`text/html` → syntect
    高亮 HTML（带行号 `<span class="ln">`，同一 DOC_STYLE）；否则（curl 等）→ 原文。
    `?raw=1` / `?view=1` 显式覆盖。非 UTF-8 与 >1MB 文件不渲染，裸字节透传。
+   未知扩展名（不在任何显式类型表内）在 fragment 或完整页 `?view=1`/`Accept: text/html` 时
+   按内容兜底：普通文件、≤1 MiB、非 `.pdf`、整文件严格 UTF-8 且无 NUL → 与代码文件相同的
+   `Plain Text` 阅读视图（带行号、转义）；否则维持占位/原字节。raw/download 不嗅探，
+   `ServeFile` 的 Content-Type 不变。
 8. Office/CSV 文档（`office.rs` 的 anydoc 格式表内：doc/docx/docm、ppt/pps/pot/pptx/pptm/ppsx/ppsm、
    xls/xlsx/xlsm/xlsb、odt/ods/odp、rtf、epub、csv；**PDF 除外**——浏览器原生打开）同样按
    **Accept 协商**返回：`text/html` → anydoc 转 GFM markdown 后经 `render_markdown_response`
@@ -129,14 +133,15 @@ tests/
    `run_blocking_job` seam）：忙即失败不排队——fragment 返回 200 安全占位 HTML
    （绝不回退裸字节），完整页返回 503 + `Retry-After: 1`；permit 由阻塞 job 持有到
    真实转换结束，handler 取消不提前释放容量。
-   判定顺序：目录 → .md → .org → Office/CSV → 代码 → ServeFile。
+   判定顺序：目录 → .md → .org → Office/CSV → 代码 → 未知扩展名纯文本兜底 → ServeFile。
 9. 所有文件请求先统一解析 `ResponseMode`，优先级固定为
    `download > raw > fragment > view > 类型默认协商`。`download` 一律返回原始字节并附
    RFC 8187 `Content-Disposition`；`raw` 一律走 `ServeFile`；目录忽略这些模式并返回完整目录页，
    只有 `fragment` 返回迷你列表。
 10. `fragment` 是预览面板的严格 HTML 接口：成功和失败都只返回 CB 生成的
     `text/html; charset=utf-8` + `nosniff` 片段；非 UTF-8、超限、Office 转换失败和不支持类型
-    返回占位片段，**禁止**回退原始字节。文档/代码正文统一包在 `.cb-doc`，完整页 body 为
+    返回占位片段，**禁止**回退原始字节。未知扩展名若内容是严格 UTF-8 文本则按纯文本渲染
+    （见第 7 条），只有不满足该条件时才返回占位。文档/代码正文统一包在 `.cb-doc`，完整页 body 为
     `.cb-doc-page`；目录页同时加载 `chapbook-doc.css` 供预览使用。
     `.html`/`.htm`（ASCII 大小写不敏感）在 fragment 模式下输出
     `.cb-doc.cb-html-preview` 内嵌 `<iframe sandbox="allow-scripts" src="exact raw URL">`，

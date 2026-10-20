@@ -576,8 +576,38 @@ async fn serve_path(
                         serve_file(&fs_path, headers, false).await
                     }
                 } else {
-                    // 其他文件: ServeFile (支持 Range 请求, 否则播放音视频无法任意快进)
-                    serve_file(&fs_path, headers, false).await
+                    // 未知扩展名: 浏览器 / ?view=1 先按内容兜底为纯文本阅读页
+                    // (ADR 0002); 不满足文本条件或读取失败时维持 ServeFile
+                    // (支持 Range 请求, 否则播放音视频无法任意快进).
+                    // .html/.htm 是网页不是文本: 完整页恒由浏览器原生渲染
+                    // (历史上就依赖 ServeFile), 不能落入纯文本兜底.
+                    let text = if (mode == Some(ResponseMode::Full) || accepts_html(&headers))
+                        && !is_html_path(&fs_path)
+                    {
+                        match detect_plain_text(&fs_path, &metadata).await {
+                            Ok(source) => source,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    path = %fs_path.display(),
+                                    "failed to read plain text candidate"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    match text {
+                        Some(source) => {
+                            let encoded = encode_path();
+                            let title = file_name_text(&fs_path);
+                            let body = highlight::code_block(&source, Some("Plain Text"));
+                            let page = render::doc_page(&title, &body, encoded.as_deref(), options);
+                            trusted_ui_response(render::inject_doc_style(&page))
+                        }
+                        None => serve_file(&fs_path, headers, false).await,
+                    }
                 }
             }
         }
@@ -985,7 +1015,21 @@ async fn serve_fragment(
             fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
         }
         FragmentKind::Unsupported => {
-            let inner = no_preview("不支持预览此文件类型");
+            // 未知扩展名按内容兜底 (ADR 0002); 不满足条件时仍是安全占位.
+            let inner = match detect_plain_text(path, metadata).await {
+                Ok(Some(source)) => {
+                    render::doc_fragment(&highlight::code_block(&source, Some("Plain Text")))
+                }
+                Ok(None) => no_preview("不支持预览此文件类型"),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %path.display(),
+                        "fragment: failed to read plain text candidate"
+                    );
+                    no_preview("无法读取文件")
+                }
+            };
             fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
         }
     }
@@ -1119,6 +1163,39 @@ async fn read_utf8(path: &Path) -> Result<String, String> {
             Err("无法读取文件".to_string())
         }
     }
+}
+
+/// 未知扩展名的纯文本兜底判定 (ADR 0002): 只接受普通文件、≤1 MiB、非 `.pdf`、
+/// 整文件严格 UTF-8 且不含 NUL. 返回内容供调用方直接渲染, 判定与渲染不重复读盘.
+///
+/// `Err` 与"不是文本"分开: fragment 对读取失败显示 "无法读取文件", 对 `Ok(None)`
+/// 保持 "不支持预览此文件类型". 大小上限复用 `highlight::MAX_RENDER_BYTES`
+/// (纯文本与代码共用同一渲染管线与上限).
+async fn detect_plain_text(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<Option<String>> {
+    // FIFO/设备/socket 读取会阻塞; 目录已在上游分派. 符号链接指向普通文件时
+    // metadata 跟随链接, 仍按文本判定.
+    if !metadata.is_file() || metadata.len() > highlight::MAX_RENDER_BYTES || is_pdf_path(path) {
+        return Ok(None);
+    }
+    let bytes = tokio::fs::read(path).await?;
+    let Ok(source) = String::from_utf8(bytes) else {
+        return Ok(None);
+    };
+    if source.contains('\0') {
+        return Ok(None);
+    }
+    Ok(Some(source))
+}
+
+/// PDF 由浏览器原生查看器接管 (见 `is_browser_native_content`): 即使是 ASCII-only
+/// 的合法 UTF-8 PDF 也不能落进纯文本兜底, 否则会推翻原生打开契约.
+fn is_pdf_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
 }
 
 /// 可见 fallback 标题 (md/org/office/code 全文页与 fragment 文档标题共用):
@@ -1514,6 +1591,14 @@ mod tests {
             FragmentKind::Code("rust")
         ));
         assert!(matches!(
+            classify_fragment(Path::new("xyz.env")),
+            FragmentKind::Code("Plain Text")
+        ));
+        assert!(matches!(
+            classify_fragment(Path::new(".env")),
+            FragmentKind::Code("Plain Text")
+        ));
+        assert!(matches!(
             classify_fragment(Path::new("x.png")),
             FragmentKind::Media(MediaKind::Image)
         ));
@@ -1525,6 +1610,62 @@ mod tests {
             classify_fragment(Path::new("x.xyz123")),
             FragmentKind::Unsupported
         ));
+    }
+
+    /// 未知扩展名纯文本兜底: 守卫 (普通文件 / 上限 / PDF) 先于读取,
+    /// 内容判定为严格 UTF-8 + 无 NUL; 读取失败与"不是文本"分开.
+    #[tokio::test]
+    async fn detect_plain_text_guards_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let text = dir.path().join("LICENSE");
+        std::fs::write(&text, "hello\n").unwrap();
+        let meta = std::fs::metadata(&text).unwrap();
+        assert_eq!(
+            detect_plain_text(&text, &meta).await.unwrap().as_deref(),
+            Some("hello\n")
+        );
+
+        // 空文件是合法 UTF-8, 正常渲染空页
+        let empty = dir.path().join("EMPTY");
+        std::fs::write(&empty, "").unwrap();
+        let meta = std::fs::metadata(&empty).unwrap();
+        assert_eq!(
+            detect_plain_text(&empty, &meta).await.unwrap().as_deref(),
+            Some("")
+        );
+
+        let invalid = dir.path().join("legacy.xyz");
+        std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+        let meta = std::fs::metadata(&invalid).unwrap();
+        assert_eq!(detect_plain_text(&invalid, &meta).await.unwrap(), None);
+
+        let nul = dir.path().join("nul.dat");
+        std::fs::write(&nul, b"a\0b").unwrap();
+        let meta = std::fs::metadata(&nul).unwrap();
+        assert_eq!(detect_plain_text(&nul, &meta).await.unwrap(), None);
+
+        // ASCII-only PDF 也是合法 UTF-8, 但必须由扩展名排除
+        let pdf = dir.path().join("ascii.PDF");
+        std::fs::write(&pdf, "plain text in pdf name").unwrap();
+        let meta = std::fs::metadata(&pdf).unwrap();
+        assert_eq!(detect_plain_text(&pdf, &meta).await.unwrap(), None);
+
+        let big = dir.path().join("big.xyz");
+        std::fs::write(&big, "x".repeat(highlight::MAX_RENDER_BYTES as usize + 1)).unwrap();
+        let meta = std::fs::metadata(&big).unwrap();
+        assert_eq!(detect_plain_text(&big, &meta).await.unwrap(), None);
+
+        // 目录/特殊文件不是普通文件 (FIFO 读取会阻塞, 必须先拒绝)
+        let subdir = dir.path().join("sub");
+        std::fs::create_dir(&subdir).unwrap();
+        let meta = std::fs::metadata(&subdir).unwrap();
+        assert_eq!(detect_plain_text(&subdir, &meta).await.unwrap(), None);
+
+        // metadata 存在但路径消失 -> 读取失败, 与"不是文本"区分
+        let meta = std::fs::metadata(&text).unwrap();
+        let missing = dir.path().join("gone.xyz");
+        assert!(detect_plain_text(&missing, &meta).await.is_err());
     }
 
     /// 预持有唯一 permit -> Busy, job 不被调用; 释放后可正常执行.

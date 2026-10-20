@@ -2,7 +2,7 @@ name: Release
 
 # 打 v* tag 时自动构建 Linux/macOS 二进制并发布到 GitHub Releases.
 # Release 正文 = docs/release-notes-<tag>.md 全文 (中文, 需包含在被打 tag 的提交里).
-# 用法: git tag v0.4.2 && git push origin v0.4.2
+# 用法: git tag v0.4.3 && git push origin v0.4.3
 on:
   push:
     tags: ['v*']
