@@ -66,7 +66,11 @@ cargo build --release
 Windows 使用系统安全随机源和默认应用接口，
 中文与空格路径保持 UTF-16，不经 `cmd /c start` 或 PowerShell 拼接命令。
 Windows URL 路径拒绝盘符、反斜杠、UNC/设备路径（包括正斜杠编码形式）及 NTFS ADS。
-v0.4.3 已发布资产仅覆盖 Linux/macOS，Windows CLI 和可选图形启动器需自行构建。
+v0.5.0 发布 `chapbook-x86_64-pc-windows-gnu.zip`（内含 `chapbook.exe` 与
+`chapbook-launcher.exe`）；也可按下文自行构建。
+
+发布 zip 内的 exe 只依赖 Windows 10+ x64 的系统 DLL（KERNEL32、msvcrt、ole32、shell32、
+ws2_32 等），不需要 MinGW/GCC/MSYS2 或额外运行库；下列 GNU 工具链与 `patch` 仅用于构建。
 
 构建需要 Rust GNU 工具链、MinGW-w64 GCC（x86_64、SEH、MSVCRT；例如
 [mingw-builds](https://github.com/niXman/mingw-builds-binaries/releases) 的 `x86_64-…-posix-seh-msvcrt-…` 包）
@@ -105,8 +109,8 @@ cp target/release/chapbook /usr/local/bin/
 ```
 
 预编译二进制与中文发布说明见 [GitHub Releases](https://github.com/weiwen99/chapbook/releases)。
-v0.4.3 支持 Linux x86_64（musl）和 macOS Apple Silicon，版本说明见
-[v0.4.3 发布 notes](docs/release-notes-v0.4.3.md)。更新后需重启原有 chapbook 进程。
+v0.5.0 支持 Linux x86_64（musl）、macOS Apple Silicon 和 Windows x86_64（GNU），版本说明见
+[v0.5.0 发布 notes](docs/release-notes-v0.5.0.md)。更新后需重启原有 chapbook 进程。
 
 ## Run
 
