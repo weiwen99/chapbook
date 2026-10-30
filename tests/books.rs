@@ -368,8 +368,13 @@ async fn books_keep_negotiation_download_raw_and_range_semantics() {
 #[tokio::test]
 async fn cbz_naturally_orders_mixed_images_and_excludes_nonpages() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("漫画 ?#%.CBZ"), mixed_comic()).unwrap();
-    let encoded = "%E6%BC%AB%E7%94%BB%20%3F%23%25.CBZ";
+    // Windows 文件名禁止 `?`；Unix 仍覆盖它不能误变成资源 URL 查询分隔符。
+    let (name, encoded) = if cfg!(windows) {
+        ("漫画 #%.CBZ", "%E6%BC%AB%E7%94%BB%20%23%25.CBZ")
+    } else {
+        ("漫画 ?#%.CBZ", "%E6%BC%AB%E7%94%BB%20%3F%23%25.CBZ")
+    };
+    std::fs::write(dir.path().join(name), mixed_comic()).unwrap();
     let app = app(dir.path());
     for mode in ["?view=1", "?fragment=1"] {
         let response = request(&app, &format!("/{encoded}{mode}"), "*/*").await;

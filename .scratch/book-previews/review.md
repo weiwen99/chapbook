@@ -82,3 +82,14 @@ FB2 三个引用消费点共用严格 UTF-8、恰好一次的 fragment 解码及
 
 本机未运行 Linux/Windows 构建或 Windows GUI 交互；平台构建交由现有 CI，不以 macOS 结果冒充实机验证。
 最终未扩大支持范围，也未引入缓存、解包目录、外部工具或新前端解析器。
+
+## 跨平台 CI 与测试样本修正
+
+首次推送 `3fceef8` 的 [Rust CI](https://github.com/weiwen99/chapbook/actions/runs/41010740381)：
+Linux、macOS 全部通过；Windows 默认 CLI 构建、154 项库测试、4 项启动器测试及 15 项书籍 HTTP 测试通过。
+剩余书籍测试在创建 `漫画 ?#%.CBZ` 时报 `InvalidFilename`（Windows error 123），未进入请求处理。
+
+仅修正测试样本的平台适用性：Windows 使用合法的中文、空格、`#`、`%` 文件名，Unix 仍保留 `?` 的
+查询分隔符边界；自然排序、混合图片、过滤、资源字节与安全头的全部断言不变。生产实现未改。
+各提交的平台门禁结果见其关联的 [Rust workflow](https://github.com/weiwen99/chapbook/actions/workflows/rust.yml)；
+CI 的启动器交互回归不冒充手工 Windows GUI 验收。
