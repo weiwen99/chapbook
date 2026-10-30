@@ -2,7 +2,7 @@
 //!
 //! 输出 classed HTML fragment: `ClassStyle::Spaced` 把完整 scope atom 作为类名
 //! (`keyword` / `string` / `comment` …), 颜色由 chapbook-doc.css 调色板控制
-//! (GitHub 亮/暗双模式). 代码文件额外带行号 (`<span class="ln">`).
+//! (GitHub 亮/暗双模式). 普通代码文件额外带行号 (`<span class="ln">`); JSON 保留原文供结构化预览.
 //!
 //! 语法集 = syntect 默认集 (~50 语言) + `assets/syntaxes/` 内嵌补充
 //! (TypeScript/TOML/Kotlin/Swift 等默认集缺失的常见语言, 详见 THIRD_PARTY_NOTICES).
@@ -226,8 +226,20 @@ fn escape(code: &str) -> String {
     out
 }
 
-/// 代码文件页面: 完整 `<pre class="sourceCode"><code>…</code></pre>` 块 (带行号).
+/// 代码文件内容: 普通代码带行号; JSON 保留原始空白, 供客户端增强为可折叠预览.
 pub fn code_block(code: &str, lang: Option<&str>) -> String {
+    if lang == Some("json") {
+        let source = highlight(code, lang, false);
+        // HTML 会把字面 CR/CRLF 归一为 LF; 字符引用让原文视图保持原始换行.
+        let source = if source.contains('\r') {
+            source.replace('\r', "&#13;")
+        } else {
+            source
+        };
+        return format!(
+            "<div class=\"cb-json\"><pre class=\"sourceCode cb-json-source\"><code>{source}</code></pre></div>"
+        );
+    }
     format!(
         "<pre class=\"sourceCode\"><code>{}</code></pre>",
         highlight(code, lang, true)

@@ -1643,6 +1643,7 @@
         }
         installPanelTitleMarkup(wrapper.querySelector('.cb-frag-title'));
         renderMermaidIn(host); // 预览面板 fragment 内的 mermaid 容器
+        renderJsonIn(host);
         // 只有一致且非占位内容才记为可跳过重取的成功安装.
         if (!wrapperIsPlaceholder(wrapper)) {
           panelCommittedKey = key;
@@ -3200,6 +3201,7 @@
     installDocLayout(docEl);
     if (docEl) installPaneTocSpy(docEl);
     renderMermaidIn(wrapper); // 内容区 fragment 内的 mermaid 容器
+    renderJsonIn(wrapper);
     // 请求目标与成功安装内容分开记录: 占位/忙内容不记为可跳过重取的成功.
     const placeholder = wrapperIsPlaceholder(wrapper);
     paneCommittedTarget = {
@@ -3480,6 +3482,145 @@
         registeredDisposer();
       });
     }
+  }
+
+  /* ---------- JSON 阅读 (保留词法原文; 不重新序列化或修改文件) ---------- */
+
+  function formattedJson(source) {
+    // 仅校验语法, 丢弃解析值: 大整数、重复键、键顺序与转义一律从原始 token 显示.
+    JSON.parse(source);
+    const tokens = source.matchAll(/"(?:\\.|[^"\\])*"|[^\s{}\[\],:]+|[{}\[\],:]/g);
+    let current = tokens.next().value[0];
+    let values = 0;
+    function take() {
+      const token = current;
+      const next = tokens.next();
+      current = next.done ? null : next.value[0];
+      return token;
+    }
+    function colored(text, kind) {
+      const span = document.createElement('span');
+      span.className = kind;
+      span.textContent = text;
+      return span;
+    }
+    function value(key, depth) {
+      // 限制新增 DOM 与递归深度; 达限时整棵树丢弃, 原文始终保留.
+      if (++values > 20000 || depth > 64) throw new RangeError('JSON structure limit');
+      const token = take();
+      const closing = token === '{' ? '}' : token === '[' ? ']' : null;
+      const branch = closing !== null && current !== closing;
+      const row = document.createElement(branch ? 'details' : 'div');
+      row.className = branch ? 'cb-json-node' : 'cb-json-value';
+      const label = branch ? document.createElement('summary') : row;
+      if (key !== null) label.append(colored(key, 'variable'), ': ');
+      let collapsed = null;
+      let end = null;
+      if (branch) {
+        row.open = true;
+        label.append(token);
+        collapsed = document.createElement('span');
+        collapsed.className = 'cb-json-collapsed';
+        collapsed.textContent = ' … ' + closing;
+        label.append(collapsed);
+        const children = document.createElement('div');
+        children.className = 'cb-json-children';
+        while (current !== closing) {
+          const childKey = token === '{' ? take() : null;
+          if (childKey !== null) take(); // 冒号; JSON.parse 已校验结构.
+          children.append(value(childKey, depth + 1));
+        }
+        take(); // 闭括号
+        end = document.createElement('div');
+        end.className = 'cb-json-close';
+        end.textContent = closing;
+        row.append(label, children, end);
+      } else if (closing !== null) {
+        take(); // 空对象 / 数组不制造无内容的折叠控件.
+        label.append(token + closing);
+      } else {
+        const kind = token[0] === '"' ? 'string'
+          : token === 'true' || token === 'false' || token === 'null' ? 'keyword'
+          : 'constant';
+        label.append(colored(token, kind));
+      }
+      if (current === ',') {
+        take();
+        if (branch) {
+          collapsed.append(',');
+          end.append(',');
+        } else {
+          label.append(',');
+        }
+      }
+      return row;
+    }
+    const tree = document.createElement('div');
+    tree.className = 'cb-json-tree';
+    tree.setAttribute('role', 'region');
+    tree.setAttribute('aria-label', '格式化 JSON');
+    tree.append(value(null, 1));
+    return tree;
+  }
+
+  function renderJsonIn(root) {
+    root.querySelectorAll('.cb-json').forEach(function (viewer) {
+      if (viewer.dataset.cbJsonReady) return;
+      const source = viewer.querySelector('.cb-json-source');
+      if (!source) return;
+      viewer.dataset.cbJsonReady = 'true';
+      let tree;
+      try {
+        tree = formattedJson(source.textContent);
+      } catch (error) {
+        if (!(error instanceof SyntaxError) && !(error instanceof RangeError)) throw error;
+        const notice = document.createElement('p');
+        notice.className = 'cb-json-notice';
+        notice.setAttribute('role', 'status');
+        notice.textContent = error instanceof SyntaxError
+          ? 'JSON 格式无效，显示高亮原文。'
+          : 'JSON 结构超过 64 层或 20,000 个值，显示高亮原文。';
+        viewer.prepend(notice);
+        return;
+      }
+      const controls = document.createElement('div');
+      controls.className = 'cb-json-controls';
+      controls.setAttribute('role', 'group');
+      controls.setAttribute('aria-label', 'JSON 预览');
+      function button(action, text) {
+        const el = document.createElement('button');
+        el.type = 'button';
+        el.dataset.cbJsonAction = action;
+        el.textContent = text;
+        controls.append(el);
+        return el;
+      }
+      const formatted = button('formatted', '格式化');
+      const original = button('source', '原文');
+      const expand = button('expand', '全部展开');
+      const collapse = button('collapse', '全部折叠');
+      const branches = tree.querySelectorAll('details.cb-json-node');
+      function showFormatted(show) {
+        tree.hidden = !show;
+        source.hidden = show;
+        formatted.setAttribute('aria-pressed', show ? 'true' : 'false');
+        original.setAttribute('aria-pressed', show ? 'false' : 'true');
+        expand.disabled = collapse.disabled = !show || branches.length === 0;
+      }
+      controls.addEventListener('click', function (event) {
+        const target = event.target.closest('button[data-cb-json-action]');
+        if (!target || !controls.contains(target)) return;
+        event.stopPropagation();
+        const action = target.dataset.cbJsonAction;
+        if (action === 'formatted' || action === 'source') {
+          showFormatted(action === 'formatted');
+        } else {
+          branches.forEach(function (node) { node.open = action === 'expand'; });
+        }
+      });
+      viewer.prepend(controls, tree);
+      showFormatted(true);
+    });
   }
 
   /* ---------- Mermaid 图表渲染 (懒加载; 事务式 render; 失败保留源码) ---------- */
@@ -4167,6 +4308,7 @@
     // 内容特性 (TOC/公式图表) 与浏览增强独立: 无显式页面语义时只保留内容特性.
     initFullPageTocSpy();
     renderMermaidIn(document);
+    renderJsonIn(document);
     const surface = bodySurface();
     if (surface === null) {
       initialized = true;

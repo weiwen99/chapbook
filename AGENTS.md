@@ -129,8 +129,11 @@ tests/
    docs/2026-08-05-proposal-remove-dependency-of-pandoc.org，Phase 1/2 已实施）。
 6. 文件服务必须支持 Range（tower-http `ServeFile` 提供）；缺失文件 404。
 7. 源代码文件（`highlight.rs` 的扩展名映射表内）按 **Accept 协商**返回：`text/html` → syntect
-   高亮 HTML（带行号 `<span class="ln">`，同一 DOC_STYLE）；否则（curl 等）→ 原文。
+   高亮 HTML（普通代码带行号 `<span class="ln">`，同一 DOC_STYLE）；否则（curl 等）→ 原文。
    `?raw=1` / `?view=1` 显式覆盖。非 UTF-8 与 >1MB 文件不渲染，裸字节透传。
+   JSON 例外：`code_block` 输出无行号的 `.cb-json-source`，CR 用字符引用避免 HTML 换行归一。
+   完整页与 fragment 共用客户端折叠／原文切换；只按原始 token 展示，保留重复键、顺序与数值写法，
+   不把解析值重新序列化。降级与限额见 [README JSON 预览](README.md#json-预览)。
    未知扩展名（不在任何显式类型表内）在 fragment 或完整页 `?view=1`/`Accept: text/html` 时
    按内容兜底：普通文件、≤1 MiB、非 `.pdf`、整文件严格 UTF-8 且无 NUL → 与代码文件相同的
    `Plain Text` 阅读视图（带行号、转义）；否则维持占位/原字节。raw/download 不嗅探，

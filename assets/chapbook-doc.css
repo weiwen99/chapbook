@@ -153,13 +153,13 @@ html:has(> body.cb-doc-page > .cb-reading-nav) {
  * 取 GitHub prettylights (亮) / GitHub Dark (暗) 调色板, 与页面色系同源, 代码块背景色不动.
  * 选择器按 scope 原子组合精确定位: 函数名用 entity.name.function / support.function
  * (避免 meta.function 容器把整个函数体染色), 类型/变量用 type/variable. */
-.cb-doc pre code span.keyword { color: #cf222e; }
+.cb-doc pre code span.keyword, .cb-doc .cb-json-tree .keyword { color: #cf222e; }
 .cb-doc pre code span.operator { color: #cf222e; }
-.cb-doc pre code span.string { color: #0a3069; }
+.cb-doc pre code span.string, .cb-doc .cb-json-tree .string { color: #0a3069; }
 .cb-doc pre code span.comment { color: #57606a; }
 .cb-doc pre code span.entity.name.function, .cb-doc pre code span.support.function, .cb-doc pre code span.support.macro { color: #8250df; }
-.cb-doc pre code span.constant { color: #0550ae; }
-.cb-doc pre code span.type, .cb-doc pre code span.variable { color: #953800; }
+.cb-doc pre code span.constant, .cb-doc .cb-json-tree .constant { color: #0550ae; }
+.cb-doc pre code span.type, .cb-doc pre code span.variable, .cb-doc .cb-json-tree .variable { color: #953800; }
 
 /* 行号 (代码文件页): 固定宽度右对齐, 不可选中.
  * 声明在调色板之后: 行号可能嵌套在上一行上下文 span 内, 同优先级下本规则胜出. */
@@ -173,14 +173,51 @@ html:has(> body.cb-doc-page > .cb-reading-nav) {
 }
 
 @media (prefers-color-scheme: dark) {
-  .cb-doc pre code span.keyword { color: #ff7b72; }
+  .cb-doc pre code span.keyword, .cb-doc .cb-json-tree .keyword { color: #ff7b72; }
   .cb-doc pre code span.operator { color: #ff7b72; }
-  .cb-doc pre code span.string { color: #a5d6ff; }
+  .cb-doc pre code span.string, .cb-doc .cb-json-tree .string { color: #a5d6ff; }
   .cb-doc pre code span.comment { color: #8b949e; }
   .cb-doc pre code span.entity.name.function, .cb-doc pre code span.support.function, .cb-doc pre code span.support.macro { color: #d2a8ff; }
-  .cb-doc pre code span.constant { color: #79c0ff; }
-  .cb-doc pre code span.type, .cb-doc pre code span.variable { color: #ffa657; }
+  .cb-doc pre code span.constant, .cb-doc .cb-json-tree .constant { color: #79c0ff; }
+  .cb-doc pre code span.type, .cb-doc pre code span.variable, .cb-doc .cb-json-tree .variable { color: #ffa657; }
 }
+
+/* JSON: 与代码块共用调色板; 原文节点不改写, 结构树只在当前阅读宿主内切换. */
+.cb-doc .cb-json [hidden] { display: none !important; }
+.cb-doc .cb-json-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4em;
+  margin: 0.8em 0;
+}
+.cb-doc .cb-json-controls button:nth-child(3) { margin-inline-start: 0.6em; }
+.cb-doc .cb-json-controls button[aria-pressed="true"] {
+  color: var(--cb-accent);
+  border-color: var(--cb-accent);
+  background-color: var(--cb-hover);
+}
+.cb-doc .cb-json-controls button:disabled { opacity: 0.5; cursor: default; }
+.cb-doc .cb-json-controls button:focus-visible,
+.cb-doc .cb-json-node > summary:focus-visible {
+  outline: 2px solid var(--cb-accent);
+  outline-offset: 2px;
+}
+.cb-doc .cb-json-tree {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.85em;
+  line-height: 1.5;
+  white-space: pre;
+  overflow-x: auto;
+  background: var(--cb-soft-bg);
+  border: 1px solid var(--cb-border);
+  padding: 0.85em 1.8em;
+}
+.cb-doc .cb-json-node > summary { display: list-item; cursor: pointer; }
+.cb-doc .cb-json-node > summary::marker { color: var(--cb-muted); }
+.cb-doc .cb-json-node[open] > summary .cb-json-collapsed { display: none; }
+.cb-doc .cb-json-collapsed, .cb-doc .cb-json-notice { color: var(--cb-muted); }
+.cb-doc .cb-json-children { margin-inline-start: 2ch; }
+
 /* 文档布局 (ticket 02, JS 渐进增强 installDocLayout): TOC 与正文是命名网格的
  * 真实兄弟列 — 正文永不环绕/流入 TOC 列. 窄屏单列 (TOC 在内容前) 是基础规则:
  * 窄屏无专门媒体查询 (旧分数像素断点查询已删除), 宽屏在 ≥ 75rem 媒体查询内
@@ -491,7 +528,7 @@ html:has(> body.cb-doc-page > .cb-reading-nav) {
 }
 /* 阅读动作 (所在目录/文件树/搜索/下载/复制链接/更多): 图标 + 文字标签 — 动作
  * 含义不依赖 hover 提示; 与工具区图标按钮同一视觉体系 (方角边框 + 主题色) */
-.cb-reading-action {
+.cb-reading-action, .cb-doc .cb-json-controls button {
   display: inline-flex;
   flex: none;
   align-items: center;
@@ -508,7 +545,7 @@ html:has(> body.cb-doc-page > .cb-reading-nav) {
   text-decoration: none;
   cursor: pointer;
 }
-.cb-reading-action:hover {
+.cb-reading-action:hover, .cb-doc .cb-json-controls button:hover:not(:disabled) {
   border-color: var(--cb-accent);
   color: var(--cb-accent);
   text-decoration: none;

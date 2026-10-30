@@ -14,11 +14,24 @@ chapbook（/ˈtʃæpbʊk/，小册子）—— 轻量高性能静态文件服务
 - **Org-mode Rendering** — `.org` 文件经 orgize 纯 Rust 渲染为自适应亮/暗色的 HTML：自建 TOC 侧栏、标题锚点、4 级标题完整保留、代码块语法高亮、KaTeX 数学公式；无子进程、无外部依赖
 - **Office / CSV Rendering** — `.doc/.docx/.ppt/.pptx/.xls/.xlsx/.odt/.ods/.odp/.rtf/.csv` 经 anydoc 纯 Rust 转为 GFM Markdown 后复用 comrak 渲染文档页（TOC/锚点/高亮与 `.md` 一致）；转换失败时完整页回退原始文件，fragment 显示安全占位；PDF 除外——浏览器原生打开
 - **Book Previews** — EPUB、FB2、CBZ 服务端可读预览，独立阅读页无 JS 也可读；能力与限制见下文
-- **Code Highlighting** — 源代码文件（含 `.txt`/`.log`/`.env`）按 Accept 协商返回 syntect 高亮 HTML（带行号）或原文；`?raw=1` / `?view=1` 显式覆盖。覆盖 60+ 语言（内置 + 内嵌补充 TypeScript/TOML/Kotlin/Swift/Dockerfile/GraphQL 等）
+- **Code Highlighting** — 源代码文件（含 `.txt`/`.log`/`.env`）按 Accept 协商返回 syntect 高亮 HTML 或原文；普通代码带行号，JSON 使用下述[专用预览](#json-预览)。`?raw=1` / `?view=1` 显式覆盖。覆盖 60+ 语言（内置 + 内嵌补充 TypeScript/TOML/Kotlin/Swift/Dockerfile/GraphQL 等）
 - **Range Requests & Media** — 支持断点续传（tower-http `ServeFile` 内置）；音视频浏览器内播放与 seek
 - **Open Locally & Download** — `?download=1` 显式下载（RFC 8187 编码文件名）；本机访问时可用系统默认应用打开文件（Linux xdg-open / macOS open / Windows ShellExecuteExW，仅 loopback + token 校验通过时）
 - **Security** — 逐分量路径解析，路径穿越返回 403；原始内容用 `sandbox allow-scripts` CSP 隔离（非下载的成功 PDF/音视频响应例外，强制 nosniff）；HTML 预览的 iframe 同样只允许 scripts，不含 `allow-same-origin`；所有 CB 完整页带 `frame-ancestors 'none'; script-src 'self'` 与 `X-Frame-Options: DENY`；Org 危险链接拒绝；悬空符号链接不会拖垮目录列表
 - **单文件分发** — 前端资源与 syntect 语法集全部内嵌进二进制，无外部文件依赖
+
+## JSON 预览
+
+- `.json`（扩展名大小写不敏感）默认显示高亮的格式化视图，对象与数组可逐项折叠／展开，
+  也可使用“全部展开／全部折叠”；空对象、空数组和标量直接显示。
+- “格式化／原文”就地切换。原文保留文件的原始空白、换行和制表符，不附加行号；
+  切换保留当前折叠状态，不重新请求文件、不改变 URL 或浏览历史，不修改磁盘文件。
+- 格式化只调整展示布局，字段顺序、重复键、大整数、指数与字符串转义保持原始写法。
+  独立阅读页、列表／网格预览面板和树内容区共用同一实现；亮暗主题自动跟随系统。
+- 格式化限 64 层、20,000 个值（根值也计入层数与数量）。非法 JSON 或结构超限时提示并显示高亮原文；
+  无 JavaScript 时仍有服务端高亮原文，不显示不可用的控件。
+- 沿用代码预览的 1 MiB／严格 UTF-8 限制：文件超限或非 UTF-8 时，完整页回退原文件，
+  fragment 显示安全占位。`?raw=1`、`?download=1` 与 Range 始终保留原始字节语义。
 
 ## 书籍预览
 
@@ -130,8 +143,8 @@ cp target/release/chapbook /usr/local/bin/
 ```
 
 预编译二进制与中文发布说明见 [GitHub Releases](https://github.com/weiwen99/chapbook/releases)。
-v0.6.0 支持 Linux x86_64（musl）、macOS Apple Silicon 和 Windows x86_64（GNU），版本说明见
-[v0.6.0 发布概要](docs/release-notes-v0.6.0.md)。更新后需重启原有 chapbook 进程。
+v0.7.0 支持 Linux x86_64（musl）、macOS Apple Silicon 和 Windows x86_64（GNU），版本说明见
+[v0.7.0 发布概要](docs/release-notes-v0.7.0.md)。更新后需重启原有 chapbook 进程。
 
 ## Run
 
