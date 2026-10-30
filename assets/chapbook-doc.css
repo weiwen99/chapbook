@@ -117,10 +117,20 @@ html:has(> body.cb-doc-page > .cb-reading-nav) {
 .cb-doc tr:nth-child(even) { background: var(--cb-soft-bg); }
 .cb-doc ul.task-list, .cb-doc ul.contains-task-list { list-style: none; padding-left: 1.2em; }
 .cb-doc ul.task-list input[type="checkbox"], .cb-doc ul.contains-task-list input[type="checkbox"] { margin-right: 0.45em; accent-color: var(--cb-accent); }
+.cb-doc li.cb-list-custom { list-style-type: none; }
+.cb-doc .cb-marker + p { display: inline; }
 .cb-doc span.todo { color: #cf222e; font-weight: 600; }
 .cb-doc span.done { color: #1a7f37; font-weight: 600; }
 .cb-doc img { max-width: 100%; height: auto; }
 .cb-doc hr { margin: 2em 0; border: none; border-top: 1px solid var(--cb-border); }
+
+/* 漫画页与阅读 pane 共用; 未解码前保留高度, 防止 lazy 图片全部折叠到同一屏. */
+.cb-doc .cb-page { margin: 1.5rem 0 3rem; }
+.cb-doc .cb-page-frame { min-height: 60vh; background: var(--cb-soft-bg); }
+.cb-doc .cb-page-image { display: block; width: 100%; height: auto; }
+.cb-doc .cb-page figcaption { margin: 0.6rem 0; color: var(--cb-muted); }
+.cb-doc .cb-page-nav { display: flex; gap: 1rem; }
+.cb-doc .cb-page-nav a[rel="next"] { margin-inline-start: auto; }
 
 /* KaTeX 数学 (服务端渲染的 .katex 结构):
  * display 公式 (align/$$ 块) 常超正文栏宽, 容器横向滚动而非撑破布局;

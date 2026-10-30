@@ -5,8 +5,8 @@
 ## 项目简介
 
 **chapbook**（简称 **CB**）是一个轻量静态文件服务器，二进制名同为 `chapbook`。功能：目录列表（Materialize UI、可排序）、
-静态文件服务（Range 请求）、`.md` 经 comrak、`.org` 经 orgize、Office/CSV 文档经 anydoc、源代码文件经
-syntect 渲染（全部纯 Rust、零运行时外部依赖）。
+静态文件服务（Range 请求）、`.md` 经 comrak、`.org` 经 orgize、Office/CSV 文档经 anydoc、EPUB/FB2/CBZ
+经私有 books Module、源代码文件经 syntect 渲染（零运行时外部依赖）。
 
 ## 常用命令
 
@@ -44,7 +44,7 @@ chapbook [-h|--host <HOST>] [-p|--port <PORT>] <root-directory>
 ```
 src/
   main.rs      # 入口：日志初始化、TCP bind、优雅退出（Ctrl-C）
-  lib.rs       # 库入口，导出下列模块（集成测试依赖 lib target）
+  lib.rs       # 库入口（集成测试依赖 lib target；books 保持私有）
   desktop.rs   # 仅 Windows：CLI native-open 与 GUI 共用的 ShellExecuteExW 默认应用接口
   launcher/
     main.rs    # GUI 生命周期：选择目录、自动端口、默认浏览器、同进程 HTTP 服务与有界退出
@@ -58,7 +58,8 @@ src/
   math.rs      # LaTeX 数学公式服务端 KaTeX 渲染（md span 替换 / org Text tokenize）
   org.rs       # orgize 渲染 .org：预扫描元数据 + 自定义 HtmlHandler + src 块高亮
   markdown.rs  # comrak 渲染 .md：front matter、HeadingAdapter 锚点/TOC、代码高亮适配器
-  office.rs    # anydoc 转换 Office/CSV 为 GFM markdown：格式表（排除 PDF）、大小上限
+  office.rs    # anydoc 转换 Office/CSV 为 GFM markdown：格式表（排除 PDF/EPUB）、大小上限
+  books/       # EPUB Document / FB2 XML / CBZ 图片页；共享受控 HTML、编码与资源限额（私有）
   routes.rs    # axum 路由、ResponseMode、fragment/search/native-open 与安全响应出口
   assets.rs    # include_str! 内嵌前端资源
 assets/        # materialize.min.css / materialize.min.js（v2.3.3 社区分支）+ chapbook-theme.css（目录页主题）
@@ -72,6 +73,7 @@ vendor/        # quick-js 0.4.1（katex crate 的 JS 引擎）本地副本：唯
                # （KaTeX 解析 7+ 层 \cfrac 嵌套会栈溢出），经 [patch.crates-io] 生效
 tests/
   router.rs    # 路由集成测试（渲染/协商/安全）
+  books.rs     # 书籍 HTTP 回归（资产/内链/协商/归档和 XML 边界）
   sort.rs      # SortBy 解析测试
 ```
 
@@ -134,22 +136,22 @@ tests/
    `Plain Text` 阅读视图（带行号、转义）；否则维持占位/原字节。raw/download 不嗅探，
    `ServeFile` 的 Content-Type 不变。
 8. Office/CSV 文档（`office.rs` 的 anydoc 格式表内：doc/docx/docm、ppt/pps/pot/pptx/pptm/ppsx/ppsm、
-   xls/xlsx/xlsm/xlsb、odt/ods/odp、rtf、epub、csv；**PDF 除外**——浏览器原生打开）同样按
+   xls/xlsx/xlsm/xlsb、odt/ods/odp、rtf、csv；**PDF 除外**——浏览器原生打开）同样按
    **Accept 协商**返回：`text/html` → anydoc 转 GFM markdown 后经 `render_markdown_response`
    渲染为文档页（与 .md 同一 comrak 管线，TOC/锚点/高亮一致）；否则 → 原文。
    `?raw=1` / `?view=1` 显式覆盖。转换失败（ConvertError：加密/损坏/超限）与 >32 MiB
    （`office::MAX_RENDER_BYTES`）文件不渲染，ServeFile 裸字节透传。
-   转换经有界并发门（容量 1 的 `spawn_blocking` + Semaphore，与搜索门同构、共用
-   `run_blocking_job` seam）：忙即失败不排队——fragment 返回 200 安全占位 HTML
+   转换与书籍共用 `document_gate`（容量 1 的 `spawn_blocking` + Semaphore，与搜索门同构、
+   共用 `run_blocking_job` seam）：忙即失败不排队——fragment 返回 200 安全占位 HTML
    （绝不回退裸字节），完整页返回 503 + `Retry-After: 1`；permit 由阻塞 job 持有到
    真实转换结束，handler 取消不提前释放容量。
-   判定顺序：目录 → .md → .org → Office/CSV → 代码 → 未知扩展名纯文本兜底 → ServeFile。
+   判定顺序：目录 → .md → .org → EPUB/FB2/CBZ → Office/CSV → 代码 → 未知扩展名纯文本兜底 → ServeFile。
 9. 所有文件请求先统一解析 `ResponseMode`，优先级固定为
    `download > raw > fragment > view > 类型默认协商`。`download` 一律返回原始字节并附
    RFC 8187 `Content-Disposition`；`raw` 一律走 `ServeFile`；目录忽略这些模式并返回完整目录页，
    只有 `fragment` 返回迷你列表。
 10. `fragment` 是预览面板的严格 HTML 接口：成功和失败都只返回 CB 生成的
-    `text/html; charset=utf-8` + `nosniff` 片段；非 UTF-8、超限、Office 转换失败和不支持类型
+    `text/html; charset=utf-8` + `nosniff` 片段；非 UTF-8、超限、Office/书籍转换失败和不支持类型
     返回占位片段，**禁止**回退原始字节。未知扩展名若内容是严格 UTF-8 文本则按纯文本渲染
     （见第 7 条），只有不满足该条件时才返回占位。文档/代码正文统一包在 `.cb-doc`，完整页 body 为
     `.cb-doc-page`；目录页同时加载 `chapbook-doc.css` 供预览使用。
@@ -197,6 +199,16 @@ tests/
     隐藏焦点回退不打开其他条目，不改变文档正文，排序/隐藏不重新转换打开的文档。
     native-open 仅完整目录/搜索的列表、网格持有 token；进入树清除 token/动作/handler，
     退出树经同上下文完整可信页恢复能力，fragment、快照与存储永不传播 token。
+16. EPUB 不再走 Office 的 Markdown serializer：一次 `anydoc::to_document` 保留资产与源锚点，
+    FB2 映射同一 model，共用受控 HTML、slug/TOC 和 `render::dangerous_url`。FB2 各 body（含 notes）
+    保持源顺序，内容内 URI fragment 只 percent-decode 一次；不改变文件 action identity。
+    CBZ 仅单卷 ZIP32 Stored/Deflated；成员原始完整名字节自然排序，隐藏/非图片/目录/符号链接排除。
+    `GET /__/book-page/{*path}?page=N` 只按已校验 ZIP 索引读取，复用 root 路径解析；初始化前绑定
+    有界中央目录快照，不能让 zip fallback 到未校验 footer。页任务独立 `page_gate(2)` 等待，
+    permit 仍由真实阻塞任务持有；资源成功与错误均 `nosniff`、CSP `sandbox`、`no-store`。
+    FB2/SVG XML 在 DOM 前拒绝内部 DTD subset，并限制 `<`/`=` 字面计数；外部实体 resolver 关闭。
+    不解包到磁盘、不缓存、不新增前端解析器；完整页无 JS 可读，fragment 复用现有面板/树。
+    限额、降级与不支持范围以 [.scratch/book-previews/spec.md](.scratch/book-previews/spec.md) 为准。
 
 ## 安全不变量
 
@@ -239,7 +251,10 @@ tests/
 | syntect 5 | 代码高亮 | 内嵌语法集（默认 ~50 语言 + `assets/syntaxes/` 补充 14 个常见语言，二进制 +~0.5MB）；`ClassStyle::Spaced` 输出 scope atom 类名 |
 | katex 0.4 | LaTeX 数学渲染 | 内嵌官方 KaTeX 0.16.7 `katex.min.js`，经 quick-js 执行（构建期编译 QuickJS C 源码，非运行时依赖）；渲染失败返回 Err，math.rs 回退原文；**升级时 `katex` crate 版本必须与 `assets/katex/` 的 CSS/字体版本一致**（见 THIRD_PARTY_NOTICES）；二进制 +~2.5MB（引擎 + 字体） |
 | quick-js 0.4.1（vendor/ 本地 patch） | katex 的 JS 引擎 | 上游无栈配置 API；本地副本把 QuickJS JS 栈 256KB→8MB（`JS_SetMaxStackSize`，见 vendor/quick-js/src/bindings.rs），否则 KaTeX 解析深嵌套公式（`\cfrac` 7+ 层，pell 连分数文档真实场景）栈溢出回退原文；经 `[patch.crates-io]` 生效，升级 katex 时需同步核对 |
-| anydoc 0.1.8 | Office/CSV → GFM markdown | 纯 Rust（zip/calamine/cfb/quick-xml/pdf-inspector），无子进程；**锁精确版本**（0.1.x 早期，API 可能变动；升级需核对 `Format` 表与 `ConvertError`）；MSRV 1.88；二进制 +~6MB；经 `log` facade 报恢复事件，`tracing-log` 桥接到 RUST_LOG |
+| anydoc 0.1.8 | Office/CSV → GFM markdown；EPUB → Document | 纯 Rust（zip/calamine/cfb/quick-xml/pdf-inspector），无子进程；**锁精确版本**（升级需核对 `Format`/`ConvertError` 与公共 model）；MSRV 1.88；经 `log` facade 报恢复事件，`tracing-log` 桥接到 RUST_LOG |
+| roxmltree 0.21 + quick-xml 0.41 | FB2/SVG XML | quick-xml 借用式 prolog 预检后才建有节点上限的 DOM；拒绝内部实体展开与无界预分配 |
+| encoding_rs 0.8 + base64 0.22 | FB2 声明编码、书籍图片资产 | 严格解码，单图/总资产限额先于扩容 |
+| zip 8 | CBZ 索引与页读取 | 与 anydoc 共用版本，仅启用 deflate；受控目录快照初始化，保留库的 extra fields/CRC 处理 |
 | clap (derive) | CLI | `disable_help_flag`，`-h` 让给 `--host` |
 | chrono | 时间格式化 | `yyyy-MM-dd HH:mm:ss` 本地时区 |
 | percent-encoding | href 编码 | 见安全不变量 |
@@ -264,8 +279,8 @@ Materialize 前端资源来自 [materializecss/materialize](https://github.com/m
 
 1. 路径穿越：词法前缀比较不消除 `..` 分量 → 逐分量解析，溢出 root 返回 403；符号链接保持跟随。
 2. 文件名链接使用 percent-encoding（空格 `%20`），不用表单语义（`+`）。
-3. 除受控 native-open 外零运行时外部依赖：.md/comrak、.org/orgize、代码/syntect、Office/CSV/anydoc
-   全部纯 Rust；LaTeX 数学/katex crate（官方 KaTeX JS 经 quick-js 执行，quick-js 是构建期编译的
+3. 除受控 native-open 外零运行时外部依赖：.md/comrak、.org/orgize、代码/syntect、Office/CSV/anydoc、
+   EPUB/FB2/CBZ/books；LaTeX 数学/katex crate（官方 KaTeX JS 经 quick-js 执行，quick-js 是构建期编译的
    C 源码，静态链接进二进制）。本机打开例外：Linux 的 `xdg-open` / macOS 的 `open`
    仅在完整安全校验后 spawn，使用 Tokio async wait 回收，runtime shutdown 时 kill-on-drop；
    Windows 使用系统 `ShellExecuteExW` 文件关联，不启动命令解释器。

@@ -118,6 +118,12 @@ Zig、INI、Nix、Svelte）：
 | [orgize](https://github.com/PoiScript/orgize) | MIT | .org 文档渲染 |
 | [comrak](https://github.com/kivikakk/comrak) | BSD-2-Clause | .md 文档渲染 |
 | [syntect](https://github.com/trishume/syntect) | MIT | 代码语法高亮（内嵌语法集） |
+| [anydoc 0.1.8](https://github.com/firecrawl/anydoc) | MIT | Office/CSV 转换、EPUB 解析与公共文档模型 |
+| [roxmltree 0.21.2](https://github.com/RazrFalcon/roxmltree) | MIT OR Apache-2.0 | 有界 FB2/SVG XML DOM |
+| [quick-xml 0.41.0](https://github.com/tafia/quick-xml) | MIT | XML prolog 安全预检 |
+| [encoding_rs 0.8.35](https://github.com/hsivonen/encoding_rs) | (Apache-2.0 OR MIT) AND BSD-3-Clause | FB2 声明编码解码 |
+| [base64 0.22.1](https://github.com/marshallpierce/rust-base64) | MIT OR Apache-2.0 | 书籍内嵌图片编解码 |
+| [zip 8.6.0](https://github.com/zip-rs/zip2) | MIT | CBZ 索引、Stored/Deflated 页读取与 CRC 校验 |
 | [katex](https://github.com/xu-cheng/katex-rs) | MIT OR Apache-2.0 | LaTeX 数学渲染（内嵌官方 KaTeX 0.16.7 JS，经 QuickJS 执行） |
 | [quick-js](https://github.com/theduke/quickjs-rs)（**vendor/ 本地副本**，含 QuickJS C 源码） | MIT | katex crate 的 JS 引擎（构建期经 cc 编译，静态链接）。本地仅一处改动：`src/bindings.rs` 中 `JS_SetMaxStackSize` 由 256KB 提到 8MB，见 AGENTS.md |
 | [maud](https://github.com/lambda-fairy/maud) | MIT OR Apache-2.0 | HTML 模板 |

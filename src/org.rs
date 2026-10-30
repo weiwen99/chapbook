@@ -174,7 +174,7 @@ impl HtmlHandler<IoError> for OrgHtmlHandler {
             // orgize 的 Link 是叶子元素 (desc 为纯文本, 无嵌套行内标记事件), 整段
             // `<a>` 在 start 输出, end 无对应事件 — 与 DefaultHtmlHandler 结构一致.
             Element::Link(link) => {
-                if !dangerous_org_url(&link.path)
+                if !render::dangerous_url(&link.path)
                     && link.desc.is_none()
                     && is_image_path(&link.path)
                 {
@@ -185,7 +185,7 @@ impl HtmlHandler<IoError> for OrgHtmlHandler {
                         HtmlEscape(&link.path)
                     )?;
                 } else {
-                    let href = if dangerous_org_url(&link.path) {
+                    let href = if render::dangerous_url(&link.path) {
                         ""
                     } else {
                         link.path.as_ref()
@@ -263,24 +263,6 @@ impl HtmlHandler<IoError> for OrgHtmlHandler {
         }
         Ok(())
     }
-}
-
-/// 链接 URL 是否危险 (javascript / vbscript / data / file 协议).
-/// 取首个 `:` 之前的候选协议名, 去掉所有 ASCII 空白/控制字符后 ASCII 小写比较;
-/// 无 `:` 的相对路径与 `#fragment` 天然安全, 未知协议名保持允许.
-fn dangerous_org_url(url: &str) -> bool {
-    let Some((scheme, _)) = url.split_once(':') else {
-        return false;
-    };
-    let normalized: String = scheme
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace() && !c.is_ascii_control())
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-    matches!(
-        normalized.as_str(),
-        "javascript" | "vbscript" | "data" | "file"
-    )
 }
 
 /// 裸链接是否为图片路径 (按扩展名判定, 大小写不敏感; 忽略 query 部分).

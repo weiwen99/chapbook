@@ -24,7 +24,7 @@ use crate::meta::{
     content_disposition, display_path_markup, display_path_text, encode_relative_path,
     escape_os_name,
 };
-use crate::{assets, highlight, listing, markdown, office, org, render, sort::SortBy};
+use crate::{assets, books, highlight, listing, markdown, office, org, render, sort::SortBy};
 
 #[derive(Clone)]
 struct AppState {
@@ -32,10 +32,11 @@ struct AppState {
     root: PathBuf,
     /// 递归搜索并发门: 容量固定 1, 非空查询同一时刻只允许一个阻塞扫描.
     search_gate: Arc<Semaphore>,
-    /// Office 转换并发门: 容量固定 1. 转换是 CPU/内存密集活 (zip 解压 + 解析,
-    /// 32 MiB 上限), 排队只会让慢转换身后堆积更多慢转换; 与搜索门一致采取
+    /// Office / 书籍转换与归档索引共用容量 1; 各格式在转换前检查输入预算.
     /// 忙即失败不排队 (fragment 占位 / 完整页 503 + Retry-After).
-    office_gate: Arc<Semaphore>,
+    document_gate: Arc<Semaphore>,
+    /// 漫画图片按需解压: 容量 2, async 等待, 不能因浏览器并发加载而丢页.
+    page_gate: Arc<Semaphore>,
     /// 本机打开 (native-open) 随机令牌: 从系统安全随机源生成 16 字节的 hex.
     /// 绝不写入日志; 仅嵌入 loopback 可信页面, 且仅 POST 校验链通过时使用.
     token: String,
@@ -56,7 +57,8 @@ fn app_with(root: PathBuf, token: String, opener: Arc<dyn OpenWith>) -> Router {
     let state = AppState {
         root,
         search_gate: Arc::new(Semaphore::new(1)),
-        office_gate: Arc::new(Semaphore::new(1)),
+        document_gate: Arc::new(Semaphore::new(1)),
+        page_gate: Arc::new(Semaphore::new(2)),
         token,
         opener,
     };
@@ -65,6 +67,7 @@ fn app_with(root: PathBuf, token: String, opener: Arc<dyn OpenWith>) -> Router {
         .route("/__/search", get(serve_search))
         .route("/__/native-open", post(native_open))
         .route("/__/static/{*path}", get(static_asset))
+        .route("/__/book-page/{*path}", get(serve_book_page))
         .route("/__/tree", get(serve_tree))
         .route("/__/tree/{*path}", get(serve_tree))
         .route("/", get(serve_path))
@@ -366,7 +369,7 @@ enum BlockingJobError {
     Task(tokio::task::JoinError),
 }
 
-/// 私有并发/生命周期 seam (搜索与 Office 转换共用, 各自持有独立 gate):
+/// 私有并发/生命周期 seam (搜索与文档转换共用, 各自持有独立 gate):
 /// 容量 1 的信号量门 + spawn_blocking.
 ///
 /// - `try_acquire_owned`: 失败即 Busy, **不调用 job**;
@@ -384,13 +387,27 @@ where
     let Ok(permit) = gate.try_acquire_owned() else {
         return Err(BlockingJobError::Busy);
     };
-    let handle = tokio::task::spawn_blocking(move || {
-        // permit 由 blocking task 持有到 job 结束 (panic 时随 unwind 释放)
+    spawn_blocking_with_permit(permit, job)
+        .await
+        .map_err(BlockingJobError::Task)
+}
+
+/// 已取得的 permit 归真实 job 所有, fail-fast 与等待门共用取消语义.
+async fn spawn_blocking_with_permit<T, F>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    job: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
         let _permit = permit;
         job()
-    });
-    handle.await.map_err(BlockingJobError::Task)
+    })
+    .await
 }
+
 /// Office 转换结果 (同步 seam, 在阻塞任务内执行): 成功 GFM markdown / anydoc
 /// 转换失败 / 文件读取失败. 32 MiB 上限由调用方先行判定.
 #[derive(Debug)]
@@ -534,7 +551,7 @@ async fn serve_path(
                 serve_fragment(&state, &fs_path, &metadata, kind, options).await
             }
             // Full (?view=1 强制渲染) 与默认 (无模式键): 类型分派;
-            // 仅 Office/代码在默认且 Accept 不含 text/html 时按 Raw 返回原文
+            // Office / 书籍 / 代码在默认且 Accept 不含 text/html 时返回原文.
             Some(ResponseMode::Full) | None => {
                 if fs_path.extension() == Some(std::ffi::OsStr::new("md")) {
                     let encoded = encode_path();
@@ -544,6 +561,21 @@ async fn serve_path(
                     let encoded = encode_path();
                     // 如果是 .org 文件，使用 orgize 渲染 (headers 透传供非 UTF-8 回退)
                     serve_org(&fs_path, headers, encoded.as_deref(), options).await
+                } else if let Some(format) = books::format_for_path(&fs_path) {
+                    if mode == Some(ResponseMode::Full) || accepts_html(&headers) {
+                        serve_book(
+                            &state,
+                            &fs_path,
+                            format,
+                            &metadata,
+                            headers,
+                            encode_path(),
+                            options,
+                        )
+                        .await
+                    } else {
+                        serve_file(&fs_path, headers, false).await
+                    }
                 } else if let Some(format) = office::format_for_path(&fs_path) {
                     // Office 文档 / CSV: 浏览器 -> anydoc 转 markdown 渲染, 脚本 -> 原文
                     if mode == Some(ResponseMode::Full) || accepts_html(&headers) {
@@ -849,12 +881,13 @@ fn path_rejection_is_root_route(rejection: &PathRejection) -> bool {
 }
 
 /// fragment 类型分派: 与 serve_path 的类型判定顺序一致
-/// (目录 -> md -> org -> Office -> 代码 -> 媒体 -> 不支持).
+/// (目录 -> md -> org -> 书籍 -> Office -> 代码 -> 媒体 -> 不支持).
 enum FragmentKind {
     Dir,
     Markdown,
     Org,
     Html,
+    Book(books::Format),
     Office(office::Format),
     Code(&'static str),
     Media(MediaKind),
@@ -875,6 +908,8 @@ fn classify_fragment(path: &Path) -> FragmentKind {
         FragmentKind::Org
     } else if is_html_path(path) {
         FragmentKind::Html
+    } else if let Some(format) = books::format_for_path(path) {
+        FragmentKind::Book(format)
     } else if let Some(format) = office::format_for_path(path) {
         FragmentKind::Office(format)
     } else if let Some(lang) = highlight::language_for_path(path) {
@@ -961,13 +996,48 @@ async fn serve_fragment(
             };
             fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
         }
+        FragmentKind::Book(format) => {
+            let inner = if !metadata.is_file() || metadata.len() > format.max_file_bytes() {
+                no_preview("文件不是普通文件或超过预览大小限制")
+            } else {
+                let path_buf = path.to_path_buf();
+                let resource_path = if format == books::Format::Cbz {
+                    encoded.clone().unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                match run_blocking_job(state.document_gate.clone(), move || {
+                    books::render(&path_buf, format, &resource_path)
+                })
+                .await
+                {
+                    Ok(Ok(body)) => render::doc_fragment(&body),
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, path = ?path, "fragment: book preview failed");
+                        no_preview(match error {
+                            books::Error::Io(_) | books::Error::NotFound => "无法读取文件",
+                            books::Error::Limit(_) => "文档超过预览资源限制",
+                            books::Error::Invalid(_) | books::Error::Unsupported(_) => {
+                                "书籍损坏或格式不受支持"
+                            }
+                        })
+                    }
+                    Err(BlockingJobError::Busy) => no_preview("预览繁忙，请稍后重试"),
+                    Err(BlockingJobError::Task(error)) => {
+                        tracing::warn!(%error, "fragment: book blocking task failed");
+                        no_preview("转换失败")
+                    }
+                }
+            };
+            fragment_response(fragment_wrapper(encoded.as_deref(), rel, options, inner))
+        }
         FragmentKind::Office(format) => {
             let inner = if metadata.len() > office::MAX_RENDER_BYTES {
                 no_preview("文件过大（超过 32 MiB 限制）")
             } else {
                 let file_name = file_name_text(path);
                 let path_buf = path.to_path_buf();
-                match run_blocking_job(state.office_gate.clone(), move || {
+                match run_blocking_job(state.document_gate.clone(), move || {
                     convert_office_document(&path_buf, format)
                 })
                 .await
@@ -1347,7 +1417,7 @@ async fn serve_office(
         return serve_file(path, headers, false).await;
     }
     let path_buf = path.to_path_buf();
-    match run_blocking_job(state.office_gate.clone(), move || {
+    match run_blocking_job(state.document_gate.clone(), move || {
         convert_office_document(&path_buf, format)
     })
     .await
@@ -1375,6 +1445,128 @@ async fn serve_office(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// 书籍与 Office 使用相同协商/失败出口, 内部模型 HTML 不再经过 Markdown.
+async fn serve_book(
+    state: &AppState,
+    path: &Path,
+    format: books::Format,
+    metadata: &std::fs::Metadata,
+    headers: HeaderMap,
+    encoded: Option<String>,
+    options: ListingOptions,
+) -> Response {
+    if !metadata.is_file() || metadata.len() > format.max_file_bytes() {
+        return serve_file(path, headers, false).await;
+    }
+    let path_buf = path.to_path_buf();
+    match run_blocking_job(state.document_gate.clone(), move || {
+        let body = books::render(&path_buf, format, encoded.as_deref().unwrap_or_default());
+        (body, encoded)
+    })
+    .await
+    {
+        Ok((Ok(body), encoded)) => {
+            let page = render::doc_page(&file_name_text(path), &body, encoded.as_deref(), options);
+            trusted_ui_response(render::inject_doc_style(&page))
+        }
+        Ok((Err(books::Error::Io(error)), _)) => {
+            tracing::warn!(%error, path = ?path, "failed to read book");
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Ok((Err(error), _)) => {
+            tracing::warn!(%error, path = ?path, "book preview failed, serving original");
+            serve_file(path, headers, false).await
+        }
+        Err(BlockingJobError::Busy) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+        )
+            .into_response(),
+        Err(BlockingJobError::Task(error)) => {
+            tracing::warn!(%error, "book blocking task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// 图片子资源不解释 ResponseMode; 原始归档仍由普通文件出口处理.
+async fn serve_book_page(
+    State(state): State<AppState>,
+    raw_path: Result<AxumPath<String>, PathRejection>,
+    query: Result<Query<HashMap<String, String>>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Ok(AxumPath(raw_path)) = raw_path else {
+        return book_page_response(StatusCode::BAD_REQUEST.into_response());
+    };
+    let Ok(Query(params)) = query else {
+        return book_page_response(StatusCode::NOT_FOUND.into_response());
+    };
+    let Some(index) = params
+        .get("page")
+        .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return book_page_response(StatusCode::NOT_FOUND.into_response());
+    };
+    let Some(path) = resolve_within_root(&state.root, &raw_path) else {
+        return book_page_response(StatusCode::FORBIDDEN.into_response());
+    };
+    if books::format_for_path(&path) != Some(books::Format::Cbz) {
+        return book_page_response(StatusCode::NOT_FOUND.into_response());
+    }
+    match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return book_page_response(StatusCode::NOT_FOUND.into_response()),
+    }
+    // 等待发生在 async 层; 尚未获得容量时不打开/解压归档或占用 blocking worker.
+    let Ok(permit) = state.page_gate.clone().acquire_owned().await else {
+        return book_page_response(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+    let response = match spawn_blocking_with_permit(permit, move || books::cbz_page(&path, index))
+        .await
+    {
+        Ok(Ok(image)) => ([(header::CONTENT_TYPE, image.media_type)], image.bytes).into_response(),
+        Ok(Err(error)) => {
+            let status = match &error {
+                books::Error::NotFound => StatusCode::NOT_FOUND,
+                books::Error::Io(error) => match error.kind() {
+                    io::ErrorKind::NotFound
+                    | io::ErrorKind::NotADirectory
+                    | io::ErrorKind::PermissionDenied => StatusCode::NOT_FOUND,
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData => {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                },
+                books::Error::Invalid(_)
+                | books::Error::Unsupported(_)
+                | books::Error::Limit(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            };
+            tracing::warn!(%error, index, "failed to read comic page");
+            status.into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "comic page blocking task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    };
+    book_page_response(response)
+}
+
+fn book_page_response(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// 渲染失败时的回退: 以纯文本返回原文.
@@ -1774,7 +1966,8 @@ mod tests {
         let state = AppState {
             root: dir.path().to_path_buf(),
             search_gate: gate.clone(),
-            office_gate: Arc::new(Semaphore::new(1)),
+            document_gate: Arc::new(Semaphore::new(1)),
+            page_gate: Arc::new(Semaphore::new(2)),
             token: "test-token".to_string(),
             opener: Arc::new(RecordingOpener::new()),
         };
@@ -1850,7 +2043,8 @@ mod tests {
         let state = AppState {
             root: dir.path().to_path_buf(),
             search_gate: gate.clone(),
-            office_gate: Arc::new(Semaphore::new(1)),
+            document_gate: Arc::new(Semaphore::new(1)),
+            page_gate: Arc::new(Semaphore::new(2)),
             token: "test-token".to_string(),
             opener: Arc::new(RecordingOpener::new()),
         };
@@ -2166,15 +2360,76 @@ mod tests {
         }
     }
 
-    /// 构造私有 AppState (同模块直构): office_gate 由调用方预持有, busy 判定确定化.
-    fn office_test_state(dir: &Path, gate: Arc<Semaphore>) -> AppState {
+    /// 转换门由调用方预持有, 使 Office / 书籍的繁忙路径可确定地验证.
+    fn document_test_state(dir: &Path, gate: Arc<Semaphore>) -> AppState {
         AppState {
             root: dir.to_path_buf(),
             search_gate: Arc::new(Semaphore::new(1)),
-            office_gate: gate,
+            document_gate: gate,
+            page_gate: Arc::new(Semaphore::new(2)),
             token: "test-token".to_string(),
             opener: Arc::new(RecordingOpener::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn book_conversion_busy_keeps_safe_fragment_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.fb2");
+        std::fs::write(
+            &path,
+            "<FictionBook><body><section><p>Readable book</p></section></body></FictionBook>",
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let gate = Arc::new(Semaphore::new(1));
+        let held = gate.clone().try_acquire_owned().unwrap();
+        let state = document_test_state(dir.path(), gate);
+        let fragment = serve_fragment(
+            &state,
+            &path,
+            &metadata,
+            FragmentKind::Book(books::Format::Fb2),
+            ListingOptions::default(),
+        )
+        .await;
+        assert_eq!(fragment.status(), StatusCode::OK);
+        assert_eq!(
+            fragment.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            fragment.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        let body = body_to_string(fragment).await;
+        assert!(body.contains("data-cb-content-state=\"placeholder\""));
+        assert!(!body.contains("Readable book"));
+        let full = serve_book(
+            &state,
+            &path,
+            books::Format::Fb2,
+            &metadata,
+            HeaderMap::new(),
+            Some("book.fb2".into()),
+            ListingOptions::default(),
+        )
+        .await;
+        assert_eq!(full.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(full.headers()[header::RETRY_AFTER], "1");
+        drop(held);
+        let full = serve_book(
+            &state,
+            &path,
+            books::Format::Fb2,
+            &metadata,
+            HeaderMap::new(),
+            Some("book.fb2".into()),
+            ListingOptions::default(),
+        )
+        .await;
+        assert_eq!(full.status(), StatusCode::OK);
+        assert!(body_to_string(full).await.contains("Readable book"));
     }
 
     /// 预持有 office permit -> fragment Busy -> 200 安全占位 HTML (绝不裸字节);
@@ -2187,7 +2442,7 @@ mod tests {
         let metadata = std::fs::metadata(&csv_path).unwrap();
         let gate = Arc::new(Semaphore::new(1));
         let held = gate.clone().try_acquire_owned().expect("preheld permit");
-        let state = office_test_state(dir.path(), gate.clone());
+        let state = document_test_state(dir.path(), gate.clone());
 
         // fragment 忙 -> 200 安全占位 (wrapper + no_preview, 无任何原始内容)
         let res = serve_fragment(
@@ -2216,10 +2471,6 @@ mod tests {
             "nosniff"
         );
         let body = body_to_string(res).await;
-        assert!(
-            body.contains("无法预览：预览繁忙，请稍后重试"),
-            "busy fragment must be a safe placeholder: {body}"
-        );
         assert!(
             body.contains(r#"data-cb-content-state="placeholder""#),
             "busy placeholder must be identifiable without wording: {body}"

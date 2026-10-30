@@ -36,9 +36,15 @@ tower-http = { version = "0.6", features = ["fs"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
-# 纯 Rust Office/CSV -> GFM markdown (firecrawl/anydoc, MIT); MSRV 1.88 满足 (本机 1.97).
-# 锁精确版本: 0.1.x 早期, API 可能变动; PDF 不启用 (浏览器原生打开).
+# 纯 Rust Office/CSV -> GFM markdown、EPUB -> Document (firecrawl/anydoc, MIT).
+# 锁精确版本: 0.1.x 早期, API 可能变动; PDF 由浏览器原生打开.
 anydoc = "=0.1.8"
+# 书籍容器与受限 XML/图片解码; ZIP 仅启用 Store/Deflate, 与 anydoc 一致.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+base64 = "0.22"
+encoding_rs = "0.8"
+quick-xml = "0.41"
+roxmltree = "0.21.2"
 chrono = "0.4"
 percent-encoding = "2"
 # 系统安全随机源: Windows 使用系统 RNG, 不依赖 Unix 的 /dev/urandom.
@@ -62,8 +68,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 tempfile = "3"
-# 测试内构造最小 docx/xlsx fixture (与 anydoc 的 zip 版本一致, 锁文件复用)
-zip = "8"
 # 测试内执行内嵌浏览器 JS (canonical transport 行为矩阵): 与 katex 相同的
 # 本地 vendor patch (栈 8MB), 仅测试使用, 非运行时依赖.
 quick-js = "=0.4.1"

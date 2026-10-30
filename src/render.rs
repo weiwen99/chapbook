@@ -1388,6 +1388,21 @@ fn toc_node(nodes: &[TocNode], idx: usize) -> Markup {
     }
 }
 
+/// Org 与书籍共用的危险协议判断; ASCII 空白/control 混淆不绕过拒绝表.
+/// 相对链接、fragment 与未列出的协议保持原 Org 行为, 不分配规范化字符串.
+pub(crate) fn dangerous_url(url: &str) -> bool {
+    let Some((scheme, _)) = url.split_once(':') else {
+        return false;
+    };
+    let normalized = scheme
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && !b.is_ascii_control())
+        .map(|b| b.to_ascii_lowercase());
+    ["javascript", "vbscript", "data", "file"]
+        .iter()
+        .any(|blocked| normalized.clone().eq(blocked.bytes()))
+}
+
 /// 将 DOC_STYLE 注入页面 </head> 之前, 覆盖各渲染器的默认样式.
 pub fn inject_doc_style(html: &str) -> String {
     match html.find("</head>") {

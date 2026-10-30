@@ -9,15 +9,36 @@ chapbook（/ˈtʃæpbʊk/，小册子）—— 轻量高性能静态文件服务
 - **Browser Views** — 树、列表、网格为三个同级视图，共用顶部图标工具区；hover/键盘焦点显示含义，隐藏项开关与六键双向排序适用于目录、树、搜索和目录预览
 - **Recursive Search** — `/__/search?q=` 服务端递归文件名搜索（过滤后确定性 BFS 取前 500 个候选，再按当前规则排序，不建索引）
 - **Keyboard Navigation** — `j/k/↑/↓` 移动选中行，`Enter`/`o` 打开，`p` 预览，`v` 按列表→网格→树→列表循环，`/` 聚焦搜索框，`Backspace` 上级目录；输入框和修饰键不触发视图切换
-- **Preview Panel** — 侧边面板以 fragment 渲染 .md/.org/Office/代码/图片/音视频，以及内容为严格 UTF-8 的未知扩展名纯文本，并以 sandboxed iframe 显示 .html/.htm 浏览器原生页面；HTML 预览可在页面与高亮源码（带行号）之间切换，不离开列表即可查看。树内容区打开 HTML 时提供同一 页面/源码 工具栏
+- **Preview Panel** — 侧边面板以 fragment 渲染 .md/.org/Office/EPUB/FB2/CBZ/代码/图片/音视频，以及内容为严格 UTF-8 的未知扩展名纯文本，并以 sandboxed iframe 显示 .html/.htm 浏览器原生页面；HTML 预览可在页面与高亮源码（带行号）之间切换，不离开列表即可查看。树内容区打开 HTML 时提供同一 页面/源码 工具栏
 - **Markdown Rendering** — `.md` 文件经 comrak 纯 Rust 渲染为自适应亮/暗色的 HTML：自建 TOC 侧栏、标题锚点、syntect 语法高亮、YAML front matter 标题、KaTeX 数学公式；无外部 CDN 依赖
 - **Org-mode Rendering** — `.org` 文件经 orgize 纯 Rust 渲染为自适应亮/暗色的 HTML：自建 TOC 侧栏、标题锚点、4 级标题完整保留、代码块语法高亮、KaTeX 数学公式；无子进程、无外部依赖
-- **Office / CSV Rendering** — `.doc/.docx/.ppt/.pptx/.xls/.xlsx/.odt/.ods/.odp/.rtf/.epub/.csv` 经 anydoc 纯 Rust 转为 GFM Markdown 后复用 comrak 渲染文档页（TOC/锚点/高亮与 `.md` 一致）；转换失败自动回退原文件下载；PDF 除外——浏览器原生打开
+- **Office / CSV Rendering** — `.doc/.docx/.ppt/.pptx/.xls/.xlsx/.odt/.ods/.odp/.rtf/.csv` 经 anydoc 纯 Rust 转为 GFM Markdown 后复用 comrak 渲染文档页（TOC/锚点/高亮与 `.md` 一致）；转换失败时完整页回退原始文件，fragment 显示安全占位；PDF 除外——浏览器原生打开
+- **Book Previews** — EPUB、FB2、CBZ 服务端可读预览，独立阅读页无 JS 也可读；能力与限制见下文
 - **Code Highlighting** — 源代码文件（含 `.txt`/`.log`/`.env`）按 Accept 协商返回 syntect 高亮 HTML（带行号）或原文；`?raw=1` / `?view=1` 显式覆盖。覆盖 60+ 语言（内置 + 内嵌补充 TypeScript/TOML/Kotlin/Swift/Dockerfile/GraphQL 等）
 - **Range Requests & Media** — 支持断点续传（tower-http `ServeFile` 内置）；音视频浏览器内播放与 seek
 - **Open Locally & Download** — `?download=1` 显式下载（RFC 8187 编码文件名）；本机访问时可用系统默认应用打开文件（Linux xdg-open / macOS open / Windows ShellExecuteExW，仅 loopback + token 校验通过时）
 - **Security** — 逐分量路径解析，路径穿越返回 403；原始内容用 `sandbox allow-scripts` CSP 隔离（非下载的成功 PDF/音视频响应例外，强制 nosniff）；HTML 预览的 iframe 同样只允许 scripts，不含 `allow-same-origin`；所有 CB 完整页带 `frame-ancestors 'none'; script-src 'self'` 与 `X-Frame-Options: DENY`；Org 危险链接拒绝；悬空符号链接不会拖垮目录列表
 - **单文件分发** — 前端资源与 syntect 语法集全部内嵌进二进制，无外部文件依赖
+
+## 书籍预览
+
+| 格式 | 可读内容 | 源文件上限 |
+|---|---|---|
+| EPUB | 正文、基本结构、内嵌图片、跨章节/段落锚点；不保留原 CSS 与分页版式 | 32 MiB |
+| FB2 | 正文、封面/内嵌图片、源顺序 notes 与链接；严格按 BOM/声明编码解码，含 UTF-8、UTF-16、Windows-1251 | 32 MiB |
+| CBZ | ZIP 中图片按完整成员名自然排序，提供页目录与前后页链接 | 512 MiB；最多 4,096 个归档成员 |
+
+- CBZ 只接受单卷 ZIP32、Stored/Deflated；不支持 ZIP64、加密归档、CBR/CBT。
+  忽略隐藏成员、`__MACOSX`、目录、符号链接和非图片。单页解压后最多 32 MiB、压缩数据最多 64 MiB。
+- 图片支持 PNG/APNG、JPEG、GIF、BMP、WebP、AVIF、ICO、SVG，实际解码能力取决于浏览器。
+  EPUB/FB2 内嵌图片单张最多 16 MiB、去重后合计最多 24 MiB；SVG 只作为隔离的图片显示，不注入文档 DOM。
+- 完整页、列表/网格预览面板、树内容区共用服务端正文；网格中可用 `j/k` 选中后按 `p` 预览。
+  无 JS 时 CBZ 仍可阅读，但浏览器可能请求全部图片；服务端最多同时处理两个页任务。
+- `?raw=1`、`?download=1` 始终保留原始字节和 Range 能力。格式损坏、不支持或超限时，
+  完整页回退原文件、fragment 显示占位；转换忙时完整页返回 503，fragment 显示安全占位。
+  CBZ 图片子资源独立报错，不提前解压整本；归档修改后请重新加载。
+- 不包含 DRM、MOBI、XPS/OXPS、ODG、`.fb2.zip`，也不新增书签、标注或阅读进度同步。
+  实现限额、安全约束与验收见[定稿设计](.scratch/book-previews/spec.md)及[评审记录](.scratch/book-previews/review.md)。
 
 ## Windows 可选图形启动器
 
@@ -161,7 +182,7 @@ Options:
 
 ### Reading
 
-Markdown、Org、代码、Office／CSV 的独立阅读页使用紧凑的吸顶导航，不再显示浏览视图切换组和禁用的隐藏／排序控件。
+Markdown、Org、代码、Office／CSV、EPUB／FB2／CBZ 的独立阅读页使用紧凑的吸顶导航，不再显示浏览视图切换组和禁用的隐藏／排序控件。
 顶栏显示路径面包屑与实际文件名，正文标题留在正文；PDF 仍交给浏览器原生查看器。
 
 - **所在目录**：进入文件的父目录，沿用保存的浏览视图（无偏好时为列表）与当前排序／隐藏规则。

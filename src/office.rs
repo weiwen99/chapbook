@@ -1,6 +1,6 @@
 //! Office 文档与 CSV 渲染 (anydoc 0.1, 纯 Rust, 无子进程).
 //!
-//! 管线: anydoc 把 doc/docx/odt/rtf/epub/ppt/xls/ods/csv 等转成 GFM markdown,
+//! 管线: anydoc 把 doc/docx/odt/rtf/ppt/xls/ods/csv 等转成 GFM markdown,
 //! 再复用 `markdown::render` (comrak) 渲染为文档页 — TOC/标题锚点/代码高亮
 //! 与 .md 完全一致 (anydoc 输出与手写 markdown 无差别).
 //!
@@ -22,7 +22,7 @@ pub use anydoc::Format;
 pub const MAX_RENDER_BYTES: u64 = 32 * 1024 * 1024;
 
 /// 扩展名 -> anydoc 格式 (大小写不敏感, 表源为 anydoc::Format::from_extension).
-/// 排除 PDF: 浏览器原生打开, 不转 markdown.
+/// 排除 PDF (浏览器原生打开) 与 EPUB (books 保留资产和书内锚点).
 pub fn format_for_path(path: &Path) -> Option<Format> {
-    Format::from_path(path).filter(|f| *f != Format::Pdf)
+    Format::from_path(path).filter(|f| !matches!(f, Format::Pdf | Format::Epub))
 }

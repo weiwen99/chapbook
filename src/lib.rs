@@ -1,6 +1,7 @@
 //! 库入口: chapbook — a simple static file server.
 
 pub mod assets;
+mod books;
 #[cfg(windows)]
 pub mod desktop;
 pub mod highlight;
